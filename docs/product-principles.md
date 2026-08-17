@@ -46,6 +46,29 @@ diagnosis, reversible preparation, and alternative paths while making the uncert
 Restrictions are maintained like code: their concrete risk must remain current. Obsolete or overly
 broad controls are replaced with precise ADRs, Standing Orders, or checks at the effect they guard.
 
+## Learn through delivery
+
+Current decisions guide the work but remain open to explicit revision when practical evidence shows a
+better path. CMD Riker advances through the smallest useful verifiable increment, revises future work
+without ceremony, and preserves the history of superseded decisions rather than quietly rewriting it.
+
+A local course correction changes the plan. A change to an accepted outcome or its Acceptance boundary
+is made visible and authorized as a changed or replacement Commitment.
+
+Gates must prove their value in delivery. Repeated friction that finds no distinct defect is a defect
+in the lifecycle itself; simplify or remove the gate rather than adding reporting about the friction.
+
+## Verify outcomes, not narration
+
+Verification targets observable outcomes, constraints, and concrete risks. Review adds independent
+judgment only where it can expose a material defect that objective checks do not cover. Neither expands
+into recursive verification of every handoff, comment, or review artifact.
+
+PR, issue, and handoff text stays brief and decision-useful. It blocks progress only when it is false,
+misleading, or omits information needed for a decision, integration, operation, or recovery. Code,
+tests, and necessary durable decisions are the maintained truth; transient prose is not a second
+product.
+
 ## Return command cleanly
 
 The returning Owner receives a concise account of decisions, effects, ADR exceptions, risks, and

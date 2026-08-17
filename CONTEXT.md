@@ -33,6 +33,27 @@ A durable Owner instruction that grants, reserves, or limits Command Authority f
 decisions or effects, especially during Owner absence. It is inspectable and revocable.
 _Avoid_: Assumed permission, Prompt hint
 
+**Commitment**:
+A visibly accepted, outcome-oriented unit of work that the Lead Agent owns through an accepted
+outcome. It is recorded durably; a loose Owner request may remain conversation or produce one or
+more Commitments, and a tracker issue is only a conditional coordination artifact.
+_Avoid_: Message, Technical task, Tracker issue
+
+**Verification**:
+The evidence-based determination that an outcome satisfies its stated criteria. Verification informs
+Acceptance but does not grant it.
+_Avoid_: Review, Acceptance
+
+**Review**:
+Independent judgment used to find material defects that objective Verification does not cover. It
+produces findings and evidence but neither re-verifies narration nor grants Acceptance.
+_Avoid_: Verification, Approval, Prose audit
+
+**Acceptance**:
+The authoritative determination that a verified outcome fulfills its Commitment. The Lead Agent may
+accept objective outcomes; the Owner retains acceptance of subjective or explicitly reserved ones.
+_Avoid_: Verification, Completion
+
 **Worker Session**:
 One delegated native agent session with its own provider identity, tools, conversation, and optional
 subagents. It never owns the Owner relationship or Command Authority.

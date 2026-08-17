@@ -26,3 +26,8 @@ Use the standard five-role triage vocabulary. See `docs/agents/triage-labels.md`
 ### Domain docs
 
 This is a single-context repository. See `docs/agents/domain.md`.
+
+### Skill distribution
+
+APM locks the complete Matt Pocock skill package plus CMD Riker's shipped `design-council`. See
+`docs/agents/skills.md` before changing, installing, or resolving repository skills.

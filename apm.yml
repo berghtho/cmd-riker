@@ -1,0 +1,15 @@
+name: cmd-riker-skills
+version: "1.0.0"
+description: Locked planning and design workflows for CMD Riker
+targets:
+  - agent-skills
+dependencies:
+  apm:
+    - git: https://github.com/mattpocock/skills
+      ref: main
+    - git: https://github.com/berghtho/cmd-riker
+      path: skills/design-council
+      ref: main
+  mcp: []
+
+scripts: {}

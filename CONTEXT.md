@@ -64,6 +64,26 @@ The installed Codex, Claude, Copilot, Pi, or other environment that owns a Worke
 agent loop and capabilities.
 _Avoid_: Provider wrapper, Generic agent interface
 
+**Model**:
+A provider-identified inference capability used for an agent turn. It is distinct from the Model
+Provider and any Native Harness through which it is used.
+_Avoid_: Provider, Native Harness, Agent
+
+**Model Provider**:
+The service or local backend that exposes Models and establishes their account, billing,
+data-handling, and availability boundary.
+_Avoid_: Model, Native Harness
+
+**Model Policy**:
+An Owner-controlled durable set of constraints and preferences governing which Model Selections CMD
+Riker may make.
+_Avoid_: Model configuration, Router configuration, Harness configuration
+
+**Model Selection**:
+The attributed concrete choice of Model, Model Provider, and, when applicable, Native Harness for one
+Lead Agent turn or Worker Session execution attempt.
+_Avoid_: Model name, Provider selection, Routing guess
+
 **Target Project**:
 The project whose work the Lead Agent coordinates. Exactly one is active in the first product.
 _Avoid_: Workspace, Client repository

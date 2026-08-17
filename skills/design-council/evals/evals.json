@@ -1,0 +1,24 @@
+{
+  "skill_name": "design-council",
+  "note": "Owner-interactive manual smoke cases. Verify triggering, relevant-seat selection, sourced persona takes, owner option cards, and explicit sign-off.",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Run a design council for a persistent lead agent that may automatically repair its own orchestration system.",
+      "expected_output": "A relevant subset including Data, La Forge, Worf, Troi, and O'Brien grounds claims in repository decisions, surfaces autonomy versus safety conflicts, walks owner decisions, and drafts a repository-conforming specification without implementation planning.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Ich möchte einen technischen Kurs um praktische Übungen ergänzen. Lass den Design Council die Anforderungen mit mir entwickeln.",
+      "expected_output": "The generic workflow adapts outside software implementation, selects human-experience, evidence, context, and delivery perspectives, converses in German, and produces acceptance focused on learner outcomes rather than code files.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I want one agent platform for every project, every team, every provider, and every operating system. Design the whole thing.",
+      "expected_output": "Intake recognizes that the route and destination exceed one council session, recommends wayfinding rather than manufacturing a complete spec, and publishes nothing unless the owner explicitly chooses a durable next step.",
+      "files": []
+    }
+  ]
+}

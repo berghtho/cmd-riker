@@ -1,0 +1,5 @@
+interface:
+  display_name: "Design Council"
+  short_description: "Shape an idea through grounded persona counsel"
+policy:
+  allow_implicit_invocation: false

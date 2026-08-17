@@ -68,6 +68,12 @@ _Avoid_: Provider wrapper, Generic agent interface
 The project whose work the Lead Agent coordinates. Exactly one is active in the first product.
 _Avoid_: Workspace, Client repository
 
+**Authorized Write Root**:
+An explicitly bounded filesystem location where an actor may perform file effects under existing
+authority without further Owner approval. Native tool-owned credential or session state does not
+extend that boundary.
+_Avoid_: Allowed folder, Repository permission
+
 **Self-repair**:
 A Lead-Agent-initiated change to CMD Riker's own orchestration system rather than to the Target
 Project.

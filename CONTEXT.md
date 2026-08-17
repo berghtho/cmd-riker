@@ -79,6 +79,12 @@ A Lead-Agent-initiated change to CMD Riker's own orchestration system rather tha
 Project.
 _Avoid_: Self-deploy, Target work
 
+**Health Assessment**:
+An evidence-based, time-bounded determination about one named subject and scope, derived from
+authoritative facts and referenced evidence. Process presence and stale or missing evidence never
+establish health, and any overall presentation is only a projection of scoped assessments.
+_Avoid_: Global status light, Process is running
+
 **Session View**:
 A minimal, primarily observational overview of the Lead Agent and Worker Sessions that never owns
 workflow continuation.

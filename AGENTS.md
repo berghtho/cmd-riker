@@ -1,14 +1,12 @@
 # CMD Riker agent instructions
 
-CMD Riker is in wayfinding: decisions are being resolved before implementation begins. Read
-`CONTEXT.md` before using a domain noun. The canonical map is
+CMD Riker's wayfinding is complete and product implementation has begun. Read `CONTEXT.md` before
+using a domain noun. The accepted product and architecture map is
 [Design CMD Riker's product and architecture](https://github.com/berghtho/cmd-riker/issues/22);
-use the `/wayfinder` skill when charting or working through it.
+use its linked resolution comments as the implementation constraints.
 
-Treat OpBoard and `cli-context-flow` as evidence sources, not inherited process. Implement product
-code only after the map reaches its destination or its Notes explicitly bring execution into scope.
-For planning and research, validate the decision artifact itself rather than inventing product tests
-before a runtime exists.
+Treat OpBoard, `cli-context-flow`, and prototype branches as evidence sources, not inherited process
+or product code.
 
 When shaping the Lead Agent's interaction, read `docs/product-principles.md`. Preserve the named
 personality traits without turning domain language into Star Trek role-play.

@@ -1,0 +1,26 @@
+{
+  "name": "cmd-riker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:focused": "node --test",
+    "test": "node --test tests/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/cli.js",
+    "live-smoke": "node dist/live-smoke.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "typescript": "5.9.2"
+  }
+}

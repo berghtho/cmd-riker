@@ -720,6 +720,8 @@ export interface OrchestrationCore {
     modelSelection: WorkerModelSelection;
     modelPolicyRevision: string;
     commitmentId?: string;
+    recoveryOfWorkerSessionId?: string;
+    recoveryReason?: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
   delegateEffectfulWorker(input: {
     objective: string;
@@ -782,11 +784,6 @@ export interface OrchestrationCore {
     questions: WorkerQuestion["questions"];
   }): WorkerQuestion;
   reserveWorkerQuestionForOwner(questionId: string, reason: string): WorkerQuestion;
-  assignWorkerRecoveryOwner(
-    blockedWorkerSessionId: string,
-    recoveryWorkerSessionId: string,
-    reason: string,
-  ): void;
   recordWorkerAnswer(
     questionId: string,
     ownerTurnId: string,
@@ -1642,6 +1639,32 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (input.commitmentId && !state.readCommitment(input.commitmentId)) {
         throw new Error(`Unknown Commitment ${input.commitmentId}.`);
       }
+      const hasRecoveryTarget = Boolean(input.recoveryOfWorkerSessionId);
+      const hasRecoveryReason = Boolean(input.recoveryReason?.trim());
+      if (hasRecoveryTarget !== hasRecoveryReason) {
+        throw new Error("A recovery Worker requires both its exhausted Worker and changed hypothesis.");
+      }
+      let recoveryCoordination: Extract<
+        NonNullable<WorkerAssignmentBase["coordination"]>,
+        { role: "recovery" }
+      > | undefined;
+      if (input.recoveryOfWorkerSessionId && input.recoveryReason) {
+        const exhausted = requireWorkerSession(state, input.recoveryOfWorkerSessionId);
+        if (exhausted.ownerAttention?.kind !== "recovery-exhausted") {
+          throw new Error(`Worker Session ${exhausted.id} has no exhausted recovery to assign.`);
+        }
+        if (
+          exhausted.assignment.targetProjectPath !== input.targetProjectPath ||
+          exhausted.assignment.commitmentId !== input.commitmentId
+        ) {
+          throw new Error("Recovery Ownership must preserve Target Project and Commitment scope.");
+        }
+        recoveryCoordination = {
+          role: "recovery",
+          recoveryOfWorkerSessionId: exhausted.id,
+          reason: input.recoveryReason,
+        };
+      }
       const workerSessionId = randomUUID();
       const executionAttemptId = randomUUID();
       const workerSession: WorkerSession = {
@@ -1653,6 +1676,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           readOnly: true,
           modelPolicyRevision: input.modelPolicyRevision,
           ...(input.commitmentId ? { commitmentId: input.commitmentId } : {}),
+          ...(recoveryCoordination ? { coordination: recoveryCoordination } : {}),
         },
         state: "starting",
         currentExecutionAttemptId: executionAttemptId,
@@ -2086,41 +2110,6 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return reserved;
     },
 
-    assignWorkerRecoveryOwner(blockedWorkerSessionId, recoveryWorkerSessionId, reason) {
-      if (!reason.trim()) throw new Error("Worker Recovery Ownership requires a reason.");
-      if (blockedWorkerSessionId === recoveryWorkerSessionId) {
-        throw new Error("Worker Recovery Ownership requires a distinct Worker Session.");
-      }
-      const blocked = requireWorkerSession(state, blockedWorkerSessionId);
-      const recovery = requireWorkerSession(state, recoveryWorkerSessionId);
-      if (!blocked.ownerAttention || blocked.ownerAttention.kind !== "recovery-exhausted") {
-        throw new Error(`Worker Session ${blocked.id} has no exhausted recovery to assign.`);
-      }
-      if (isTerminalWorkerState(recovery.state)) {
-        throw new Error(`Recovery Worker Session ${recovery.id} is terminal.`);
-      }
-      if (
-        blocked.assignment.targetProjectPath !== recovery.assignment.targetProjectPath ||
-        blocked.assignment.commitmentId !== recovery.assignment.commitmentId
-      ) {
-        throw new Error("Recovery Ownership must preserve Target Project and Commitment scope.");
-      }
-      const { ownerAttention: _ownerAttention, ...settledBlocked } = blocked;
-      state.appendWorkerSessionSnapshots([
-        {
-          ...recovery,
-          assignment: {
-            ...recovery.assignment,
-            coordination: {
-              role: "recovery",
-              recoveryOfWorkerSessionId: blocked.id,
-              reason,
-            },
-          },
-        },
-      ]);
-      state.appendWorkerSessionSnapshots([settledBlocked]);
-    },
 
     recordWorkerAnswer(questionId, ownerTurnId, answers) {
       if (state.ownerTurnSequence(ownerTurnId) === undefined) {
@@ -3283,10 +3272,6 @@ function requireCurrentWorkerAttempt(
     throw new Error(`Unknown Worker execution attempt ${executionAttemptId}.`);
   }
   return attempt;
-}
-
-function isTerminalWorkerState(state: WorkerSession["state"]): boolean {
-  return ["completed", "blocked", "failed", "cancelled"].includes(state);
 }
 
 function recordWorkerContinuityLoss(

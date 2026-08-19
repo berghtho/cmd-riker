@@ -230,6 +230,19 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
   assert.deepEqual(awaitingSnapshot.exceptions.map((item) => item.kind), ["reserved-owner-decision"]);
   assert.deepEqual(awaitingSnapshot.exceptions[0]?.actions, []);
 
+  const blockedAwaiting = {
+    ...awaiting,
+    condition: {
+      kind: "blocked" as const,
+      reason: "Trusted Acceptance evidence is unavailable.",
+      nextAction: "Restore the trusted evidence before an Owner verdict.",
+      ownerAttention: "trusted-base-loss" as const,
+    },
+  };
+  const blockedAwaitingSnapshot = projectSessionView(fakeState({ commitments: [blockedAwaiting] }));
+  assert.deepEqual(blockedAwaitingSnapshot.exceptions.map((item) => item.kind), ["relevant-failure"]);
+  assert.doesNotMatch(blockedAwaitingSnapshot.exceptions[0]?.recoveryConditions.join(" ") ?? "", /Accept/);
+
   const blocked = {
     ...activeCommitment(),
     condition: {
@@ -259,6 +272,28 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
     commitments: [activeCommitment()],
   }));
   assert.deepEqual(exhaustedSnapshot.exceptions.map((item) => item.id), ["worker-recovery:worker-1"]);
+
+  const recoveryWorker = workerSession({
+    id: "worker-2",
+    currentExecutionAttemptId: "attempt-2",
+    assignment: {
+      ...workerSession({}).assignment,
+      coordination: {
+        role: "recovery",
+        recoveryOfWorkerSessionId: exhaustedWorker.id,
+        reason: "A changed recovery hypothesis is assigned from dispatch.",
+      },
+    },
+  });
+  const owned = projectSessionView(fakeState({
+    workers: [exhaustedWorker, recoveryWorker],
+    attempts: [
+      workerAttempt(exhaustedWorker, { status: "blocked" }),
+      workerAttempt(recoveryWorker, { status: "running" }),
+    ],
+    commitments: [activeCommitment()],
+  }));
+  assert.deepEqual(owned.exceptions, []);
 });
 
 test("only explicitly Owner-reserved Worker questions enter attention", () => {

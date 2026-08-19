@@ -499,6 +499,8 @@ async function completeOwnerTurn(
                   objective: string;
                   prompt: string;
                   commitmentId?: string;
+                  recoveryOfWorkerSessionId?: string;
+                  recoveryReason?: string;
                 }) =>
                   workerSupervisor.delegate({
                     ...input,
@@ -519,17 +521,6 @@ async function completeOwnerTurn(
                   orchestration.adjudicateReview(input.commitmentId, input.decisions),
                 reserveOwnerDecision: (questionId: string, reason: string) => {
                   orchestration.reserveWorkerQuestionForOwner(questionId, reason);
-                },
-                assignRecoveryOwner: (
-                  blockedWorkerSessionId: string,
-                  recoveryWorkerSessionId: string,
-                  reason: string,
-                ) => {
-                  orchestration.assignWorkerRecoveryOwner(
-                    blockedWorkerSessionId,
-                    recoveryWorkerSessionId,
-                    reason,
-                  );
                 },
                 ...(workerCapabilities!.effectful
                   ? {

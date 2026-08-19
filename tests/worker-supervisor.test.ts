@@ -973,16 +973,18 @@ test("orchestration blocks startup recovery after its bounded read-only attempts
     reason: "Automatic Worker recovery exhausted its bounded attempts.",
     nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
   });
-  const recovery = await supervisor.delegate(workerAssignment());
+  const recovery = await supervisor.delegate({
+    ...workerAssignment(),
+    recoveryOfWorkerSessionId: started.workerSessionId,
+    recoveryReason: "A fresh Worker owns the changed recovery hypothesis.",
+  });
   await waitFor(
     () => state.readWorkerExecutionAttempt(recovery.executionAttemptId)?.status === "running",
   );
-  createOrchestrationCore(state).assignWorkerRecoveryOwner(
-    started.workerSessionId,
-    recovery.workerSessionId,
-    "A fresh Worker owns the changed recovery hypothesis.",
+  assert.equal(
+    state.readWorkerSession(started.workerSessionId)?.ownerAttention?.kind,
+    "recovery-exhausted",
   );
-  assert.equal(state.readWorkerSession(started.workerSessionId)?.ownerAttention, undefined);
   assert.deepEqual(state.readWorkerSession(recovery.workerSessionId)?.assignment.coordination, {
     role: "recovery",
     recoveryOfWorkerSessionId: started.workerSessionId,

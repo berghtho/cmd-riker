@@ -143,6 +143,14 @@ export function projectSessionView(
         cancellationAvailable,
       ),
     }));
+  const recoveryOwnedWorkerIds = new Set(
+    visibleWorkers.flatMap((worker) => {
+      const assignment = workerById.get(worker.id)?.assignment;
+      return assignment?.coordination?.role === "recovery"
+        ? [assignment.coordination.recoveryOfWorkerSessionId]
+        : [];
+    }),
+  );
   const exceptions: SessionViewException[] = [];
   const pausedCommitments = new Set<string>();
 
@@ -214,7 +222,7 @@ export function projectSessionView(
 
   for (const commitment of commitments.values()) {
     if (isTerminalCommitment(commitment) || pausedCommitments.has(commitment.id)) continue;
-    if (commitment.state === "awaiting-acceptance") {
+    if (commitment.state === "awaiting-acceptance" && !commitment.condition?.ownerAttention) {
       const exceptionId = `owner-decision:${commitment.id}`;
       exceptions.push({
         id: exceptionId,
@@ -354,6 +362,7 @@ export function projectSessionView(
       : undefined;
     if (
       !worker.ownerAttention ||
+      recoveryOwnedWorkerIds.has(worker.id) ||
       (worker.assignment.commitmentId && materialCommitmentIds.has(worker.assignment.commitmentId)) ||
       (linkedCommitment && isTerminalCommitment(linkedCommitment))
     ) {

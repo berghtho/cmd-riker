@@ -100,6 +100,8 @@ export type PiTurnRequest = {
       objective: string;
       prompt: string;
       commitmentId?: string;
+      recoveryOfWorkerSessionId?: string;
+      recoveryReason?: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     delegateEffectful?(input: {
       objective: string;
@@ -121,11 +123,6 @@ export type PiTurnRequest = {
       }>;
     }): void;
     reserveOwnerDecision?(questionId: string, reason: string): void;
-    assignRecoveryOwner?(
-      blockedWorkerSessionId: string,
-      recoveryWorkerSessionId: string,
-      reason: string,
-    ): void;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -920,11 +917,19 @@ function workerTools(
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
         commitmentId: Type.Optional(Type.String({ minLength: 1 })),
+        recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
+        recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const result = await actions.delegate(
-          params as { objective: string; prompt: string; commitmentId?: string },
+          params as {
+            objective: string;
+            prompt: string;
+            commitmentId?: string;
+            recoveryOfWorkerSessionId?: string;
+            recoveryReason?: string;
+          },
         );
         observer.onMutation();
         return {
@@ -1100,42 +1105,6 @@ function workerTools(
             text: `Worker question ${questionId} is reserved for an Owner decision in the Session View.`,
           }],
           details: { questionId },
-        };
-      },
-    });
-  }
-  if (actions.assignRecoveryOwner) {
-    tools.push({
-      name: "assign_worker_recovery_owner",
-      label: "Assign Worker Recovery Owner",
-      description:
-        "Assign a distinct active Worker Session as precise Recovery Ownership for one Worker whose bounded recovery is exhausted, clearing the old attention fact.",
-      parameters: Type.Object({
-        blockedWorkerSessionId: Type.String({ minLength: 1 }),
-        recoveryWorkerSessionId: Type.String({ minLength: 1 }),
-        reason: Type.String({ minLength: 1 }),
-      }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const input = params as {
-          blockedWorkerSessionId: string;
-          recoveryWorkerSessionId: string;
-          reason: string;
-        };
-        actions.assignRecoveryOwner!(
-          input.blockedWorkerSessionId,
-          input.recoveryWorkerSessionId,
-          input.reason,
-        );
-        observer.onMutation();
-        return {
-          content: [{
-            type: "text",
-            text:
-              `Worker Session ${input.recoveryWorkerSessionId} now owns recovery for ` +
-              `${input.blockedWorkerSessionId}.`,
-          }],
-          details: input,
         };
       },
     });

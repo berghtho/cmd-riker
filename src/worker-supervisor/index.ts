@@ -129,6 +129,8 @@ export interface WorkerSupervisor {
     model: string;
     modelPolicyRevision: string;
     commitmentId?: string;
+    recoveryOfWorkerSessionId?: string;
+    recoveryReason?: string;
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
   delegateEffectful(input: {
     objective: string;

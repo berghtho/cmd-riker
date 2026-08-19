@@ -423,6 +423,25 @@ test("restore preserves damaged evidence and blocks mutations until post-backup 
   ]);
   assert.equal(reconciliationResult.code, 0, reconciliationResult.stderr);
   assert.match(reconciliationResult.stdout, /CMD_RIKER_POST_BACKUP_EFFECT_RECONCILED:/);
+  const installedDatabase = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"));
+  installedDatabase.exec("CREATE TABLE recovery_tamper (value TEXT) STRICT;");
+  installedDatabase.close();
+  const tamperedCompletion = await runCli(stateDirectory, ["--complete-state-recovery"]);
+  assert.equal(tamperedCompletion.code, 2);
+  assert.match(tamperedCompletion.stderr, /backup hash|integrity verification/i);
+
+  const repeatedRestore = await runCli(stateDirectory, [
+    "--restore-state-backup",
+    backupPath,
+    "--post-backup-inventory",
+    inventoryPath,
+  ]);
+  assert.equal(repeatedRestore.code, 0, repeatedRestore.stderr);
+  const repeatedReconciliation = await runCli(stateDirectory, [
+    "--reconcile-post-backup-effect",
+    reconciliationPath,
+  ]);
+  assert.equal(repeatedReconciliation.code, 0, repeatedReconciliation.stderr);
   const completionResult = await runCli(stateDirectory, ["--complete-state-recovery"]);
   assert.equal(completionResult.code, 0, completionResult.stderr);
   assert.match(completionResult.stdout, /CMD_RIKER_STATE_RECOVERY_COMPLETED:/);

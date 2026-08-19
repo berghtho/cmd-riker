@@ -1760,6 +1760,9 @@ function verifyCmdRikerBackupProvenance(
   databasePath: string,
   manifest: AuthoritativeStateBackup,
 ): void {
+  if (sha256File(databasePath) !== manifest.sha256) {
+    throw new Error("CMD Riker backup hash does not match the installed recovery database.");
+  }
   const database = new DatabaseSync(databasePath, { readOnly: true });
   try {
     assertDatabaseIntegrity(database);

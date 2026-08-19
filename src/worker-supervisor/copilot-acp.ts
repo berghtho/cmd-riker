@@ -158,7 +158,8 @@ class CopilotAcpHarness implements NativeWorkerHarness {
         readOnly: true,
         nativeQuestions: false,
         cancellation: false,
-        providerSessionResume:
+        providerSessionResume: false,
+        providerSessionLoad:
           agentCapabilities.loadSession === true
             ? "conversation-replay-only" as const
             : "unavailable" as const,

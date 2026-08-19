@@ -93,7 +93,8 @@ test("a read-only Codex Worker Session starts without occupying the Lead Agent",
     readOnly: true,
     nativeQuestions: true,
     cancellation: true,
-    providerSessionResume: "unavailable",
+    providerSessionResume: false,
+    providerSessionLoad: "unavailable",
     providerSessionDeletion: false,
     nativeChildControl: false,
     exactExecutionResume: "live-connection-only",
@@ -119,7 +120,7 @@ test("Claude and Copilot Workers persist honest native capability limits", async
       model: "claude-sonnet-5",
       nativeQuestions: false,
       cancellation: true,
-      providerSessionResume: "conversation-replay-only" as const,
+      providerSessionLoad: "unavailable" as const,
     },
     {
       provider: "github" as const,
@@ -127,7 +128,7 @@ test("Claude and Copilot Workers persist honest native capability limits", async
       model: "auto",
       nativeQuestions: false,
       cancellation: false,
-      providerSessionResume: "conversation-replay-only" as const,
+      providerSessionLoad: "conversation-replay-only" as const,
     },
   ];
 
@@ -161,7 +162,8 @@ test("Claude and Copilot Workers persist honest native capability limits", async
       readOnly: true,
       nativeQuestions: expected.nativeQuestions,
       cancellation: expected.cancellation,
-      providerSessionResume: expected.providerSessionResume,
+      providerSessionResume: false,
+      providerSessionLoad: expected.providerSessionLoad,
       providerSessionDeletion: false,
       nativeChildControl: false,
       exactExecutionResume: "live-connection-only",
@@ -1098,7 +1100,8 @@ test("the Claude adapter completes a bounded read-only assignment with honest ca
     readOnly: true,
     nativeQuestions: false,
     cancellation: true,
-    providerSessionResume: "conversation-replay-only",
+    providerSessionResume: false,
+    providerSessionLoad: "unavailable",
     providerSessionDeletion: false,
     nativeChildControl: false,
     exactExecutionResume: "live-connection-only",
@@ -1159,7 +1162,8 @@ test("the Copilot ACP adapter completes a bounded assignment without simulating 
     readOnly: true,
     nativeQuestions: false,
     cancellation: false,
-    providerSessionResume: "conversation-replay-only",
+    providerSessionResume: false,
+    providerSessionLoad: "conversation-replay-only",
     providerSessionDeletion: false,
     nativeChildControl: false,
     exactExecutionResume: "live-connection-only",
@@ -1400,7 +1404,7 @@ class FakeLimitedNativeHarness implements NativeWorkerHarness {
   }) & {
     nativeQuestions: boolean;
     cancellation: boolean;
-    providerSessionResume: "conversation-replay-only";
+    providerSessionLoad: "unavailable" | "conversation-replay-only";
   }) {
     this.selection = input.nativeHarness === "claude"
       ? { provider: "anthropic", nativeHarness: "claude" }
@@ -1435,7 +1439,7 @@ class FakeLimitedNativeExecution implements NativeWorkerExecution {
     nativeHarness: "claude" | "copilot";
     nativeQuestions: boolean;
     cancellation: boolean;
-    providerSessionResume: "conversation-replay-only";
+    providerSessionLoad: "unavailable" | "conversation-replay-only";
   }) {
     this.identity = {
       providerSessionId: `${input.nativeHarness}-session-1`,
@@ -1447,7 +1451,8 @@ class FakeLimitedNativeExecution implements NativeWorkerExecution {
         readOnly: true as const,
         nativeQuestions: input.nativeQuestions,
         cancellation: input.cancellation,
-        providerSessionResume: input.providerSessionResume,
+        providerSessionResume: false as const,
+        providerSessionLoad: input.providerSessionLoad,
         providerSessionDeletion: false as const,
         nativeChildControl: false as const,
         exactExecutionResume: "live-connection-only" as const,
@@ -1596,7 +1601,8 @@ class FakeCodexExecution implements CodexWorkerExecution {
         readOnly: !effectful,
         nativeQuestions: true,
         cancellation: true,
-        providerSessionResume: "unavailable" as const,
+        providerSessionResume: false as const,
+        providerSessionLoad: "unavailable" as const,
         providerSessionDeletion: false,
         nativeChildControl: false,
         exactExecutionResume: "live-connection-only" as const,

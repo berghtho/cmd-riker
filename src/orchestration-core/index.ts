@@ -194,7 +194,8 @@ export type WorkerNativeCapabilities = {
   readOnly: boolean;
   nativeQuestions: boolean;
   cancellation: boolean;
-  providerSessionResume: "unavailable" | "conversation-replay-only";
+  providerSessionResume: boolean;
+  providerSessionLoad: "unavailable" | "conversation-replay-only";
   providerSessionDeletion: boolean;
   nativeChildControl: boolean;
   exactExecutionResume: "live-connection-only" | "unavailable";

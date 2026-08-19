@@ -37,8 +37,13 @@ import {
   assertExternalEffectEvidence,
 } from "../target-project-operations/index.ts";
 import type {
+  ForgeOperationAttempt,
+  ForgeOwnerActionNotice,
+} from "../forge-operations/index.ts";
+import type {
   EffectIntent,
   ExternalEffectEvidence,
+  ForgeOperationEffectIntent,
   TargetProjectOperationEffectIntent,
   TargetProjectOperationAttempt,
   WorkerAssignmentEffectIntent,
@@ -209,6 +214,24 @@ export interface AuthoritativeState {
   appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
   appendCoordinationMessage(message: CoordinationMessage): void;
   readCoordinationMessages(): CoordinationMessage[];
+  appendForgeOperationAttemptSnapshots(snapshots: ForgeOperationAttempt[]): void;
+  readForgeOperationAttempt(attemptId: string): ForgeOperationAttempt | undefined;
+  readForgeOperationAttempts(): ForgeOperationAttempt[];
+  startForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  claimForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  settleForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  readForgeOwnerActionNotice(id: ForgeOwnerActionNotice["id"]): ForgeOwnerActionNotice | undefined;
+  readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
+  appendForgeOwnerActionNotice(notice: ForgeOwnerActionNotice): void;
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -264,6 +287,8 @@ type FactDraft =
   | { kind: "standing-order.snapshot"; value: StandingOrder }
   | { kind: "acting-authority.snapshot"; value: ActingAuthority }
   | { kind: "coordination-message.recorded"; value: CoordinationMessage }
+  | { kind: "forge-operation-attempt.snapshot"; value: ForgeOperationAttempt }
+  | { kind: "forge-owner-action-notice.snapshot"; value: ForgeOwnerActionNotice }
   | { kind: "target-project-operation-attempt.snapshot"; value: TargetProjectOperationAttempt }
   | { kind: "effect-intent.snapshot"; value: EffectIntent };
 
@@ -288,6 +313,8 @@ type TransitionKind =
   | `standing-order.${StandingOrder["state"]}`
   | `acting-authority.${ActingAuthority["state"]}`
   | "coordination-message.recorded"
+  | `forge-operation-attempt.${ForgeOperationAttempt["status"]}`
+  | `forge-owner-action-notice.${ForgeOwnerActionNotice["state"]}`
   | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
   | `effect-intent.${EffectIntent["status"]}`;
 
@@ -524,6 +551,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot"
       | "effect-intent.snapshot",
     subjectId: string,
   ): { id: string; value: T } | undefined => {
@@ -548,7 +577,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot",
+      | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot",
   ): T[] => {
     const rows = database
       .prepare(`
@@ -571,6 +602,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot"
       | "effect-intent.snapshot";
     subjectPrefix:
       | "worker-session"
@@ -578,6 +611,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice"
       | "effect-intent";
     transitionPrefix:
       | "worker-session"
@@ -585,6 +620,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice"
       | "effect-intent";
     snapshot: { id: string; state?: string; status?: string };
   };
@@ -644,19 +681,25 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot",
+      | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot",
     subjectPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority",
+      | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice",
     transitionPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority",
+      | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice",
     snapshots: T[],
   ): void => {
     if (snapshots.length === 0) return;
@@ -822,6 +865,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
              WHERE current.kind = 'effect-intent.snapshot'
                 AND (
                   COALESCE(
+                    json_extract(current.value_json, '$.effectScopeKey'),
                     json_extract(current.value_json, '$.authorizedWriteRootKey'),
                     lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
                   ) = ?
@@ -833,7 +877,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
                )
              LIMIT 1
           `)
-          .get(effectIntent.authorizedWriteRootKey, effectIntent.commitmentId);
+          .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
         if (conflict) {
           throw new Error("A conflicting Target Project effect is already open for this Commitment.");
         }
@@ -859,6 +903,110 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         .run(
           randomUUID(),
           `target-project-operation-attempt.${attempt.status}`,
+          attemptFactId,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
+        `)
+        .run(
+          effectFactId,
+          `effect-intent:${effectIntent.id}`,
+          JSON.stringify(effectIntent),
+          predecessors?.effectIntentId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(randomUUID(), `effect-intent.${effectIntent.status}`, effectFactId, recordedAt);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
+  const writeForgeOperationAndEffect = (
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+    predecessors?: { attemptId: string; effectIntentId: string },
+    rejectConflict = false,
+  ): void => {
+    if (
+      attempt.effectIntentId !== effectIntent.id ||
+      effectIntent.forgeOperationAttemptId !== attempt.id ||
+      attempt.commitmentId !== effectIntent.commitmentId ||
+      attempt.provider !== effectIntent.provider
+    ) {
+      throw new Error("Forge Operation Attempt and effect intent attribution must match.");
+    }
+    const recordedAt = new Date().toISOString();
+    const attemptFactId = randomUUID();
+    const effectFactId = randomUUID();
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      if (rejectConflict) {
+        if (attempt.target.kind !== "github-issue") {
+          throw new Error("Only a typed GitHub target can dispatch a Forge mutation.");
+        }
+        assertActingAuthorityDispatch(effectIntent, {
+          effectClass: "update",
+          target: `${attempt.target.repository}#${attempt.target.issueNumber}`,
+          reversible: true,
+          externallyBinding: true,
+          incrementalSpendUsd: 0,
+        });
+        const conflict = database
+          .prepare(`
+            SELECT 1
+              FROM facts current
+             WHERE current.kind = 'effect-intent.snapshot'
+               AND (
+                 COALESCE(
+                   json_extract(current.value_json, '$.effectScopeKey'),
+                   json_extract(current.value_json, '$.authorizedWriteRootKey'),
+                   lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
+                 ) = ?
+                 OR json_extract(current.value_json, '$.commitmentId') = ?
+               )
+               AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
+               AND NOT EXISTS (
+                 SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+               )
+             LIMIT 1
+          `)
+          .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
+        if (conflict) {
+          throw new Error("A conflicting effect is already open for this Forge target or Commitment.");
+        }
+      }
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, 'forge-operation-attempt.snapshot', ?, ?, ?)
+        `)
+        .run(
+          attemptFactId,
+          `forge-operation-attempt:${attempt.id}`,
+          JSON.stringify(attempt),
+          predecessors?.attemptId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          `forge-operation-attempt.${attempt.status}`,
           attemptFactId,
           recordedAt,
         );
@@ -1187,8 +1335,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
               SELECT 1
                 FROM facts current
                WHERE current.kind = 'effect-intent.snapshot'
-                 AND COALESCE(
-                   json_extract(current.value_json, '$.authorizedWriteRootKey'),
+                  AND COALESCE(
+                    json_extract(current.value_json, '$.effectScopeKey'),
+                    json_extract(current.value_json, '$.authorizedWriteRootKey'),
                    lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
                  ) = ?
                  AND (
@@ -1204,7 +1353,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
                  )
                LIMIT 1
             `)
-            .get(effectIntent.authorizedWriteRootKey);
+            .get(effectScopeKey(effectIntent));
           if (conflict) {
             throw new Error("A conflicting Target Project effect is already open for this Authorized Write Root.");
           }
@@ -1521,6 +1670,114 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
 
     readWorkerQuestions() {
       return readCurrentSnapshots<WorkerQuestion>("worker-question.snapshot");
+    },
+
+    appendForgeOperationAttemptSnapshots(snapshots) {
+      if (snapshots.some((snapshot) => snapshot.effectIntentId)) {
+        throw new Error("Mutating Forge attempts must be recorded atomically with their effect intent.");
+      }
+      appendSnapshots(
+        "forge-operation-attempt.snapshot",
+        "forge-operation-attempt",
+        "forge-operation-attempt",
+        snapshots,
+      );
+    },
+
+    readForgeOperationAttempt(attemptId) {
+      return readCurrentSnapshot<ForgeOperationAttempt>(
+        "forge-operation-attempt.snapshot",
+        `forge-operation-attempt:${attemptId}`,
+      )?.value;
+    },
+
+    readForgeOperationAttempts() {
+      return readCurrentSnapshots<ForgeOperationAttempt>("forge-operation-attempt.snapshot");
+    },
+
+    startForgeMutation(attempt, effectIntent) {
+      if (
+        readCurrentSnapshot(
+          "forge-operation-attempt.snapshot",
+          `forge-operation-attempt:${attempt.id}`,
+        ) ||
+        readEffectIntentRow(effectIntent.id)
+      ) {
+        throw new Error("Forge Operation Attempt and effect intent identities must be new.");
+      }
+      if (attempt.status !== "ready" || effectIntent.status !== "pending") {
+        throw new Error("A Forge mutation must record ready intent before dispatch.");
+      }
+      writeForgeOperationAndEffect(attempt, effectIntent, undefined, true);
+    },
+
+    claimForgeMutation(attempt, effectIntent) {
+      const currentAttempt = readCurrentSnapshot<ForgeOperationAttempt>(
+        "forge-operation-attempt.snapshot",
+        `forge-operation-attempt:${attempt.id}`,
+      );
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      if (!currentAttempt || !currentEffect) {
+        throw new Error("Cannot claim an unknown Forge mutation.");
+      }
+      if (currentAttempt.value.status !== "ready" || currentEffect.value.status !== "pending") {
+        throw new Error("Forge mutation is not ready for dispatch.");
+      }
+      if (attempt.status !== "running" || effectIntent.status !== "dispatching" || !effectIntent.lease) {
+        throw new Error("Forge dispatch claim requires a running attempt and durable effect lease.");
+      }
+      writeForgeOperationAndEffect(attempt, effectIntent, {
+        attemptId: currentAttempt.id,
+        effectIntentId: currentEffect.id,
+      });
+    },
+
+    settleForgeMutation(attempt, effectIntent) {
+      const currentAttempt = readCurrentSnapshot<ForgeOperationAttempt>(
+        "forge-operation-attempt.snapshot",
+        `forge-operation-attempt:${attempt.id}`,
+      );
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      if (!currentAttempt || !currentEffect) {
+        throw new Error("Cannot settle an unknown Forge mutation.");
+      }
+      const dispatched =
+        currentAttempt.value.status === "running" &&
+        currentEffect.value.status === "dispatching" &&
+        ["succeeded", "unknown"].includes(attempt.status) &&
+        ["succeeded", "unknown"].includes(effectIntent.status);
+      const undispatched =
+        currentAttempt.value.status === "ready" &&
+        currentEffect.value.status === "pending" &&
+        attempt.status === "rejected" &&
+        effectIntent.status === "rejected";
+      if (!dispatched && !undispatched) {
+        throw new Error("Forge mutation is not dispatching or has an invalid settlement.");
+      }
+      writeForgeOperationAndEffect(attempt, effectIntent, {
+        attemptId: currentAttempt.id,
+        effectIntentId: currentEffect.id,
+      });
+    },
+
+    readForgeOwnerActionNotice(id) {
+      return readCurrentSnapshot<ForgeOwnerActionNotice>(
+        "forge-owner-action-notice.snapshot",
+        `forge-owner-action-notice:${id}`,
+      )?.value;
+    },
+
+    readForgeOwnerActionNotices() {
+      return readCurrentSnapshots<ForgeOwnerActionNotice>("forge-owner-action-notice.snapshot");
+    },
+
+    appendForgeOwnerActionNotice(notice) {
+      appendSnapshots(
+        "forge-owner-action-notice.snapshot",
+        "forge-owner-action-notice",
+        "forge-owner-action-notice",
+        [notice],
+      );
     },
 
     startTargetProjectOperation(attempt, effectIntent) {
@@ -2227,6 +2484,8 @@ function ensureSchema(database: DatabaseSync): void {
         'standing-order.snapshot',
         'acting-authority.snapshot',
         'coordination-message.recorded',
+        'forge-operation-attempt.snapshot',
+        'forge-owner-action-notice.snapshot',
         'target-project-operation-attempt.snapshot',
         'effect-intent.snapshot'
       )),
@@ -2287,6 +2546,16 @@ function ensureSchema(database: DatabaseSync): void {
         'acting-authority.handoff-pending',
         'acting-authority.ended',
         'coordination-message.recorded',
+        'forge-operation-attempt.ready',
+        'forge-operation-attempt.running',
+        'forge-operation-attempt.succeeded',
+        'forge-operation-attempt.failed',
+        'forge-operation-attempt.timed-out',
+        'forge-operation-attempt.unknown',
+        'forge-operation-attempt.rejected',
+        'forge-operation-attempt.unavailable',
+        'forge-owner-action-notice.active',
+        'forge-owner-action-notice.cleared',
         'target-project-operation-attempt.running',
         'target-project-operation-attempt.ready',
         'target-project-operation-attempt.succeeded',
@@ -2343,9 +2612,12 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'standing-order.snapshot'") &&
     row.sql.includes("'acting-authority.snapshot'") &&
     row.sql.includes("'coordination-message.recorded'") &&
+    row.sql.includes("'forge-operation-attempt.snapshot'") &&
+    row.sql.includes("'forge-owner-action-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
+    transitionsRow.sql.includes("'forge-owner-action-notice.cleared'") &&
     transitionsRow.sql.includes("'effect-intent.reconciled'")
   ) {
     return;
@@ -2376,6 +2648,8 @@ function ensureSchema(database: DatabaseSync): void {
           'standing-order.snapshot',
           'acting-authority.snapshot',
           'coordination-message.recorded',
+          'forge-operation-attempt.snapshot',
+          'forge-owner-action-notice.snapshot',
           'target-project-operation-attempt.snapshot',
           'effect-intent.snapshot'
         )),
@@ -2434,6 +2708,16 @@ function ensureSchema(database: DatabaseSync): void {
           'acting-authority.handoff-pending',
           'acting-authority.ended',
           'coordination-message.recorded',
+          'forge-operation-attempt.ready',
+          'forge-operation-attempt.running',
+          'forge-operation-attempt.succeeded',
+          'forge-operation-attempt.failed',
+          'forge-operation-attempt.timed-out',
+          'forge-operation-attempt.unknown',
+          'forge-operation-attempt.rejected',
+          'forge-operation-attempt.unavailable',
+          'forge-owner-action-notice.active',
+          'forge-owner-action-notice.cleared',
           'target-project-operation-attempt.running',
           'target-project-operation-attempt.ready',
           'target-project-operation-attempt.succeeded',
@@ -2500,7 +2784,7 @@ function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectInten
     left.kind !== right.kind ||
     left.commitmentId !== right.commitmentId ||
     left.expectedEffect !== right.expectedEffect ||
-    left.authorizedWriteRootKey !== right.authorizedWriteRootKey ||
+    effectScopeKey(left) !== effectScopeKey(right) ||
     left.retryRule !== right.retryRule ||
     left.authorization.kind !== right.authorization.kind ||
     left.authorization.commitmentId !== right.authorization.commitmentId ||
@@ -2517,12 +2801,25 @@ function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectInten
       JSON.stringify(left.causedByWorker) === JSON.stringify(right.causedByWorker)
     );
   }
+  if (left.kind === "forge-operation") {
+    return (
+      right.kind === "forge-operation" &&
+      left.forgeOperationAttemptId === right.forgeOperationAttemptId &&
+      left.provider === right.provider
+    );
+  }
   return (
     right.kind === "worker-assignment" &&
     left.workerSessionId === right.workerSessionId &&
     left.executionAttemptId === right.executionAttemptId &&
     left.verificationOperationAttemptId === right.verificationOperationAttemptId
   );
+}
+
+function effectScopeKey(effectIntent: EffectIntent): string {
+  return effectIntent.effectScopeKey ??
+    effectIntent.authorizedWriteRootKey ??
+    effectIntent.authorization.targetProjectPath.toLowerCase();
 }
 
 function factSubject(input: FactDraft): string {
@@ -2550,6 +2847,10 @@ function factSubject(input: FactDraft): string {
       return `acting-authority:${input.value.id}`;
     case "coordination-message.recorded":
       return `coordination-message:${input.value.id}`;
+    case "forge-operation-attempt.snapshot":
+      return `forge-operation-attempt:${input.value.id}`;
+    case "forge-owner-action-notice.snapshot":
+      return `forge-owner-action-notice:${input.value.id}`;
     case "target-project-operation-attempt.snapshot":
       return `target-project-operation-attempt:${input.value.id}`;
     case "effect-intent.snapshot":

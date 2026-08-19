@@ -305,6 +305,76 @@ test("production adapter delegates effectful work only through the bounded assig
   assert.equal(result.content, "The bounded implementation Worker Session is running.");
 });
 
+test("production adapter exposes typed Forge operations without provider commands", async (t) => {
+  let executed: unknown;
+  let firstRequest = "";
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      firstRequest = JSON.stringify(requestBody);
+      return {
+        toolCall: {
+          id: "github-comment-call-1",
+          name: "comment_on_github_issue",
+          arguments: {
+            commitmentId: "commitment-1",
+            repository: "berghtho/cmd-riker",
+            issueNumber: 36,
+            body: "Typed Forge proof.",
+            expectedAccount: "berghtho",
+          },
+        },
+      };
+    }
+    return "The typed GitHub operation is recorded.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Record the GitHub proof.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    forgeActions: {
+      async execute(request) {
+        executed = request;
+        return {
+          operationAttemptId: "forge-attempt-1",
+          effectIntentId: "forge-effect-1",
+          commitmentId: request.commitmentId,
+          operation: request.operation.kind,
+          provider: "github",
+          status: "succeeded",
+          evidence: [{
+            source: "provider-readback",
+            reference: "https://github.test/comment-1",
+            summary: "The comment matched its attributed read-back.",
+            observedAt: "2026-08-19T20:00:00.000Z",
+          }],
+          diagnostics: [],
+          uncertainty: null,
+          startedAt: "2026-08-19T20:00:00.000Z",
+          completedAt: "2026-08-19T20:00:01.000Z",
+        };
+      },
+    },
+  });
+
+  assert.deepEqual(executed, {
+    commitmentId: "commitment-1",
+    operation: {
+      kind: "github-issue-comment",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      body: "Typed Forge proof.",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 30_000,
+  });
+  assert.match(firstRequest, /comment_on_github_issue/);
+  assert.match(firstRequest, /inspect_azure_subscription/);
+  assert.doesNotMatch(firstRequest, /gh api|az account/);
+  assert.equal(result.content, "The typed GitHub operation is recorded.");
+});
+
 function modelSelection(baseUrl: string): ModelSelection {
   return {
     provider: "local-openai",

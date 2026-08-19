@@ -36,6 +36,7 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import type { TargetProjectOperationResult } from "../target-project-operations/index.ts";
+import type { ForgeOperationRequest, ForgeOperationResult } from "../forge-operations/index.ts";
 
 export type PiTurnRequest = {
   conversation: readonly ConversationMessage[];
@@ -66,6 +67,12 @@ export type PiTurnRequest = {
       operation: "test",
       actingAuthorityEffect?: ActingAuthorityEffectRequest,
     ): Promise<TargetProjectOperationResult>;
+  };
+  forgeActions?: {
+    execute(
+      request: ForgeOperationRequest,
+      actingAuthorityEffect?: ActingAuthorityEffectRequest,
+    ): Promise<ForgeOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
   actingAuthority?: ActingAuthority;
@@ -313,6 +320,7 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       };
       const tools = [
         ...commitmentTools(request, mutationObserver),
+        ...forgeTools(request, mutationObserver),
         ...authorityTools(request, mutationObserver),
         ...workerTools(request, mutationObserver),
       ];
@@ -371,6 +379,11 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "cancel, or supersede instruction." +
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
            "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
+           (request.forgeActions
+             ? " For a GitHub comment or Azure inspection, record one Commitment with the matching forge-operation criterion before calling its typed tool. " +
+               "Use typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
+               "Treat an unavailable result as one Owner action and do not retry blindly."
+             : "") +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
            (request.authorityActions
              ? "\nStanding Orders are created or revoked only from explicit Owner instructions. Silence never begins Acting Authority. " +
@@ -536,6 +549,102 @@ function unknownHardGates(): ModelCandidateValidation["hardGates"] {
   ) as ModelCandidateValidation["hardGates"];
 }
 
+function forgeTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  if (!request.forgeActions) return [];
+  const actions = request.forgeActions;
+  return [
+    {
+      name: "comment_on_github_issue",
+      label: "Comment on GitHub Issue",
+      description:
+        "Create one bounded GitHub issue comment through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        repository: Type.String({ minLength: 3 }),
+        issueNumber: Type.Integer({ minimum: 1 }),
+        body: Type.String({ minLength: 1, maxLength: 65_536 }),
+        expectedAccount: Type.String({ minLength: 1 }),
+        actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, repository, issueNumber, body, expectedAccount, actingAuthorityEffect } = params as {
+          commitmentId: string;
+          repository: string;
+          issueNumber: number;
+          body: string;
+          expectedAccount: string;
+          actingAuthorityEffect?: ActingAuthorityEffectRequest;
+        };
+        const result = await actions.execute(
+          {
+            commitmentId,
+            operation: {
+              kind: "github-issue-comment",
+              repository,
+              issueNumber,
+              body,
+              expectedAccount,
+            },
+            timeoutMs: 30_000,
+          },
+          actingAuthorityEffect,
+        );
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: forgeResultText(result) }],
+          details: result,
+        };
+      },
+    },
+    {
+      name: "inspect_azure_subscription",
+      label: "Inspect Azure Subscription",
+      description:
+        "Inspect one Azure subscription through the typed non-interactive adapter after proving executable, intended account, target, and read capability. No secret value is accepted or returned.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        subscriptionId: Type.String({ minLength: 36, maxLength: 36 }),
+        expectedAccount: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, subscriptionId, expectedAccount } = params as {
+          commitmentId: string;
+          subscriptionId: string;
+          expectedAccount: string;
+        };
+        const result = await actions.execute({
+          commitmentId,
+          operation: {
+            kind: "azure-subscription-inspection",
+            subscriptionId,
+            expectedAccount,
+          },
+          timeoutMs: 30_000,
+        });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: forgeResultText(result) }],
+          details: result,
+        };
+      },
+    },
+  ];
+}
+
+function forgeResultText(result: ForgeOperationResult): string {
+  const base = `${result.provider} operation attempt ${result.operationAttemptId} ended ${result.status}.`;
+  return result.ownerAction
+    ? `${base} Owner action: ${result.ownerAction.nextAction}`
+    : result.uncertainty
+      ? `${base} ${result.uncertainty.reason}`
+      : `${base} ${result.evidence.length} attributed evidence item(s).`;
+}
+
 const commitmentCriterionSchema = Type.Union([
   Type.Object({
     kind: Type.Literal("response-includes"),
@@ -549,6 +658,14 @@ const commitmentCriterionSchema = Type.Union([
     kind: Type.Literal("target-project-operation"),
     description: Type.String({ minLength: 1 }),
     operation: Type.Literal("test"),
+  }),
+  Type.Object({
+    kind: Type.Literal("forge-operation"),
+    description: Type.String({ minLength: 1 }),
+    operation: Type.Union([
+      Type.Literal("github-issue-comment"),
+      Type.Literal("azure-subscription-inspection"),
+    ]),
   }),
 ]);
 

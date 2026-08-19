@@ -19,6 +19,7 @@ import {
   type SessionViewState,
 } from "../src/session-view/index.ts";
 import type { EffectIntent } from "../src/target-project-operations/index.ts";
+import type { ForgeOwnerActionNotice } from "../src/forge-operations/index.ts";
 
 test("running process presence contributes only to the quiet Worker count", () => {
   const worker = workerSession({ state: "running" });
@@ -163,6 +164,31 @@ test("active capability loss is scoped and clears with its authoritative fact", 
   assert.equal(stale.exceptions[0]?.healthAssessment?.verdict, "unknown");
 
   const cleared = projectSessionView(fakeState({ capability: { ...active, state: "cleared" } }));
+  assert.deepEqual(cleared.exceptions, []);
+});
+
+test("a deduplicated Forge Owner action remains one scoped capability exception", () => {
+  const notice: ForgeOwnerActionNotice = {
+    id: "azure-cli",
+    provider: "azure",
+    state: "active",
+    fingerprint: "fingerprint",
+    detail: "Azure CLI executable is unavailable.",
+    nextAction: "Install az and retry.",
+    expectedAccount: "owner@example.test",
+    target: "subscription:00000000-0000-0000-0000-000000000036",
+    observedAt: "2026-08-19T10:00:00.000Z",
+  };
+  const active = projectSessionView(fakeState({ forgeNotices: [notice] }), {
+    assessedAt: "2026-08-19T10:00:10.000Z",
+  });
+  assert.deepEqual(active.exceptions.map((item) => item.id), ["capability:azure-cli"]);
+  assert.equal(active.exceptions[0]?.scope.kind, "provider-target");
+  assert.deepEqual(active.exceptions[0]?.recoveryConditions, ["Install az and retry."]);
+
+  const cleared = projectSessionView(fakeState({
+    forgeNotices: [{ ...notice, state: "cleared" }],
+  }));
   assert.deepEqual(cleared.exceptions, []);
 });
 
@@ -456,6 +482,7 @@ function fakeState(input: {
   questions?: WorkerQuestion[];
   commitments?: Commitment[];
   capability?: CapabilityNotice;
+  forgeNotices?: ForgeOwnerActionNotice[];
 }): SessionViewState {
   const attempts = new Map((input.attempts ?? []).map((attempt) => [attempt.id, attempt]));
   const commitments = new Map((input.commitments ?? []).map((commitment) => [commitment.id, commitment]));
@@ -467,6 +494,7 @@ function fakeState(input: {
     readCommitments: () => input.commitments ?? [],
     readCommitment: (id) => commitments.get(id),
     readCapabilityNotice: () => input.capability,
+    readForgeOwnerActionNotices: () => input.forgeNotices ?? [],
   };
 }
 

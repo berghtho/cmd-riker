@@ -51,6 +51,7 @@ import {
   type WorkerSupervisor,
 } from "./worker-supervisor/index.ts";
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
+import { createForgeOperations } from "./forge-operations/index.ts";
 import {
   parseSessionViewControl,
   parseSessionViewInspection,
@@ -608,6 +609,27 @@ async function completeOwnerTurn(
                 : {}),
             });
             orchestration.observeTargetProjectOperationResult(commitmentId, result);
+            return result;
+          },
+        },
+        forgeActions: {
+          execute: async (request, actingAuthorityEffect) => {
+            const authorization = actingAuthorityEffect
+              ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
+              : undefined;
+            const result = await createForgeOperations(state).execute({
+              ...request,
+              ...(request.operation.kind === "github-issue-comment" && authorization
+                ? {
+                    actingAuthorityEffectAuthorization: {
+                      actingAuthorityId: authorization.actingAuthorityId,
+                      authorizationId: authorization.id,
+                      standingOrderId: authorization.standingOrderId,
+                    },
+                  }
+                : {}),
+            });
+            orchestration.observeForgeOperationResult(request.commitmentId, result);
             return result;
           },
         },

@@ -77,11 +77,12 @@ export type TargetProjectOperationAttempt = {
   causedByWorker?: WorkerExecutionAttribution;
 };
 
-type EffectIntentBase = {
+export type EffectIntentBase = {
   id: string;
   commitmentId: string;
   expectedEffect: string;
-  authorizedWriteRootKey: string;
+  authorizedWriteRootKey?: string;
+  effectScopeKey?: string;
   authorization: {
     kind: "lead-agent-command-authority";
     commitmentId: string;
@@ -158,7 +159,16 @@ export type WorkerAssignmentEffectIntent = EffectIntentBase & {
   verificationOperationAttemptId?: string;
 };
 
-export type EffectIntent = TargetProjectOperationEffectIntent | WorkerAssignmentEffectIntent;
+export type ForgeOperationEffectIntent = EffectIntentBase & {
+  kind: "forge-operation";
+  forgeOperationAttemptId: string;
+  provider: "github";
+};
+
+export type EffectIntent =
+  | TargetProjectOperationEffectIntent
+  | WorkerAssignmentEffectIntent
+  | ForgeOperationEffectIntent;
 
 export type TaskCliInspection = {
   version: string;

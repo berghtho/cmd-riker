@@ -1,0 +1,316 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import { openAuthoritativeState, type AuthoritativeState } from "../src/authoritative-state/index.ts";
+import {
+  createForgeOperations,
+  ForgeAdapterError,
+  NativeAzureCli,
+  type AzureCli,
+  type ForgeCapabilityProof,
+  type GitHubCli,
+} from "../src/forge-operations/index.ts";
+import { createOrchestrationCore, type Commitment } from "../src/orchestration-core/index.ts";
+
+test("GitHub mutation records intent before dispatch and settles only after exact read-back", async (t) => {
+  const { state, commitment } = await configuredState(t, "github-success");
+  const body = "CMD Riker live-proof marker.";
+  let createObservedDispatch = false;
+  const github: GitHubCli = {
+    inspect: async () => githubCapability(),
+    createIssueComment: async () => {
+      const attempt = state.readForgeOperationAttempts()[0];
+      assert.equal(attempt?.status, "running");
+      assert.equal(state.readEffectIntent(attempt?.effectIntentId ?? "")?.status, "dispatching");
+      createObservedDispatch = true;
+      return { id: "comment-42", url: "https://github.test/comment-42" };
+    },
+    readIssueComment: async () => ({
+      id: "comment-42",
+      url: "https://github.test/comment-42",
+      body,
+      author: "berghtho",
+      observedAt: "2026-08-19T20:00:00.000Z",
+    }),
+  };
+
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-comment",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      body,
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+  });
+
+  assert.equal(createObservedDispatch, true);
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.evidence[0]?.source, "provider-readback");
+  assert.equal(state.readForgeOperationAttempt(result.operationAttemptId)?.status, "succeeded");
+  assert.equal(state.readEffectIntent(result.effectIntentId ?? "")?.status, "succeeded");
+  assert.doesNotMatch(JSON.stringify(state.readForgeOperationAttempts()), /CMD Riker live-proof marker/);
+  createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
+  assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
+});
+
+test("missing GitHub authentication records one durable Owner action and deduplicates repeats", async (t) => {
+  const { state, commitment } = await configuredState(t, "github-auth");
+  const github: GitHubCli = {
+    inspect: async () => {
+      throw new ForgeAdapterError("authentication", "GitHub CLI authentication is unavailable.");
+    },
+    createIssueComment: async () => assert.fail("mutation must not dispatch"),
+    readIssueComment: async () => assert.fail("read-back must not run"),
+  };
+  const operations = createForgeOperations(state, { github });
+  const request = {
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-comment" as const,
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      body: "Not dispatched.",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+  };
+
+  const first = await operations.execute(request);
+  const second = await operations.execute(request);
+
+  assert.equal(first.status, "unavailable");
+  assert.equal(first.ownerAction?.disposition, "recorded");
+  assert.equal(second.ownerAction?.disposition, "deduplicated");
+  assert.equal(state.readForgeOwnerActionNotices().length, 1);
+  assert.equal(state.readForgeOwnerActionNotice("github-cli")?.state, "active");
+  assert.equal(state.readEffectIntents().length, 0);
+});
+
+test("an interactive Azure prompt becomes one non-interactive Owner action", async (t) => {
+  const { state, commitment } = await configuredState(
+    t,
+    "azure-prompt",
+    "azure-subscription-inspection",
+  );
+  const azure: AzureCli = {
+    inspectSubscription: async () => {
+      throw new ForgeAdapterError("interactive", "Azure CLI exceeded its non-interactive deadline.");
+    },
+  };
+  const operations = createForgeOperations(state, { azure });
+  const request = {
+    commitmentId: commitment.id,
+    operation: {
+      kind: "azure-subscription-inspection" as const,
+      subscriptionId: "00000000-0000-0000-0000-000000000036",
+      expectedAccount: "owner@example.test",
+    },
+    timeoutMs: 1_000,
+  };
+
+  const first = await operations.execute(request);
+  const second = await operations.execute(request);
+
+  assert.equal(first.status, "unavailable");
+  assert.equal(first.ownerAction?.disposition, "recorded");
+  assert.equal(second.ownerAction?.disposition, "deduplicated");
+  assert.match(first.ownerAction?.nextAction ?? "", /outside CMD Riker/);
+  assert.equal(state.readForgeOwnerActionNotices().length, 1);
+});
+
+test("Azure inspection persists attributed read-only evidence and clears its Owner action", async (t) => {
+  const { state, commitment } = await configuredState(
+    t,
+    "azure-success",
+    "azure-subscription-inspection",
+  );
+  const unavailable = createForgeOperations(state, {
+    azure: new NativeAzureCli("cmd-riker-definitely-missing-az"),
+  });
+  const request = {
+    commitmentId: commitment.id,
+    operation: {
+      kind: "azure-subscription-inspection" as const,
+      subscriptionId: "00000000-0000-0000-0000-000000000036",
+      expectedAccount: "owner@example.test",
+    },
+    timeoutMs: 1_000,
+  };
+  assert.equal((await unavailable.execute(request)).status, "unavailable");
+
+  const azure: AzureCli = {
+    inspectSubscription: async () => ({
+      capability: azureCapability(),
+      evidence: {
+        source: "provider-readback",
+        reference: "azure-subscription:00000000-0000-0000-0000-000000000036",
+        summary: "Azure subscription Test is enabled for the intended account.",
+        observedAt: "2026-08-19T20:00:00.000Z",
+      },
+    }),
+  };
+  const result = await createForgeOperations(state, { azure }).execute(request);
+
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.effectIntentId, undefined);
+  assert.equal(result.capability?.account, "owner@example.test");
+  assert.equal(state.readForgeOperationAttempt(result.operationAttemptId)?.status, "succeeded");
+  assert.equal(state.readForgeOwnerActionNotice("azure-cli")?.state, "cleared");
+  createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
+  assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
+});
+
+test("mismatched GitHub read-back leaves the dispatched effect unknown", async (t) => {
+  const { state, commitment } = await configuredState(t, "github-unknown");
+  const github: GitHubCli = {
+    inspect: async () => githubCapability(),
+    createIssueComment: async () => ({ id: "comment-42", url: "https://github.test/comment-42" }),
+    readIssueComment: async () => ({
+      id: "comment-42",
+      url: "https://github.test/comment-42",
+      body: "Different content.",
+      author: "berghtho",
+      observedAt: "2026-08-19T20:00:00.000Z",
+    }),
+  };
+
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-comment",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      body: "Intended content.",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+  });
+
+  assert.equal(result.status, "unknown");
+  assert.equal(state.readEffectIntent(result.effectIntentId ?? "")?.status, "unknown");
+  assert.match(result.uncertainty?.nextAction ?? "", /before any retry/);
+  createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
+  assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "reconciling");
+});
+
+test("restart marks a dispatched GitHub mutation unknown without replay", async (t) => {
+  const { state, commitment } = await configuredState(t, "github-restart");
+  const startedAt = "2026-08-19T20:00:00.000Z";
+  const attempt = {
+    id: "forge-attempt-restart",
+    commitmentId: commitment.id,
+    effectIntentId: "forge-effect-restart",
+    provider: "github" as const,
+    operation: "github-issue-comment" as const,
+    target: {
+      kind: "github-issue" as const,
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      bodySha256: "0".repeat(64),
+    },
+    expectedAccount: "berghtho",
+    timeoutMs: 30_000,
+    status: "ready" as const,
+    startedAt,
+  };
+  const effect = {
+    id: "forge-effect-restart",
+    commitmentId: commitment.id,
+    kind: "forge-operation" as const,
+    forgeOperationAttemptId: attempt.id,
+    provider: "github" as const,
+    effectScopeKey: "github:berghtho/cmd-riker:issue:36",
+    expectedEffect: "Create one attributed GitHub issue comment.",
+    authorization: {
+      kind: "lead-agent-command-authority" as const,
+      commitmentId: commitment.id,
+      targetProjectPath: "berghtho/cmd-riker",
+      validatedAt: startedAt,
+    },
+    retryRule: "Read back before retry.",
+    status: "pending" as const,
+  };
+  state.startForgeMutation(attempt, effect);
+  state.claimForgeMutation(
+    { ...attempt, status: "running" },
+    {
+      ...effect,
+      status: "dispatching",
+      lease: {
+        claimedAt: startedAt,
+        expiresAt: "2026-08-19T20:00:30.000Z",
+      },
+    },
+  );
+
+  createOrchestrationCore(state).reconcileInterruptedCommitments();
+
+  assert.equal(state.readForgeOperationAttempt(attempt.id)?.status, "unknown");
+  assert.equal(state.readEffectIntent(effect.id)?.status, "unknown");
+  assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "reconciling");
+});
+
+async function configuredState(
+  t: test.TestContext,
+  suffix: string,
+  operation: "github-issue-comment" | "azure-subscription-inspection" = "github-issue-comment",
+): Promise<{ state: AuthoritativeState; commitment: Commitment }> {
+  const stateDirectory = await mkdtemp(join(tmpdir(), `cmd-riker-forge-${suffix}-`));
+  const state = openAuthoritativeState(stateDirectory);
+  t.after(async () => {
+    state.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  });
+  state.initialize({
+    targetProject: { path: "C:\\target-project" },
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:11434/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  const turnId = state.appendOwnerMessage("Perform one typed Forge operation.");
+  const commitment = createOrchestrationCore(state).recordCommitment(turnId, {
+    outcome: "One typed Forge operation is completed.",
+    criteria: [{
+      kind: "forge-operation",
+      description: "The typed Forge operation succeeds with attributed evidence.",
+      operation,
+    }],
+  });
+  return { state, commitment };
+}
+
+function githubCapability(): ForgeCapabilityProof {
+  return {
+    provider: "github",
+    executable: "gh",
+    version: "gh version 2.97.0",
+    authentication: "verified",
+    account: "berghtho",
+    target: "berghtho/cmd-riker",
+    capability: "issue-comment:ADMIN",
+    observedAt: "2026-08-19T20:00:00.000Z",
+  };
+}
+
+function azureCapability(): ForgeCapabilityProof {
+  return {
+    provider: "azure",
+    executable: "az",
+    version: "2.77.0",
+    authentication: "verified",
+    account: "owner@example.test",
+    target: "00000000-0000-0000-0000-000000000036",
+    capability: "subscription-inspection",
+    observedAt: "2026-08-19T20:00:00.000Z",
+  };
+}

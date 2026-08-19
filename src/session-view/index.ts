@@ -6,17 +6,18 @@ import type {
   WorkerSession,
 } from "../orchestration-core/index.ts";
 import type { EffectIntent } from "../target-project-operations/index.ts";
+import type { ForgeOwnerActionNotice } from "../forge-operations/index.ts";
 
 const healthEvidenceFreshnessMs = 60_000;
 
 export type SessionViewSubject = {
-  kind: "worker-session" | "effect-intent" | "worker-capability" | "commitment";
+  kind: "worker-session" | "effect-intent" | "worker-capability" | "forge-capability" | "commitment";
   id: string;
   label: string;
 };
 
 export type SessionViewScope = {
-  kind: "assignment" | "commitment" | "target-project";
+  kind: "assignment" | "commitment" | "target-project" | "provider-target";
   id: string;
   label: string;
 };
@@ -87,6 +88,7 @@ export interface SessionViewState {
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
+  readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
 }
 
 export function projectSessionView(
@@ -433,6 +435,38 @@ export function projectSessionView(
     });
   }
 
+  for (const notice of state.readForgeOwnerActionNotices()) {
+    if (notice.state !== "active") continue;
+    const subject = forgeCapabilitySubject(notice);
+    const scope = forgeTargetScope(notice);
+    exceptions.push({
+      id: `capability:${notice.id}`,
+      kind: "capability-unavailable",
+      subject,
+      scope,
+      knownFacts: [notice.detail],
+      unknowns: [`Whether ${notice.provider} is now available for the intended account and target.`],
+      recoveryConditions: [notice.nextAction],
+      ...(includeHealth
+        ? {
+            healthAssessment: createHealthAssessment({
+              subject,
+              scope,
+              evidence: [{
+                reference: `forge-owner-action-notice:${notice.id}`,
+                summary: notice.detail,
+                observedAt: notice.observedAt,
+                bearing: "supports",
+              }],
+              assessedAt,
+              verdict: "unavailable",
+            }),
+          }
+        : {}),
+      actions: [],
+    });
+  }
+
   return {
     leadAvailability: options.leadAvailability ?? "available",
     activeWorkerCount: visibleWorkers.length,
@@ -631,6 +665,18 @@ function effectSubject(id: string): SessionViewSubject {
 
 function capabilitySubject(id: string): SessionViewSubject {
   return { kind: "worker-capability", id, label: "Codex Worker capability" };
+}
+
+function forgeCapabilitySubject(notice: ForgeOwnerActionNotice): SessionViewSubject {
+  return {
+    kind: "forge-capability",
+    id: notice.id,
+    label: `${notice.provider === "github" ? "GitHub" : "Azure"} CLI capability`,
+  };
+}
+
+function forgeTargetScope(notice: ForgeOwnerActionNotice): SessionViewScope {
+  return { kind: "provider-target", id: notice.target, label: notice.target };
 }
 
 function commitmentSubject(commitment: Commitment): SessionViewSubject {

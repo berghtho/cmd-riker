@@ -83,6 +83,13 @@ must independently pass the configured capability, context, data-handling, cost,
 identity, and availability gates; an unknown or failed gate makes only that candidate ineligible. A
 fallback is attributed on the completed Lead turn together with the active policy revision.
 
+The Lead Agent also exposes two typed, non-interactive Forge operations: one GitHub issue-comment
+mutation through `gh`, and one Azure subscription inspection through `az`. Each adapter proves its
+executable, authenticated identity, intended target, and required capability before use. GitHub
+records durable effect intent before dispatch and succeeds only after an exact provider read-back;
+Azure remains read-only. CMD Riker never accepts or persists credential values. A missing CLI,
+authentication, or required interaction produces one deduplicated Owner action in the Session View.
+
 The Lead Agent can visibly accept bounded conversational work as a durable Commitment. CMD Riker
 records its `Committed -> Ready -> Active -> Verifying` history, verifies declared response
 postconditions, and grants objective Acceptance itself. Criteria reserved for Owner judgment stop at

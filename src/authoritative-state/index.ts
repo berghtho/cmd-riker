@@ -18,14 +18,15 @@ import {
   assertSupportedModelSelection,
   type ModelSelection,
 } from "../model-selection.ts";
-import type {
-  CapabilityNotice,
-  Commitment,
-  LeadTurnAttempt,
-  OwnerConfiguration,
-  WorkerExecutionAttempt,
-  WorkerQuestion,
-  WorkerSession,
+import {
+  assertSupportedWorkerModelSelection,
+  type CapabilityNotice,
+  type Commitment,
+  type LeadTurnAttempt,
+  type OwnerConfiguration,
+  type WorkerExecutionAttempt,
+  type WorkerQuestion,
+  type WorkerSession,
 } from "../orchestration-core/index.ts";
 import {
   assertEffectEvidenceSupportsDisposition,
@@ -2233,14 +2234,8 @@ function validateConfiguration(configuration: OwnerConfiguration): void {
   }
   if (configuration.workerModelPolicy) {
     const { revision, selection } = configuration.workerModelPolicy;
-    if (
-      !revision.trim() ||
-      selection.provider !== "openai" ||
-      selection.nativeHarness !== "codex" ||
-      selection.model !== "gpt-5.6-sol"
-    ) {
-      throw new Error("Worker Model Policy must select the proven Codex gpt-5.6-sol capability.");
-    }
+    if (!revision.trim()) throw new Error("Worker Model Policy revision is required.");
+    assertSupportedWorkerModelSelection(selection);
   }
 }
 

@@ -51,19 +51,25 @@ export type PiTurnRequest = {
   workers?: readonly WorkerSession[];
   workerQuestions?: readonly WorkerQuestion[];
   workerActions?: {
+    capabilities?: {
+      nativeHarness: "codex" | "claude" | "copilot";
+      effectful: boolean;
+      nativeQuestions: boolean;
+      cancellation: boolean;
+    };
     delegate(input: {
       objective: string;
       prompt: string;
       commitmentId?: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
-    delegateEffectful(input: {
+    delegateEffectful?(input: {
       objective: string;
       prompt: string;
       commitmentId: string;
       targets: string[];
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
-    answer(questionId: string, answers: Record<string, string[]>): Promise<void>;
-    cancel(workerSessionId: string, reason: string): Promise<void>;
+    answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
+    cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
 };
 
@@ -298,13 +304,7 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
            "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
-           (request.workerActions
-              ? "\nA proven Codex 0.147.0 Worker capability is available for network-disabled read-only work and " +
-                "effectful work confined to the active Target Project checkout. For implementation, first record " +
-                "one Commitment with a target-project-operation test criterion, then call delegate_effectful_codex " +
-                "with checkout-relative targets. CMD Riker runs typed Verification after the Worker finishes. " +
-                "It supports native questions and cancellation. Never claim rollback or effectful replay after connection loss."
-             : "") +
+           (request.workerActions ? workerCapabilityPrompt(request.workerActions) : "") +
            (workerContext ? `\nCurrent Worker Sessions:\n${workerContext}` : "") +
            (questionContext ? `\nOpen Worker questions:\n${questionContext}` : ""),
         model: execution.model,
@@ -618,12 +618,14 @@ function workerTools(
 ): AgentTool[] {
   if (!request.workerActions) return [];
   const actions = request.workerActions;
-  return [
+  const capabilities = workerCapabilities(actions);
+  const nativeName = nativeHarnessName(capabilities.nativeHarness);
+  const tools: AgentTool[] = [
     {
-      name: "delegate_read_only_codex",
-      label: "Delegate Read-only Codex Worker",
+      name: `delegate_read_only_${capabilities.nativeHarness}`,
+      label: `Delegate Read-only ${nativeName} Worker`,
       description:
-        "Start one bounded, network-disabled, read-only Codex Worker Session without waiting for its outcome.",
+        `Start one bounded, read-only ${nativeName} Worker Session without waiting for its outcome.`,
       parameters: Type.Object({
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
@@ -648,11 +650,13 @@ function workerTools(
         };
       },
     },
-    {
-      name: "delegate_effectful_codex",
-      label: "Delegate Effectful Codex Worker",
+  ];
+  if (capabilities.effectful && actions.delegateEffectful) {
+    tools.push({
+      name: `delegate_effectful_${capabilities.nativeHarness}`,
+      label: `Delegate Effectful ${nativeName} Worker`,
       description:
-        "Start one bounded, network-disabled Codex implementation assignment inside the technically enforced active Target Project checkout. Requires an active Commitment with declared test Verification.",
+        `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. Requires an active Commitment with declared test Verification.`,
       parameters: Type.Object({
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
@@ -661,7 +665,7 @@ function workerTools(
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const result = await actions.delegateEffectful(
+        const result = await actions.delegateEffectful!(
           params as {
             objective: string;
             prompt: string;
@@ -682,11 +686,13 @@ function workerTools(
           details: result,
         };
       },
-    },
-    {
+    });
+  }
+  if (capabilities.nativeQuestions && actions.answer) {
+    tools.push({
       name: "answer_worker_question",
       label: "Answer Worker Question",
-      description: "Deliver the Owner's answer to one open native Codex question by durable identity.",
+      description: `Deliver the Owner's answer to one open native ${nativeName} question by durable identity.`,
       parameters: Type.Object({
         questionId: Type.String({ minLength: 1 }),
         answers: Type.Record(
@@ -700,7 +706,7 @@ function workerTools(
           questionId: string;
           answers: Record<string, string[]>;
         };
-        await actions.answer(questionId, answers);
+        await actions.answer!(questionId, answers);
         observer.onMutation();
         return {
           content: [
@@ -714,12 +720,14 @@ function workerTools(
           details: { questionId, deliveryState: "answer-recorded" },
         };
       },
-    },
-    {
+    });
+  }
+  if (capabilities.cancellation && actions.cancel) {
+    tools.push({
       name: "cancel_worker_session",
       label: "Cancel Worker Session",
       description:
-        "Record cancellation intent, then interrupt one active Codex Worker Session. This does not roll back effects.",
+        `Record cancellation intent, then interrupt one active ${nativeName} Worker Session. This does not roll back effects.`,
       parameters: Type.Object({
         workerSessionId: Type.String({ minLength: 1 }),
         reason: Type.String({ minLength: 1 }),
@@ -730,7 +738,7 @@ function workerTools(
           workerSessionId: string;
           reason: string;
         };
-        await actions.cancel(workerSessionId, reason);
+        await actions.cancel!(workerSessionId, reason);
         observer.onMutation();
         return {
           content: [
@@ -744,8 +752,36 @@ function workerTools(
           details: { workerSessionId },
         };
       },
-    },
-  ];
+    });
+  }
+  return tools;
+}
+
+function workerCapabilities(actions: NonNullable<PiTurnRequest["workerActions"]>) {
+  return actions.capabilities ?? {
+    nativeHarness: "codex" as const,
+    effectful: true,
+    nativeQuestions: true,
+    cancellation: true,
+  };
+}
+
+function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {
+  return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
+}
+
+function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerActions"]>): string {
+  const capabilities = workerCapabilities(actions);
+  const nativeName = nativeHarnessName(capabilities.nativeHarness);
+  return (
+    `\nA proven ${nativeName} Worker capability is available for bounded read-only work.` +
+    (capabilities.effectful
+      ? " Effectful work is confined to the active Target Project checkout; first record one Commitment with a target-project-operation test criterion, then delegate with checkout-relative targets. CMD Riker runs typed Verification after the Worker finishes."
+      : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
+    (capabilities.nativeQuestions ? " Native questions are available." : " Native questions are unavailable.") +
+    (capabilities.cancellation ? " Native cancellation is available." : " Native cancellation is unavailable.") +
+    " Never claim resume, deletion, child control, rollback, or effect continuity when the recorded capability facts do not prove it."
+  );
 }
 
 function toPiModel(

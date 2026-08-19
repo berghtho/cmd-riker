@@ -2,6 +2,9 @@ import {
   createOrchestrationCore,
   type OrchestrationState,
   type WorkerExecutionAttempt,
+  type WorkerModelSelection,
+  type WorkerNativeHarnessSelection,
+  type WorkerNativeCapabilities,
   type WorkerReportedOutcome,
   type WorkerSession,
 } from "../orchestration-core/index.ts";
@@ -17,6 +20,16 @@ export {
   resolveCodexRuntime,
   type CodexRuntime,
 } from "./codex-app-server.ts";
+export {
+  createClaudeWorkerHarness,
+  resolveClaudeRuntime,
+  type ClaudeRuntime,
+} from "./claude-process.ts";
+export {
+  createCopilotWorkerHarness,
+  resolveCopilotRuntime,
+  type CopilotRuntime,
+} from "./copilot-acp.ts";
 export {
   NativeEffectfulCheckoutInspector,
   type EffectfulCheckoutInspector,
@@ -74,13 +87,14 @@ export type WorkerExecutionObserver = {
   failed(error: Error): void | Promise<void>;
 };
 
-export type CodexWorkerExecution = {
+export type NativeWorkerExecution = {
   identity: {
     providerSessionId: string;
     nativeExecutionId: string;
     process: { pid: number; startedAt: string };
     harnessVersion: string;
     protocolSchemaSha256: string;
+    capabilities: WorkerNativeCapabilities;
     writeIsolation?: "codex-windows-workspace-write";
   };
   answer(providerRequestId: number | string, answers: Record<string, string[]>): Promise<void>;
@@ -88,15 +102,26 @@ export type CodexWorkerExecution = {
   terminate(): Promise<{ gone: boolean }>;
 };
 
-export interface CodexWorkerHarness {
+export interface NativeWorkerHarness {
+  readonly selection: WorkerNativeHarnessSelection;
+  readonly supportsEffectful: boolean;
   start(
     request: WorkerStartRequest,
     observer: WorkerExecutionObserver,
-  ): Promise<CodexWorkerExecution>;
+  ): Promise<NativeWorkerExecution>;
   abandon(process: { pid: number; startedAt: string }): Promise<{ gone: boolean }>;
 }
 
+export type CodexWorkerExecution = NativeWorkerExecution;
+export interface CodexWorkerHarness extends NativeWorkerHarness {}
+
 export interface WorkerSupervisor {
+  capabilities(): {
+    nativeHarness: WorkerModelSelection["nativeHarness"];
+    effectful: boolean;
+    nativeQuestions: boolean;
+    cancellation: boolean;
+  };
   delegate(input: {
     objective: string;
     prompt: string;
@@ -127,12 +152,12 @@ export interface WorkerSupervisor {
 
 export function createWorkerSupervisor(
   state: OrchestrationState,
-  harness: CodexWorkerHarness,
+  harness: NativeWorkerHarness,
   verificationOperations?: TargetProjectOperations,
   checkoutInspector: EffectfulCheckoutInspector = new NativeEffectfulCheckoutInspector(),
 ): WorkerSupervisor {
   const orchestration = createOrchestrationCore(state);
-  const executions = new Map<string, CodexWorkerExecution>();
+  const executions = new Map<string, NativeWorkerExecution>();
   const outputByAttempt = new Map<string, string>();
   const commandsByAttempt = new Map<string, string[]>();
   const deadlinesByAttempt = new Map<string, NodeJS.Timeout[]>();
@@ -172,8 +197,13 @@ export function createWorkerSupervisor(
     workerSession: WorkerSession,
     executionAttempt: WorkerExecutionAttempt,
   ): Promise<void> => {
+    if (!sameNativeHarness(executionAttempt.modelSelection, harness.selection)) {
+      throw new Error(
+        `${nativeHarnessName(executionAttempt.modelSelection.nativeHarness)} continuity is unavailable because the configured Native Harness changed.`,
+      );
+    }
     orchestration.claimWorkerLaunch(workerSession.id, executionAttempt.id);
-    const ready = Promise.withResolvers<CodexWorkerExecution>();
+    const ready = Promise.withResolvers<NativeWorkerExecution>();
     void ready.promise.catch(() => {});
     const retainedAnswers = orchestration
       .workerQuestionsView()
@@ -287,7 +317,7 @@ export function createWorkerSupervisor(
           },
           async failed(error) {
             clearDeadlines(executionAttempt.id);
-            let liveExecution: CodexWorkerExecution;
+            let liveExecution: NativeWorkerExecution;
             try {
               liveExecution = await ready.promise;
             } catch {
@@ -321,6 +351,7 @@ export function createWorkerSupervisor(
         nativeExecutionId: execution.identity.nativeExecutionId,
         process: execution.identity.process,
         harnessVersion: execution.identity.harnessVersion,
+        capabilities: execution.identity.capabilities,
         ...(execution.identity.writeIsolation
           ? { writeIsolation: "authorized-write-root-enforced" as const }
           : {}),
@@ -385,7 +416,7 @@ export function createWorkerSupervisor(
         orchestration.recordWorkerContinuityLoss(
           workerSession.id,
           executionAttempt.id,
-          error instanceof Error ? error.message : "Codex startup continuity was lost.",
+          error instanceof Error ? error.message : "Native Harness startup continuity was lost.",
         );
         const recovery = orchestration.recoverWorker(workerSession.id, abandoned.gone);
         if (recovery.kind === "restart") {
@@ -398,14 +429,35 @@ export function createWorkerSupervisor(
         executionAttemptId: executionAttempt.id,
         status: "failed",
         processGone: !latestAttempt?.process,
-        detail: error instanceof Error ? error.message : "Codex Worker startup failed.",
+        detail: error instanceof Error ? error.message : "Worker startup failed.",
       });
       throw error;
     }
   };
   return {
+    capabilities() {
+      const liveCapabilities = [...executions.keys()].flatMap((workerSessionId) => {
+        const worker = orchestration.workerSessionView(workerSessionId);
+        const attempt = worker
+          ? orchestration.workerExecutionAttemptView(worker.currentExecutionAttemptId)
+          : undefined;
+        return attempt?.capabilities ? [attempt.capabilities] : [];
+      });
+      return {
+        nativeHarness: harness.selection.nativeHarness,
+        effectful: harness.supportsEffectful,
+        nativeQuestions: liveCapabilities.some((capabilities) => capabilities.nativeQuestions),
+        cancellation: liveCapabilities.some((capabilities) => capabilities.cancellation),
+      };
+    },
+
     async delegate(input) {
-      const { workerSession, executionAttempt } = orchestration.delegateReadOnlyCodex(input);
+      const { model, ...assignment } = input;
+      const modelSelection: WorkerModelSelection = { ...harness.selection, model };
+      const { workerSession, executionAttempt } = orchestration.delegateReadOnlyWorker({
+        ...assignment,
+        modelSelection,
+      });
       void startExecution(workerSession, executionAttempt).catch(() => {});
       return {
         workerSessionId: workerSession.id,
@@ -414,6 +466,11 @@ export function createWorkerSupervisor(
     },
 
     async delegateEffectful(input) {
+      if (!harness.supportsEffectful) {
+        throw new Error(
+          `${nativeHarnessName(harness.selection.nativeHarness)} effectful assignments are unavailable because Authorized Write Root enforcement is not proven.`,
+        );
+      }
       if (!verificationOperations) {
         throw new Error("Effectful Worker delegation requires typed Verification operations.");
       }
@@ -422,9 +479,10 @@ export function createWorkerSupervisor(
         input.timeoutMs,
       );
       const { model, ...assignment } = input;
+      const modelSelection: WorkerModelSelection = { ...harness.selection, model };
       const { workerSession, executionAttempt } = orchestration.delegateEffectfulWorker({
         ...assignment,
-        modelSelection: { provider: "openai", model, nativeHarness: "codex" },
+        modelSelection,
         checkoutIsolation,
       });
       void startExecution(workerSession, executionAttempt).catch(() => {});
@@ -435,6 +493,17 @@ export function createWorkerSupervisor(
     },
 
     async answer(questionId, ownerTurnId, answers) {
+      const pendingQuestion = orchestration.workerQuestionsView().find(
+        (question) => question.id === questionId,
+      );
+      const pendingAttempt = pendingQuestion
+        ? orchestration.workerExecutionAttemptView(pendingQuestion.executionAttemptId)
+        : undefined;
+      if (pendingAttempt?.capabilities?.nativeQuestions === false) {
+        throw new Error(
+          `${nativeHarnessName(pendingAttempt.modelSelection.nativeHarness)} native questions are unavailable.`,
+        );
+      }
       const question = orchestration.recordWorkerAnswer(questionId, ownerTurnId, answers);
       const worker = orchestration.workerSessionView(question.workerSessionId);
       if (worker?.currentExecutionAttemptId !== question.executionAttemptId) {
@@ -445,7 +514,7 @@ export function createWorkerSupervisor(
       const execution = executions.get(question.workerSessionId);
       if (!execution) {
         throw new Error(
-          `Worker Session ${question.workerSessionId} has no live Codex execution for answer delivery.`,
+          `Worker Session ${question.workerSessionId} has no live native execution for answer delivery.`,
         );
       }
       void execution
@@ -457,10 +526,19 @@ export function createWorkerSupervisor(
     },
 
     async cancel(workerSessionId, ownerTurnId, reason) {
+      const currentWorker = orchestration.workerSessionView(workerSessionId);
+      const currentAttempt = currentWorker
+        ? orchestration.workerExecutionAttemptView(currentWorker.currentExecutionAttemptId)
+        : undefined;
+      if (currentAttempt?.capabilities?.cancellation === false) {
+        throw new Error(
+          `${nativeHarnessName(currentAttempt.modelSelection.nativeHarness)} cancellation is unavailable.`,
+        );
+      }
       orchestration.requestWorkerCancellation(workerSessionId, ownerTurnId, reason);
       const execution = executions.get(workerSessionId);
       if (!execution) {
-        throw new Error(`Worker Session ${workerSessionId} has no live Codex execution to interrupt.`);
+        throw new Error(`Worker Session ${workerSessionId} has no live native execution to interrupt.`);
       }
       void execution.interrupt().catch(async (error: unknown) => {
         const termination = await execution.terminate();
@@ -471,7 +549,7 @@ export function createWorkerSupervisor(
           executionAttemptId: worker!.currentExecutionAttemptId,
           status: "interrupted",
           processGone: true,
-          detail: error instanceof Error ? error.message : "Codex interruption failed.",
+          detail: error instanceof Error ? error.message : "Native interruption failed.",
         });
         executions.delete(workerSessionId);
       });
@@ -482,6 +560,16 @@ export function createWorkerSupervisor(
         const abandoned = attempt.process
           ? await harness.abandon(attempt.process)
           : { gone: true };
+        if (!sameNativeHarness(attempt.modelSelection, harness.selection)) {
+          if (attempt.status !== "continuity-lost") {
+            orchestration.recordWorkerContinuityLoss(
+              worker.id,
+              attempt.id,
+              `${nativeHarnessName(attempt.modelSelection.nativeHarness)} continuity is unavailable because the configured Native Harness changed.`,
+            );
+          }
+          continue;
+        }
         if (attempt.status !== "continuity-lost" && worker.state !== "cancellation-requested") {
           orchestration.recordWorkerContinuityLoss(
             worker.id,
@@ -499,4 +587,15 @@ export function createWorkerSupervisor(
       }
     },
   };
+}
+
+function nativeHarnessName(harness: WorkerModelSelection["nativeHarness"]): string {
+  return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
+}
+
+function sameNativeHarness(
+  selection: WorkerModelSelection,
+  harness: NativeWorkerHarness["selection"],
+): boolean {
+  return selection.provider === harness.provider && selection.nativeHarness === harness.nativeHarness;
 }

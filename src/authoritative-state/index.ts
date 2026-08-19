@@ -19,11 +19,15 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import {
+  type ActingAuthority,
+  type ActingAuthorityEffectRequest,
   assertSupportedWorkerModelSelection,
   type CapabilityNotice,
   type Commitment,
+  type CoordinationMessage,
   type LeadTurnAttempt,
   type OwnerConfiguration,
+  type StandingOrder,
   type WorkerExecutionAttempt,
   type WorkerQuestion,
   type WorkerSession,
@@ -42,15 +46,25 @@ import type {
 
 export type { ModelSelection } from "../model-selection.ts";
 export type {
+  ActingAuthority,
+  ActingAuthorityEffectRequest,
+  ActingAuthorityEvent,
+  ActingAuthorityHandoff,
   CapabilityNotice,
   Commitment,
   CommitmentCriterion,
   CommitmentDraft,
   CommitmentState,
+  CoordinationMessage,
   LeadModelPolicy,
   LeadTurnAttempt,
   ModelCandidateValidation,
   OwnerConfiguration,
+  StandingOrder,
+  StandingOrderDraft,
+  StandingOrderEffectClass,
+  ReviewFinding,
+  ReviewReason,
   WorkerExecutionAttempt,
   WorkerModelSelection,
   WorkerOutcome,
@@ -141,6 +155,8 @@ export interface AuthoritativeState {
   initialize(configuration: OwnerConfiguration): void;
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
   readOwnerConversation(): OwnerConversation | undefined;
+  ownerMessage(ownerTurnId: string): string | undefined;
+  latestOwnerTurnId(): string | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
   appendOwnerMessage(content: string): string;
   appendLeadAgentMessage(
@@ -185,6 +201,14 @@ export interface AuthoritativeState {
   ): void;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
+  readStandingOrder(standingOrderId: string): StandingOrder | undefined;
+  readStandingOrders(): StandingOrder[];
+  appendStandingOrderSnapshots(snapshots: StandingOrder[]): void;
+  readActingAuthority(actingAuthorityId: string): ActingAuthority | undefined;
+  readActingAuthorities(): ActingAuthority[];
+  appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
+  appendCoordinationMessage(message: CoordinationMessage): void;
+  readCoordinationMessages(): CoordinationMessage[];
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -237,6 +261,9 @@ type FactDraft =
   | { kind: "worker-execution-attempt.snapshot"; value: WorkerExecutionAttempt }
   | { kind: "worker-question.snapshot"; value: WorkerQuestion }
   | { kind: "capability-notice.snapshot"; value: CapabilityNotice }
+  | { kind: "standing-order.snapshot"; value: StandingOrder }
+  | { kind: "acting-authority.snapshot"; value: ActingAuthority }
+  | { kind: "coordination-message.recorded"; value: CoordinationMessage }
   | { kind: "target-project-operation-attempt.snapshot"; value: TargetProjectOperationAttempt }
   | { kind: "effect-intent.snapshot"; value: EffectIntent };
 
@@ -258,6 +285,9 @@ type TransitionKind =
   | `worker-execution-attempt.${WorkerExecutionAttempt["status"]}`
   | `worker-question.${WorkerQuestion["status"]}`
   | `capability-notice.${CapabilityNotice["state"]}`
+  | `standing-order.${StandingOrder["state"]}`
+  | `acting-authority.${ActingAuthority["state"]}`
+  | "coordination-message.recorded"
   | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
   | `effect-intent.${EffectIntent["status"]}`;
 
@@ -487,11 +517,13 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     }
   };
 
-  const readCurrentWorkerSnapshot = <T>(
+  const readCurrentSnapshot = <T>(
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot"
       | "effect-intent.snapshot",
     subjectId: string,
   ): { id: string; value: T } | undefined => {
@@ -510,11 +542,13 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     return row ? { id: row.id, value: JSON.parse(row.value_json) as T } : undefined;
   };
 
-  const readCurrentWorkerSnapshots = <T>(
+  const readCurrentSnapshots = <T>(
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
-      | "worker-question.snapshot",
+      | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot",
   ): T[] => {
     const rows = database
       .prepare(`
@@ -530,26 +564,32 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     return rows.map((row) => JSON.parse(row.value_json) as T);
   };
 
-  type WorkerSnapshotEntry = {
+  type DurableSnapshotEntry = {
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot"
       | "effect-intent.snapshot";
     subjectPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
+      | "standing-order"
+      | "acting-authority"
       | "effect-intent";
     transitionPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
+      | "standing-order"
+      | "acting-authority"
       | "effect-intent";
     snapshot: { id: string; state?: string; status?: string };
   };
 
-  const appendWorkerStateBatch = (entries: WorkerSnapshotEntry[]): void => {
+  const appendSnapshotBatch = (entries: DurableSnapshotEntry[]): void => {
     if (entries.length === 0) return;
     const predecessorBySubject = new Map<string, string | undefined>();
     database.exec("BEGIN IMMEDIATE");
@@ -559,7 +599,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         if (!predecessorBySubject.has(subjectId)) {
           predecessorBySubject.set(
             subjectId,
-            readCurrentWorkerSnapshot(entry.kind, subjectId)?.id,
+            readCurrentSnapshot(entry.kind, subjectId)?.id,
           );
         }
         const factId = randomUUID();
@@ -598,21 +638,33 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     }
   };
 
-  const appendWorkerSnapshots = <T extends { id: string; state?: string; status?: string }>(
+  const appendSnapshots = <T extends { id: string; state?: string; status?: string }>(
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
-      | "worker-question.snapshot",
-    subjectPrefix: "worker-session" | "worker-execution-attempt" | "worker-question",
-    transitionPrefix: "worker-session" | "worker-execution-attempt" | "worker-question",
+      | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot",
+    subjectPrefix:
+      | "worker-session"
+      | "worker-execution-attempt"
+      | "worker-question"
+      | "standing-order"
+      | "acting-authority",
+    transitionPrefix:
+      | "worker-session"
+      | "worker-execution-attempt"
+      | "worker-question"
+      | "standing-order"
+      | "acting-authority",
     snapshots: T[],
   ): void => {
     if (snapshots.length === 0) return;
     const subjectIdentity = snapshots[0]!.id;
     if (snapshots.some((snapshot) => snapshot.id !== subjectIdentity)) {
-      throw new Error("One Worker snapshot batch cannot contain multiple identities.");
+      throw new Error("One durable snapshot batch cannot contain multiple identities.");
     }
-    appendWorkerStateBatch(
+    appendSnapshotBatch(
       snapshots.map((snapshot) => ({
         kind,
         subjectPrefix,
@@ -620,6 +672,79 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         snapshot,
       })),
     );
+  };
+
+  const assertActingAuthorityDispatch = (
+    effectIntent: EffectIntent,
+    actualEffect: {
+      effectClass: StandingOrder["effectClasses"][number];
+      target: string;
+      reversible: boolean;
+      externallyBinding: boolean;
+      incrementalSpendUsd: number;
+    },
+  ): void => {
+    const actingAuthority = readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot").at(-1);
+    const authorization = effectIntent.authorization.actingAuthority;
+    if (!actingAuthority || actingAuthority.state === "ended") {
+      if (authorization) {
+        throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
+      }
+      return;
+    }
+    if (!actingAuthority.commitmentIds.includes(effectIntent.commitmentId)) {
+      if (authorization) {
+        throw new Error("Acting Authority cannot authorize an unrelated Commitment effect.");
+      }
+      return;
+    }
+    if (actingAuthority.state !== "active" || !authorization) {
+      throw new Error("Effect dispatch is blocked without active Acting Authority authorization.");
+    }
+    const grant = (actingAuthority.effectAuthorizations ?? []).find(
+      (candidate) => candidate.id === authorization.authorizationId,
+    );
+    const standingOrder = authorization.standingOrderId
+      ? readCurrentSnapshot<StandingOrder>(
+          "standing-order.snapshot",
+          `standing-order:${authorization.standingOrderId}`,
+        )?.value
+      : undefined;
+    if (
+      !grant ||
+      grant.actingAuthorityId !== actingAuthority.id ||
+      authorization.actingAuthorityId !== actingAuthority.id ||
+      grant.standingOrderId !== authorization.standingOrderId ||
+      grant.commitmentId !== effectIntent.commitmentId ||
+      grant.effectClass !== actualEffect.effectClass ||
+      grant.target !== actualEffect.target ||
+      grant.reversible !== actualEffect.reversible ||
+      grant.externallyBinding !== actualEffect.externallyBinding ||
+      grant.incrementalSpendUsd !== actualEffect.incrementalSpendUsd ||
+      !standingOrder ||
+      standingOrder.state !== "active" ||
+      Date.parse(standingOrder.validUntil) <= Date.now() ||
+      !standingOrder.commitmentIds.includes(grant.commitmentId) ||
+      !standingOrder.effectClasses.includes(grant.effectClass) ||
+      !standingOrder.targets.includes(grant.target) ||
+      grant.incrementalSpendUsd > standingOrder.maximumIncrementalSpendUsd ||
+      (!grant.reversible && !standingOrder.allowIrreversibleEffects) ||
+      (grant.externallyBinding && !standingOrder.allowExternallyBindingEffects)
+    ) {
+      throw new Error("Effect dispatch does not match its durable Acting Authority authorization.");
+    }
+    const reused = database
+      .prepare(`
+        SELECT 1
+          FROM facts
+         WHERE kind = 'effect-intent.snapshot'
+           AND json_extract(value_json, '$.authorization.actingAuthority.authorizationId') = ?
+         LIMIT 1
+      `)
+      .get(authorization.authorizationId);
+    if (reused) {
+      throw new Error("An Acting Authority effect authorization can dispatch only one effect intent.");
+    }
   };
 
   const readTargetProjectOperationAttemptRow = (
@@ -683,6 +808,13 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     database.exec("BEGIN IMMEDIATE");
     try {
       if (rejectConflictingCommitmentEffect) {
+        assertActingAuthorityDispatch(effectIntent, {
+          effectClass: "test",
+          target: attempt.operation,
+          reversible: true,
+          externallyBinding: false,
+          incrementalSpendUsd: 0,
+        });
         const conflict = database
           .prepare(`
             SELECT 1
@@ -916,6 +1048,32 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return row?.sequence;
     },
 
+    ownerMessage(ownerTurnId) {
+      const row = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'owner-conversation.owner-message'
+             AND json_extract(value_json, '$.turnId') = ?
+           LIMIT 1
+        `)
+        .get(ownerTurnId) as { value_json: string } | undefined;
+      return row ? (JSON.parse(row.value_json) as { content: string }).content : undefined;
+    },
+
+    latestOwnerTurnId() {
+      const row = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'owner-conversation.owner-message'
+           ORDER BY sequence DESC
+           LIMIT 1
+        `)
+        .get() as { value_json: string } | undefined;
+      return row ? (JSON.parse(row.value_json) as { turnId: string }).turnId : undefined;
+    },
+
     leadAgentResponse(ownerTurnId) {
       const row = database
         .prepare(`
@@ -1000,13 +1158,30 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         throw new Error("An effectful Worker launch cannot omit its effect intent.");
       }
       const recordedAt = new Date().toISOString();
-      let predecessorId = readCurrentWorkerSnapshot<WorkerSession>(
+      let predecessorId = readCurrentSnapshot<WorkerSession>(
         "worker-session.snapshot",
         `worker-session:${workerSession.id}`,
       )?.id;
       database.exec("BEGIN IMMEDIATE");
       try {
         if (effectIntent) {
+          const assignment = workerSession.assignment;
+          if (assignment.readOnly) {
+            throw new Error("An effect intent cannot dispatch a read-only Worker assignment.");
+          }
+          assertActingAuthorityDispatch(effectIntent, {
+            effectClass:
+              assignment.coordination?.role === "implementer" &&
+              assignment.coordination.repairOfReviewFindingIds?.length
+                ? "self-repair"
+                : "update",
+            target: assignment.targets.length === 1
+              ? assignment.targets[0]!
+              : "",
+            reversible: true,
+            externallyBinding: false,
+            incrementalSpendUsd: assignment.costBound.maximumIncrementalSpendUsd,
+          });
           const conflict = database
             .prepare(`
               SELECT 1
@@ -1105,7 +1280,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     appendWorkerState(input) {
-      appendWorkerStateBatch([
+      appendSnapshotBatch([
         ...(input.executionAttempt
           ? [
               {
@@ -1227,8 +1402,67 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       );
     },
 
+    appendStandingOrderSnapshots(snapshots) {
+      appendSnapshots(
+        "standing-order.snapshot",
+        "standing-order",
+        "standing-order",
+        snapshots,
+      );
+    },
+
+    readStandingOrder(standingOrderId) {
+      return readCurrentSnapshot<StandingOrder>(
+        "standing-order.snapshot",
+        `standing-order:${standingOrderId}`,
+      )?.value;
+    },
+
+    readStandingOrders() {
+      return readCurrentSnapshots<StandingOrder>("standing-order.snapshot");
+    },
+
+    appendActingAuthoritySnapshots(snapshots) {
+      appendSnapshots(
+        "acting-authority.snapshot",
+        "acting-authority",
+        "acting-authority",
+        snapshots,
+      );
+    },
+
+    readActingAuthority(actingAuthorityId) {
+      return readCurrentSnapshot<ActingAuthority>(
+        "acting-authority.snapshot",
+        `acting-authority:${actingAuthorityId}`,
+      )?.value;
+    },
+
+    readActingAuthorities() {
+      return readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot");
+    },
+
+    appendCoordinationMessage(message) {
+      appendFact(
+        { kind: "coordination-message.recorded", value: message },
+        "coordination-message.recorded",
+      );
+    },
+
+    readCoordinationMessages() {
+      const rows = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'coordination-message.recorded'
+           ORDER BY sequence
+        `)
+        .all() as Array<{ value_json: string }>;
+      return rows.map((row) => JSON.parse(row.value_json) as CoordinationMessage);
+    },
+
     appendWorkerSessionSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "worker-session.snapshot",
         "worker-session",
         "worker-session",
@@ -1237,18 +1471,18 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readWorkerSession(workerSessionId) {
-      return readCurrentWorkerSnapshot<WorkerSession>(
+      return readCurrentSnapshot<WorkerSession>(
         "worker-session.snapshot",
         `worker-session:${workerSessionId}`,
       )?.value;
     },
 
     readWorkerSessions() {
-      return readCurrentWorkerSnapshots<WorkerSession>("worker-session.snapshot");
+      return readCurrentSnapshots<WorkerSession>("worker-session.snapshot");
     },
 
     appendWorkerExecutionAttemptSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "worker-execution-attempt.snapshot",
         "worker-execution-attempt",
         "worker-execution-attempt",
@@ -1257,20 +1491,20 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readWorkerExecutionAttempt(attemptId) {
-      return readCurrentWorkerSnapshot<WorkerExecutionAttempt>(
+      return readCurrentSnapshot<WorkerExecutionAttempt>(
         "worker-execution-attempt.snapshot",
         `worker-execution-attempt:${attemptId}`,
       )?.value;
     },
 
     readWorkerExecutionAttempts() {
-      return readCurrentWorkerSnapshots<WorkerExecutionAttempt>(
+      return readCurrentSnapshots<WorkerExecutionAttempt>(
         "worker-execution-attempt.snapshot",
       );
     },
 
     appendWorkerQuestionSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "worker-question.snapshot",
         "worker-question",
         "worker-question",
@@ -1279,14 +1513,14 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readWorkerQuestion(questionId) {
-      return readCurrentWorkerSnapshot<WorkerQuestion>(
+      return readCurrentSnapshot<WorkerQuestion>(
         "worker-question.snapshot",
         `worker-question:${questionId}`,
       )?.value;
     },
 
     readWorkerQuestions() {
-      return readCurrentWorkerSnapshots<WorkerQuestion>("worker-question.snapshot");
+      return readCurrentSnapshots<WorkerQuestion>("worker-question.snapshot");
     },
 
     startTargetProjectOperation(attempt, effectIntent) {
@@ -1990,6 +2224,9 @@ function ensureSchema(database: DatabaseSync): void {
         'worker-execution-attempt.snapshot',
         'worker-question.snapshot',
         'capability-notice.snapshot',
+        'standing-order.snapshot',
+        'acting-authority.snapshot',
+        'coordination-message.recorded',
         'target-project-operation-attempt.snapshot',
         'effect-intent.snapshot'
       )),
@@ -2044,6 +2281,12 @@ function ensureSchema(database: DatabaseSync): void {
         'worker-question.cancelled',
         'capability-notice.active',
         'capability-notice.cleared',
+        'standing-order.active',
+        'standing-order.revoked',
+        'acting-authority.active',
+        'acting-authority.handoff-pending',
+        'acting-authority.ended',
+        'coordination-message.recorded',
         'target-project-operation-attempt.running',
         'target-project-operation-attempt.ready',
         'target-project-operation-attempt.succeeded',
@@ -2097,6 +2340,9 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'worker-execution-attempt.snapshot'") &&
     row.sql.includes("'worker-question.snapshot'") &&
     row.sql.includes("'capability-notice.snapshot'") &&
+    row.sql.includes("'standing-order.snapshot'") &&
+    row.sql.includes("'acting-authority.snapshot'") &&
+    row.sql.includes("'coordination-message.recorded'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
@@ -2127,6 +2373,9 @@ function ensureSchema(database: DatabaseSync): void {
           'worker-execution-attempt.snapshot',
           'worker-question.snapshot',
           'capability-notice.snapshot',
+          'standing-order.snapshot',
+          'acting-authority.snapshot',
+          'coordination-message.recorded',
           'target-project-operation-attempt.snapshot',
           'effect-intent.snapshot'
         )),
@@ -2179,6 +2428,12 @@ function ensureSchema(database: DatabaseSync): void {
           'worker-question.cancelled',
           'capability-notice.active',
           'capability-notice.cleared',
+          'standing-order.active',
+          'standing-order.revoked',
+          'acting-authority.active',
+          'acting-authority.handoff-pending',
+          'acting-authority.ended',
+          'coordination-message.recorded',
           'target-project-operation-attempt.running',
           'target-project-operation-attempt.ready',
           'target-project-operation-attempt.succeeded',
@@ -2289,6 +2544,12 @@ function factSubject(input: FactDraft): string {
       return `worker-question:${input.value.id}`;
     case "capability-notice.snapshot":
       return `capability-notice:${input.value.id}`;
+    case "standing-order.snapshot":
+      return `standing-order:${input.value.id}`;
+    case "acting-authority.snapshot":
+      return `acting-authority:${input.value.id}`;
+    case "coordination-message.recorded":
+      return `coordination-message:${input.value.id}`;
     case "target-project-operation-attempt.snapshot":
       return `target-project-operation-attempt:${input.value.id}`;
     case "effect-intent.snapshot":

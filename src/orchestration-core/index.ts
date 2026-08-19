@@ -109,6 +109,11 @@ export type Commitment = {
     kind: "blocked" | "paused" | "reconciling";
     reason: string;
     nextAction: string;
+    ownerAttention?:
+      | "owner-reserved-decision"
+      | "recovery-exhausted"
+      | "trusted-base-loss"
+      | "mission-critical-impairment";
   };
   disposition?: {
     kind: "cancelled" | "superseded";
@@ -386,6 +391,10 @@ export type WorkerQuestion = {
     isOther: boolean;
   }>;
   status: "open" | "answer-recorded" | "delivered" | "cancelled";
+  ownerAttention?: {
+    kind: "owner-reserved-decision";
+    reason: string;
+  };
   answer?: {
     ownerTurnId: string;
     answers: Record<string, string[]>;

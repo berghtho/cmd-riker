@@ -2,6 +2,7 @@ import type {
   CapabilityNotice,
   Commitment,
   WorkerExecutionAttempt,
+  WorkerQuestion,
   WorkerSession,
 } from "../orchestration-core/index.ts";
 import type { EffectIntent } from "../target-project-operations/index.ts";
@@ -81,6 +82,7 @@ export type SessionViewSnapshot = {
 export interface SessionViewState {
   readWorkerSessions(): WorkerSession[];
   readWorkerExecutionAttempt(attemptId: string): WorkerExecutionAttempt | undefined;
+  readWorkerQuestions(): WorkerQuestion[];
   readEffectIntents(): EffectIntent[];
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
@@ -114,10 +116,17 @@ export function projectSessionView(
       unsettledWorkerByCommitment.set(worker.assignment.commitmentId, worker);
     }
   }
-  const unknownEffectCommitments = new Set(
-    state.readEffectIntents()
-      .filter((effect) => effect.status === "unknown")
-      .map((effect) => effect.commitmentId),
+  const unknownEffects = state.readEffectIntents().filter((effect) => effect.status === "unknown");
+  const unknownEffectsByCommitment = new Map<string, EffectIntent[]>();
+  for (const effect of unknownEffects) {
+    const scoped = unknownEffectsByCommitment.get(effect.commitmentId) ?? [];
+    scoped.push(effect);
+    unknownEffectsByCommitment.set(effect.commitmentId, scoped);
+  }
+  const cancellingCommitments = new Set(
+    workers
+      .filter((worker) => worker.state === "cancellation-requested")
+      .flatMap((worker) => worker.assignment.commitmentId ? [worker.assignment.commitmentId] : []),
   );
   const visibleWorkers = workers
     .filter((worker) => !isTerminalWorker(worker))
@@ -142,7 +151,8 @@ export function projectSessionView(
     pausedCommitments.add(commitment.id);
     const worker = unsettledWorkerByCommitment.get(commitment.id);
     const workerUnsettled = Boolean(worker && !isTerminalWorker(worker));
-    const effectUnsettled = unknownEffectCommitments.has(commitment.id);
+    const scopedUnknownEffects = unknownEffectsByCommitment.get(commitment.id) ?? [];
+    const effectUnsettled = scopedUnknownEffects.length > 0;
     if (!workerUnsettled && !effectUnsettled) continue;
     const attempt = worker ? attempts.get(worker.currentExecutionAttemptId) : undefined;
     const exceptionId = `pause:${commitment.id}`;
@@ -158,10 +168,47 @@ export function projectSessionView(
       ],
       recoveryConditions: [
         "Resume or cancel through the Owner conversation; reconcile any uncertain effect before replay.",
+        ...scopedUnknownEffects.map((effect) => effect.retryRule),
       ],
       actions: worker
         ? workerInterventionActions(state, worker, attempt, exceptionId, cancellationAvailable)
         : [],
+    });
+  }
+
+  for (const question of state.readWorkerQuestions()) {
+    if (
+      question.ownerAttention?.kind !== "owner-reserved-decision" ||
+      (question.status !== "open" && question.status !== "answer-recorded")
+    ) {
+      continue;
+    }
+    const worker = workerById.get(question.workerSessionId);
+    if (!worker || isTerminalWorker(worker)) continue;
+    const commitmentId = worker.assignment.commitmentId;
+    if (commitmentId && pausedCommitments.has(commitmentId)) continue;
+    const exceptionId = `worker-question:${question.id}`;
+    exceptions.push({
+      id: exceptionId,
+      kind: "reserved-owner-decision",
+      subject: workerSubject(worker),
+      scope: workerScope(worker),
+      knownFacts: [question.status === "answer-recorded"
+        ? "An Owner answer is durably recorded for a reserved Worker question."
+        : "A Worker question is explicitly classified as an Owner-reserved decision."],
+      unknowns: [question.status === "answer-recorded"
+        ? "Delivery to the current Worker execution is not yet established."
+        : "The Owner decision has not yet been recorded."],
+      recoveryConditions: [question.status === "answer-recorded"
+        ? "Deliver the recorded answer to the current Worker execution."
+        : question.ownerAttention.reason],
+      actions: workerInterventionActions(
+        state,
+        worker,
+        attempts.get(worker.currentExecutionAttemptId),
+        exceptionId,
+        cancellationAvailable,
+      ),
     });
   }
 
@@ -177,20 +224,20 @@ export function projectSessionView(
         knownFacts: ["Objective work is complete and this Commitment reserves Acceptance to the Owner."],
         unknowns: ["The Owner Acceptance verdict is not recorded."],
         recoveryConditions: ["Accept, cancel, or supersede through the Owner conversation."],
-        actions: [commitmentCancelAction(commitment.id, exceptionId)],
+        actions: [],
       });
       continue;
     }
-    if (commitment.condition?.kind !== "blocked") continue;
+    if (commitment.condition?.kind !== "blocked" || !commitment.condition.ownerAttention) continue;
     const exceptionId = `commitment-blocked:${commitment.id}`;
     exceptions.push({
       id: exceptionId,
       kind: "relevant-failure",
       subject: commitmentSubject(commitment),
       scope: commitmentScope(commitment.id),
-      knownFacts: ["A current Commitment is authoritatively blocked."],
-      unknowns: ["Fresh, timestamped cause evidence is not available in this projection."],
-      recoveryConditions: ["Ask the Lead Agent to diagnose the named Commitment before retrying."],
+      knownFacts: [commitment.condition.reason],
+      unknowns: ["Freshness of the reported blocker is unknown."],
+      recoveryConditions: [commitment.condition.nextAction],
       ...(includeHealth
         ? {
             healthAssessment: createHealthAssessment({
@@ -207,12 +254,14 @@ export function projectSessionView(
             }),
           }
         : {}),
-      actions: [commitmentCancelAction(commitment.id, exceptionId)],
+      actions: [],
     });
   }
 
-  for (const effect of state.readEffectIntents()) {
-    if (effect.status !== "unknown") continue;
+  for (const effect of unknownEffects) {
+    if (pausedCommitments.has(effect.commitmentId) || cancellingCommitments.has(effect.commitmentId)) {
+      continue;
+    }
     const worker = effect.kind === "worker-assignment"
       ? workerById.get(effect.workerSessionId)
       : undefined;
@@ -255,6 +304,9 @@ export function projectSessionView(
 
   for (const worker of workers) {
     if (worker.state === "cancellation-requested") {
+      const scopedUnknownEffects = worker.assignment.commitmentId
+        ? unknownEffectsByCommitment.get(worker.assignment.commitmentId) ?? []
+        : [];
       exceptions.push({
         id: `cancellation:${worker.id}`,
         kind: "cancellation-incomplete",
@@ -264,9 +316,13 @@ export function projectSessionView(
         unknowns: [
           "Native interruption acknowledgement and observed cessation are not yet established.",
           "Existing effects are not rolled back by cancellation.",
+          ...(scopedUnknownEffects.length > 0
+            ? ["Whether one or more expected effects were applied."]
+            : []),
         ],
         recoveryConditions: [
           "Observe the Worker process stop, then reconcile any effect that may have occurred.",
+          ...scopedUnknownEffects.map((effect) => effect.retryRule),
         ],
         ...(includeHealth
           ? {
@@ -492,15 +548,6 @@ export function createHealthAssessment(
       status: freshness,
     },
     verdict: freshness === "current" && !hasConflictingEvidence ? verdict : "unknown",
-  };
-}
-
-function commitmentCancelAction(commitmentId: string, exceptionId: string): SessionViewAction {
-  return {
-    kind: "cancel",
-    targetKind: "commitment",
-    targetId: commitmentId,
-    command: `/session cancel ${exceptionId}`,
   };
 }
 

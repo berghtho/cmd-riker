@@ -400,17 +400,6 @@ async function completeOwnerInteraction(
       content: "Pause recorded. The waiting Worker and any effects remain separate facts.",
     };
   }
-  if (action.targetKind === "commitment") {
-    createOrchestrationCore(state).cancelCommitment(
-      action.targetId,
-      ownerTurnId,
-      "Owner cancelled the outcome from the Session View.",
-    );
-    return {
-      source: "Session View",
-      content: "Commitment cancelled. Existing Worker effects remain separate facts.",
-    };
-  }
   if (!workerSupervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
   await workerSupervisor.cancel(
     action.targetId,

@@ -5,6 +5,7 @@ import type {
   CapabilityNotice,
   Commitment,
   WorkerExecutionAttempt,
+  WorkerQuestion,
   WorkerSession,
 } from "../src/orchestration-core/index.ts";
 import {
@@ -165,7 +166,7 @@ test("active capability loss is scoped and clears with its authoritative fact", 
   assert.deepEqual(cleared.exceptions, []);
 });
 
-test("a recorded pause replaces its question with one incomplete-pause exception", () => {
+test("a recorded pause remains only while Worker cessation is unsettled", () => {
   const worker = workerSession({ state: "waiting-question" });
   const attempt = workerAttempt(worker, {
     status: "running",
@@ -190,7 +191,7 @@ test("a recorded pause replaces its question with one incomplete-pause exception
   assert.match(snapshot.exceptions[0]?.unknowns.join(" ") ?? "", /Worker.*ceased.*not established/);
 });
 
-test("a blocked Commitment remains visible until authoritative recovery resolves it", () => {
+test("a locally recoverable blocked Commitment does not interrupt the Owner", () => {
   const failed = workerSession({ state: "failed" });
   const replacement = workerSession({
     id: "worker-2",
@@ -212,7 +213,7 @@ test("a blocked Commitment remains visible until authoritative recovery resolves
     attempts: [failedAttempt, replacementAttempt],
     commitments: [blockedCommitment],
   }));
-  assert.deepEqual(recovered.exceptions.map((item) => item.kind), ["relevant-failure"]);
+  assert.deepEqual(recovered.exceptions, []);
 
   const accepted = { ...activeCommitment(), state: "accepted" as const };
   const resolved = projectSessionView(fakeState({
@@ -227,7 +228,7 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
   const awaiting = { ...activeCommitment(), state: "awaiting-acceptance" as const };
   const awaitingSnapshot = projectSessionView(fakeState({ commitments: [awaiting] }));
   assert.deepEqual(awaitingSnapshot.exceptions.map((item) => item.kind), ["reserved-owner-decision"]);
-  assert.deepEqual(awaitingSnapshot.exceptions[0]?.actions.map((action) => action.targetKind), ["commitment"]);
+  assert.deepEqual(awaitingSnapshot.exceptions[0]?.actions, []);
 
   const blocked = {
     ...activeCommitment(),
@@ -235,11 +236,75 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
       kind: "blocked" as const,
       reason: "Lead turn failed.",
       nextAction: "Retry with changed evidence.",
+      ownerAttention: "recovery-exhausted" as const,
     },
   };
   const blockedSnapshot = projectSessionView(fakeState({ commitments: [blocked] }));
   assert.deepEqual(blockedSnapshot.exceptions.map((item) => item.kind), ["relevant-failure"]);
   assert.equal(blockedSnapshot.exceptions[0]?.healthAssessment?.verdict, "unknown");
+  assert.deepEqual(blockedSnapshot.exceptions[0]?.knownFacts, ["Lead turn failed."]);
+  assert.deepEqual(blockedSnapshot.exceptions[0]?.recoveryConditions, ["Retry with changed evidence."]);
+});
+
+test("only explicitly Owner-reserved Worker questions enter attention", () => {
+  const worker = workerSession({ state: "waiting-question" });
+  const attempt = workerAttempt(worker, {
+    status: "running",
+    capabilities: capabilities({ cancellation: true }),
+  });
+  const routine = workerQuestion(worker);
+  const reserved = {
+    ...workerQuestion(worker),
+    id: "question-2",
+    ownerAttention: {
+      kind: "owner-reserved-decision" as const,
+      reason: "The Owner must choose the product boundary.",
+    },
+  };
+  const snapshot = projectSessionView(fakeState({
+    workers: [worker],
+    attempts: [attempt],
+    questions: [routine, reserved],
+    commitments: [activeCommitment()],
+  }));
+  assert.deepEqual(snapshot.exceptions.map((item) => item.id), ["worker-question:question-2"]);
+  assert.deepEqual(snapshot.exceptions[0]?.actions.map((action) => action.kind), ["pause", "cancel"]);
+});
+
+test("pause and cancellation absorb uncertain effects in the same scope", () => {
+  const pausedWorker = workerSession({ state: "running" });
+  const pausedCommitment = {
+    ...activeCommitment(),
+    condition: {
+      kind: "paused" as const,
+      reason: "Owner paused.",
+      nextAction: "Wait.",
+    },
+  };
+  const paused = projectSessionView(fakeState({
+    workers: [pausedWorker],
+    attempts: [workerAttempt(pausedWorker, { status: "running" })],
+    commitments: [pausedCommitment],
+    effects: [workerEffect(pausedWorker, {})],
+  }));
+  assert.deepEqual(paused.exceptions.map((item) => item.kind), ["pause-incomplete"]);
+
+  const cancellingWorker = workerSession({
+    state: "cancellation-requested",
+    cancellation: {
+      kind: "owner",
+      requestedAt: "2026-08-19T10:00:00.000Z",
+      requestedByOwnerTurnId: "turn-2",
+      reason: "Stop.",
+    },
+  });
+  const cancelling = projectSessionView(fakeState({
+    workers: [cancellingWorker],
+    attempts: [workerAttempt(cancellingWorker, { status: "running" })],
+    commitments: [activeCommitment()],
+    effects: [workerEffect(cancellingWorker, {})],
+  }));
+  assert.deepEqual(cancelling.exceptions.map((item) => item.kind), ["cancellation-incomplete"]);
 });
 
 test("conflicting health evidence forces an unknown verdict", () => {
@@ -271,6 +336,7 @@ function fakeState(input: {
   workers?: WorkerSession[];
   attempts?: WorkerExecutionAttempt[];
   effects?: EffectIntent[];
+  questions?: WorkerQuestion[];
   commitments?: Commitment[];
   capability?: CapabilityNotice;
 }): SessionViewState {
@@ -279,6 +345,7 @@ function fakeState(input: {
   return {
     readWorkerSessions: () => input.workers ?? [],
     readWorkerExecutionAttempt: (id) => attempts.get(id),
+    readWorkerQuestions: () => input.questions ?? [],
     readEffectIntents: () => input.effects ?? [],
     readCommitments: () => input.commitments ?? [],
     readCommitment: (id) => commitments.get(id),
@@ -354,6 +421,18 @@ function activeCommitment(): Commitment {
     createdByOwnerTurnId: "turn-1",
     activeOwnerTurnId: "turn-1",
     state: "active",
+  };
+}
+
+function workerQuestion(worker: WorkerSession): WorkerQuestion {
+  return {
+    id: "question-1",
+    workerSessionId: worker.id,
+    executionAttemptId: worker.currentExecutionAttemptId,
+    providerRequestId: "request-1",
+    itemId: "item-1",
+    questions: [{ id: "q1", question: "Choose.", isOther: false }],
+    status: "open",
   };
 }
 

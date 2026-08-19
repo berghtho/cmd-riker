@@ -11,9 +11,15 @@ import {
 } from "@earendil-works/pi-tui";
 
 import {
+  completeAuthoritativeStateRecovery,
+  establishNewAuthoritativeStateBaseline,
   openAuthoritativeStateSafely,
+  reconcilePostBackupEffect,
+  restoreAuthoritativeStateBackup,
   type AuthoritativeState,
   type OwnerConfiguration,
+  type PostBackupEffectInventory,
+  type PostBackupEffectReconciliation,
 } from "./authoritative-state/index.ts";
 import {
   PiAgentTurnAdapter,
@@ -43,17 +49,117 @@ async function main(): Promise<void> {
   const stateDirectory = argumentValue("--state-dir");
   if (!stateDirectory) throw new Error("--state-dir is required.");
 
+  const restoreBackupPath = argumentValue("--restore-state-backup");
+  const reconciliationPath = argumentValue("--reconcile-post-backup-effect");
+  const completeRecovery = process.argv.includes("--complete-state-recovery");
+  const establishNewBaseline = process.argv.includes("--establish-new-state-baseline");
+  const recoveryActionCount = [
+    Boolean(restoreBackupPath),
+    Boolean(reconciliationPath),
+    completeRecovery,
+    establishNewBaseline,
+  ].filter(Boolean).length;
+  if (recoveryActionCount > 1) {
+    throw new HostDiagnostic(
+      "CMD_RIKER_STATE_RECOVERY_ACTION_INVALID",
+      "Choose exactly one Authoritative State recovery action.",
+    );
+  }
+  if (restoreBackupPath) {
+    const inventoryPath = argumentValue("--post-backup-inventory");
+    if (!inventoryPath) {
+      throw new HostDiagnostic(
+        "CMD_RIKER_STATE_RECOVERY_INPUT_INVALID",
+        "--restore-state-backup requires --post-backup-inventory.",
+      );
+    }
+    const inventory = await readJsonFile(inventoryPath) as PostBackupEffectInventory;
+    try {
+      const recovery = restoreAuthoritativeStateBackup({
+        stateDirectory,
+        backupPath: restoreBackupPath,
+        postBackupInventory: inventory,
+      });
+      process.stdout.write(
+        `CMD_RIKER_STATE_BACKUP_RESTORED: Mutations remain disabled; ` +
+          `${recovery.postBackupInventory?.effects.length ?? 0} possible later effects require reconciliation.\n`,
+      );
+      return;
+    } catch (error) {
+      throw recoveryFailure(error);
+    }
+  }
+  if (reconciliationPath) {
+    const input = await readJsonFile(reconciliationPath) as Pick<
+      PostBackupEffectReconciliation,
+      "effectId" | "disposition" | "evidence"
+    >;
+    try {
+      reconcilePostBackupEffect({ stateDirectory, ...input });
+      process.stdout.write(
+        `CMD_RIKER_POST_BACKUP_EFFECT_RECONCILED: ${input.effectId} is settled from external evidence.\n`,
+      );
+      return;
+    } catch (error) {
+      throw recoveryFailure(error);
+    }
+  }
+  if (completeRecovery) {
+    try {
+      completeAuthoritativeStateRecovery(stateDirectory);
+      process.stdout.write(
+        "CMD_RIKER_STATE_RECOVERY_COMPLETED: Authoritative State mutations are enabled.\n",
+      );
+      return;
+    } catch (error) {
+      throw recoveryFailure(error);
+    }
+  }
+  if (establishNewBaseline) {
+    const ownerConfirmation = argumentValue("--owner-confirmation");
+    const configuration = await readConfiguration(stateDirectory);
+    try {
+      establishNewAuthoritativeStateBaseline({
+        stateDirectory,
+        configuration,
+        ownerConfirmation: ownerConfirmation ?? "",
+      });
+      process.stdout.write(
+        "CMD_RIKER_NEW_STATE_BASELINE_ESTABLISHED: Damaged history remains recovery evidence.\n",
+      );
+      return;
+    } catch (error) {
+      throw recoveryFailure(error);
+    }
+  }
+
   const openedState = openAuthoritativeStateSafely(stateDirectory);
   if (openedState.kind === "recovery-required") {
     throw new HostDiagnostic(
       "CMD_RIKER_STATE_RECOVERY_REQUIRED",
       "Authoritative State integrity is not trusted; product mutations are disabled. " +
         `Damaged evidence is preserved at ${openedState.recovery.damagedEvidenceDirectory}. ` +
-        "Restore a verified backup and reconcile every possible post-backup external effect. " +
+        "Use --restore-state-backup with --post-backup-inventory, then " +
+        "--reconcile-post-backup-effect and --complete-state-recovery; without a trusted backup, " +
+        "use --establish-new-state-baseline with explicit --owner-confirmation. " +
         `Observed failure: ${openedState.recovery.reason}`,
     );
   }
   const state = openedState.state;
+  const backupPath = argumentValue("--create-state-backup");
+  if (backupPath) {
+    try {
+      const backup = await state.createBackup(backupPath);
+      process.stdout.write(
+        `CMD_RIKER_STATE_BACKUP_CREATED: ${backup.databasePath} sha256=${backup.sha256}\n`,
+      );
+      return;
+    } catch (error) {
+      throw recoveryFailure(error);
+    } finally {
+      state.close();
+    }
+  }
   const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
   try {
     let policyValidated = false;
@@ -433,6 +539,30 @@ class HostDiagnostic extends Error {
     super(message);
     this.code = code;
   }
+}
+
+async function readJsonFile(path: string): Promise<unknown> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "input could not be read";
+    throw new HostDiagnostic(
+      "CMD_RIKER_STATE_RECOVERY_INPUT_INVALID",
+      `Recovery input ${path} is not valid JSON: ${detail}`,
+    );
+  }
+}
+
+async function readConfiguration(stateDirectory: string): Promise<OwnerConfiguration> {
+  return parseConfiguration(await readJsonFile(join(stateDirectory, "config.json")));
+}
+
+function recoveryFailure(error: unknown): HostDiagnostic {
+  if (error instanceof HostDiagnostic) return error;
+  return new HostDiagnostic(
+    "CMD_RIKER_STATE_RECOVERY_FAILED",
+    error instanceof Error ? error.message : "Authoritative State recovery failed.",
+  );
 }
 
 function invalidConfiguration(): HostDiagnostic {

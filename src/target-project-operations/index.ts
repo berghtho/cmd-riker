@@ -89,13 +89,21 @@ type EffectIntentBase = {
   reconciliation?: EffectReconciliation;
 };
 
+export type ExternalEffectEvidence = {
+  source:
+    | "target-project-readback"
+    | "provider-readback"
+    | "compensation-result"
+    | "write-generation-and-effect-inventory-readback";
+  reference: string;
+  summary: string;
+  observedAt: string;
+};
+
 export type EffectReconciliation = {
   disposition: "confirmed-applied" | "confirmed-not-applied" | "compensated";
-  evidence: {
+  evidence: ExternalEffectEvidence & {
     source: "target-project-readback" | "provider-readback" | "compensation-result";
-    reference: string;
-    summary: string;
-    observedAt: string;
   };
   reconciledAt: string;
   reconciledBy: "lead-agent";

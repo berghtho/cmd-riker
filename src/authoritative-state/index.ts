@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -26,6 +29,7 @@ import type {
 } from "../orchestration-core/index.ts";
 import type {
   EffectIntent,
+  ExternalEffectEvidence,
   TargetProjectOperationEffectIntent,
   TargetProjectOperationAttempt,
   WorkerAssignmentEffectIntent,
@@ -100,6 +104,9 @@ export type PostBackupEffectInventory = {
   source: "external-effect-inventory";
   reference: string;
   summary: string;
+  completenessEvidence: ExternalEffectEvidence & {
+    source: "write-generation-and-effect-inventory-readback";
+  };
   effects: Array<{
     id: string;
     scope: string;
@@ -110,11 +117,8 @@ export type PostBackupEffectInventory = {
 export type PostBackupEffectReconciliation = {
   effectId: string;
   disposition: "confirmed-applied" | "confirmed-not-applied" | "compensated";
-  evidence: {
+  evidence: ExternalEffectEvidence & {
     source: "target-project-readback" | "provider-readback" | "compensation-result";
-    reference: string;
-    summary: string;
-    observedAt: string;
   };
   reconciledAt: string;
   reconciledBy: "lead-agent";
@@ -1381,9 +1385,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       if (
         effectIntent.status !== "reconciled" ||
         !effectIntent.reconciliation ||
-        effectIntent.kind !== current.value.kind ||
-        effectIntent.commitmentId !== current.value.commitmentId ||
-        effectIntent.authorizedWriteRootKey !== current.value.authorizedWriteRootKey
+        !sameEffectIntentIdentityAndScope(current.value, effectIntent)
       ) {
         throw new Error("Effect reconciliation must preserve the original effect identity and scope.");
       }
@@ -1459,7 +1461,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         createdAt: new Date().toISOString(),
         lastJournalSequence: row.sequence,
       };
-      writeFileSync(backupManifestPath(destination), JSON.stringify(manifest, null, 2), "utf8");
+      writeJsonAtomically(backupManifestPath(destination), manifest);
       return manifest;
     },
 
@@ -1596,16 +1598,71 @@ export function completeAuthoritativeStateRecovery(stateDirectoryInput: string):
     );
   }
   verifyDatabaseFile(join(stateDirectory, "authoritative-state.sqlite"));
-  writeFileSync(
+  writeJsonAtomically(
     join(recovery.damagedEvidenceDirectory, "completed-recovery.json"),
-    JSON.stringify(
-      { ...recovery, completedAt: new Date().toISOString(), mutationPolicy: "enabled" },
-      null,
-      2,
-    ),
-    "utf8",
+    { ...recovery, completedAt: new Date().toISOString(), mutationPolicy: "enabled" },
   );
   rmSync(recoveryStatusPath(stateDirectory), { force: true });
+}
+
+export function establishNewAuthoritativeStateBaseline(input: {
+  stateDirectory: string;
+  configuration: OwnerConfiguration;
+  ownerConfirmation: string;
+}): void {
+  const stateDirectory = resolve(input.stateDirectory);
+  const recovery = loadRecoveryStatus(stateDirectory);
+  if (!recovery) throw new Error("A new baseline requires an active Authoritative State recovery.");
+  if (input.ownerConfirmation !== "ESTABLISH-NEW-BASELINE") {
+    throw new Error("A new baseline requires explicit Owner confirmation.");
+  }
+  const candidateDirectory = resolve(join(stateDirectory, `baseline-candidate-${randomUUID()}`));
+  if (dirname(candidateDirectory) !== stateDirectory) {
+    throw new Error("New baseline candidate escaped its state directory.");
+  }
+  mkdirSync(candidateDirectory, { recursive: true });
+  try {
+    const candidateState = openAuthoritativeState(candidateDirectory);
+    try {
+      candidateState.initialize(input.configuration);
+    } finally {
+      candidateState.close();
+    }
+    const candidateDatabase = join(candidateDirectory, "authoritative-state.sqlite");
+    verifyDatabaseFile(candidateDatabase);
+    const databasePath = join(stateDirectory, "authoritative-state.sqlite");
+    const preserveSuffix = `${new Date().toISOString().replaceAll(":", "-")}-${randomUUID()}`;
+    for (const fileName of [
+      "authoritative-state.sqlite",
+      "authoritative-state.sqlite-wal",
+      "authoritative-state.sqlite-shm",
+    ]) {
+      const source = join(stateDirectory, fileName);
+      if (existsSync(source)) {
+        copyFileSync(
+          source,
+          join(recovery.damagedEvidenceDirectory, `pre-new-baseline-${preserveSuffix}-${fileName}`),
+        );
+      }
+    }
+    rmSync(databasePath, { force: true });
+    rmSync(`${databasePath}-wal`, { force: true });
+    rmSync(`${databasePath}-shm`, { force: true });
+    renameSync(candidateDatabase, databasePath);
+    writeJsonAtomically(
+      join(recovery.damagedEvidenceDirectory, "completed-recovery.json"),
+      {
+        ...recovery,
+        completedAt: new Date().toISOString(),
+        mutationPolicy: "enabled",
+        completion: "owner-established-new-baseline",
+        ownerConfirmation: input.ownerConfirmation,
+      },
+    );
+    rmSync(recoveryStatusPath(stateDirectory), { force: true });
+  } finally {
+    rmSync(candidateDirectory, { recursive: true, force: true });
+  }
 }
 
 function assertDatabaseIntegrity(database: DatabaseSync): void {
@@ -1658,10 +1715,15 @@ function validatePostBackupInventory(inventory: PostBackupEffectInventory): void
     inventory.source !== "external-effect-inventory" ||
     !Number.isFinite(Date.parse(inventory.assessedAt)) ||
     !inventory.reference.trim() ||
-    !inventory.summary.trim()
+    !inventory.summary.trim() ||
+    inventory.completenessEvidence?.source !==
+      "write-generation-and-effect-inventory-readback"
   ) {
-    throw new Error("Restore requires an attributed inventory of possible post-backup effects.");
+    throw new Error(
+      "Restore requires external evidence that the post-backup effect inventory is complete.",
+    );
   }
+  validateExternalEvidence(inventory.completenessEvidence);
   const identities = new Set<string>();
   for (const effect of inventory.effects) {
     if (
@@ -1677,7 +1739,7 @@ function validatePostBackupInventory(inventory: PostBackupEffectInventory): void
 }
 
 function validateExternalEvidence(
-  evidence: PostBackupEffectReconciliation["evidence"],
+  evidence: ExternalEffectEvidence,
 ): void {
   if (
     !evidence.reference.trim() ||
@@ -1715,25 +1777,99 @@ function preserveDamagedState(
     detectedAt,
     damagedEvidenceDirectory,
   };
-  writeFileSync(recoveryStatusPath(stateDirectory), JSON.stringify(recovery, null, 2), "utf8");
+  writeRecoveryStatus(stateDirectory, recovery);
   return recovery;
 }
 
 function loadRecoveryStatus(stateDirectory: string): AuthoritativeStateRecovery | undefined {
   const path = recoveryStatusPath(stateDirectory);
   if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8")) as AuthoritativeStateRecovery;
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!isRecoveryStatus(value)) throw new Error("Recovery marker shape is invalid.");
+    return value;
+  } catch (error) {
+    return preserveDamagedRecoveryMarker(
+      stateDirectory,
+      path,
+      error instanceof Error ? error.message : "Recovery marker could not be read.",
+    );
+  }
 }
 
 function writeRecoveryStatus(
   stateDirectory: string,
   recovery: AuthoritativeStateRecovery,
 ): void {
-  writeFileSync(recoveryStatusPath(stateDirectory), JSON.stringify(recovery, null, 2), "utf8");
+  writeJsonAtomically(recoveryStatusPath(stateDirectory), recovery);
 }
 
 function recoveryStatusPath(stateDirectory: string): string {
   return join(stateDirectory, "authoritative-state-recovery.json");
+}
+
+function preserveDamagedRecoveryMarker(
+  stateDirectory: string,
+  markerPath: string,
+  detail: string,
+): AuthoritativeStateRecovery {
+  const detectedAt = new Date().toISOString();
+  const damagedEvidenceDirectory = join(
+    stateDirectory,
+    "recovery-evidence",
+    `${detectedAt.replaceAll(":", "-")}-${randomUUID()}`,
+  );
+  mkdirSync(damagedEvidenceDirectory, { recursive: true });
+  copyFileSync(markerPath, join(damagedEvidenceDirectory, "damaged-authoritative-state-recovery.json"));
+  for (const fileName of [
+    "authoritative-state.sqlite",
+    "authoritative-state.sqlite-wal",
+    "authoritative-state.sqlite-shm",
+  ]) {
+    const source = join(stateDirectory, fileName);
+    if (existsSync(source)) copyFileSync(source, join(damagedEvidenceDirectory, fileName));
+  }
+  const recovery: AuthoritativeStateRecovery = {
+    version: 1,
+    phase: "damaged-state",
+    mutationPolicy: "disabled",
+    reason: `Recovery metadata integrity failed: ${detail}`,
+    detectedAt,
+    damagedEvidenceDirectory,
+  };
+  writeRecoveryStatus(stateDirectory, recovery);
+  return recovery;
+}
+
+function isRecoveryStatus(value: unknown): value is AuthoritativeStateRecovery {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<AuthoritativeStateRecovery>;
+  return (
+    candidate.version === 1 &&
+    (candidate.phase === "damaged-state" || candidate.phase === "post-backup-reconciliation") &&
+    candidate.mutationPolicy === "disabled" &&
+    typeof candidate.reason === "string" &&
+    typeof candidate.detectedAt === "string" &&
+    typeof candidate.damagedEvidenceDirectory === "string"
+  );
+}
+
+function writeJsonAtomically(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporaryPath, "wx");
+    writeFileSync(descriptor, JSON.stringify(value, null, 2), "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
 }
 
 function ensureSchema(database: DatabaseSync): void {
@@ -1984,6 +2120,37 @@ function validateConfiguration(configuration: OwnerConfiguration): void {
       throw new Error("Worker Model Policy must select the proven Codex gpt-5.6-sol capability.");
     }
   }
+}
+
+function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectIntent): boolean {
+  if (
+    left.id !== right.id ||
+    left.kind !== right.kind ||
+    left.commitmentId !== right.commitmentId ||
+    left.expectedEffect !== right.expectedEffect ||
+    left.authorizedWriteRootKey !== right.authorizedWriteRootKey ||
+    left.retryRule !== right.retryRule ||
+    left.authorization.kind !== right.authorization.kind ||
+    left.authorization.commitmentId !== right.authorization.commitmentId ||
+    left.authorization.targetProjectPath !== right.authorization.targetProjectPath ||
+    left.authorization.validatedAt !== right.authorization.validatedAt ||
+    JSON.stringify(left.lease) !== JSON.stringify(right.lease)
+  ) {
+    return false;
+  }
+  if (left.kind === "target-project-operation") {
+    return (
+      right.kind === "target-project-operation" &&
+      left.operationAttemptId === right.operationAttemptId &&
+      JSON.stringify(left.causedByWorker) === JSON.stringify(right.causedByWorker)
+    );
+  }
+  return (
+    right.kind === "worker-assignment" &&
+    left.workerSessionId === right.workerSessionId &&
+    left.executionAttemptId === right.executionAttemptId &&
+    left.verificationOperationAttemptId === right.verificationOperationAttemptId
+  );
 }
 
 function factSubject(input: FactDraft): string {

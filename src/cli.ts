@@ -37,6 +37,7 @@ import {
   defaultLeadModelRequirements,
   type LeadModelRequirements,
   type LeadModelPolicy,
+  type ActingAuthorityEffectRequest,
 } from "./orchestration-core/index.ts";
 import {
   createClaudeWorkerHarness,
@@ -390,9 +391,14 @@ async function completeOwnerTurn(
                         prompt: string;
                         commitmentId: string;
                         targets: string[];
-                      }) =>
-                        workerSupervisor.delegateEffectful({
-                          ...input,
+                        actingAuthorityEffect?: ActingAuthorityEffectRequest;
+                      }) => {
+                        const { actingAuthorityEffect, ...assignment } = input;
+                        const authorization = actingAuthorityEffect
+                          ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
+                          : undefined;
+                        return workerSupervisor.delegateEffectful({
+                          ...assignment,
                           targetProjectPath: conversation.targetProject.path,
                           model: conversation.workerModelPolicy!.selection.model,
                           modelPolicyRevision: conversation.workerModelPolicy!.revision,
@@ -402,7 +408,11 @@ async function completeOwnerTurn(
                             workingDirectory: conversation.targetProject.path,
                             timeoutMs: 120_000,
                           },
-                        }),
+                          ...(authorization
+                            ? { actingAuthorityEffectAuthorizationId: authorization.id }
+                            : {}),
+                        });
+                      },
                       answer: (questionId: string, answers: Record<string, string[]>) =>
                         workerSupervisor.answer(questionId, turnId, answers),
                     }
@@ -436,13 +446,25 @@ async function completeOwnerTurn(
               );
             }
           },
-          executeOperation: async (commitmentId, operation) => {
+          executeOperation: async (commitmentId, operation, actingAuthorityEffect) => {
+            const authorization = actingAuthorityEffect
+              ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
+              : undefined;
             const result = await createTargetProjectOperations(state).execute({
               commitmentId,
               operation: { kind: operation, inputs: {} },
               checkout: conversation.targetProject.path,
               workingDirectory: conversation.targetProject.path,
               timeoutMs: 120_000,
+              ...(authorization
+                ? {
+                    actingAuthorityEffectAuthorization: {
+                      actingAuthorityId: authorization.actingAuthorityId,
+                      authorizationId: authorization.id,
+                      standingOrderId: authorization.standingOrderId,
+                    },
+                  }
+                : {}),
             });
             orchestration.observeTargetProjectOperationResult(commitmentId, result);
             return result;
@@ -456,17 +478,6 @@ async function completeOwnerTurn(
           ? { selectionReason: "fallback-after-ineligible-candidate" as const }
           : {}),
       });
-      const pendingHandoff = orchestration.actingAuthorityView();
-      if (
-        pendingHandoff?.state === "handoff-pending" &&
-        pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
-      ) {
-        orchestration.observeActingAuthorityHandoffDelivered(
-          pendingHandoff.id,
-          turnId,
-          response.content,
-        );
-      }
       orchestration.observeLeadResponse(turnId, response.content);
       const notices = state
         .readCommitments()
@@ -479,6 +490,17 @@ async function completeOwnerTurn(
         ? `${response.content}\n\n${notices.join("\n")}`
         : response.content;
       orchestration.settleLeadTurnAttempt(attempt.id, "completed");
+      const pendingHandoff = orchestration.actingAuthorityView();
+      if (
+        pendingHandoff?.state === "handoff-pending" &&
+        pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
+      ) {
+        orchestration.observeActingAuthorityHandoffDelivered(
+          pendingHandoff.id,
+          turnId,
+          response.content,
+        );
+      }
       return content;
     } catch (error) {
       if (!(error instanceof PiTurnFailure)) throw error;

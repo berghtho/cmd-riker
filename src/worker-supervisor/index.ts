@@ -140,6 +140,7 @@ export interface WorkerSupervisor {
     targets: string[];
     timeoutMs: number;
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
+    actingAuthorityEffectAuthorizationId?: string;
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
   delegateReview(input: {
     implementationWorkerSessionId: string;

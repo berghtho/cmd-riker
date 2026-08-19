@@ -87,29 +87,6 @@ test("an implementing Worker hands one bounded assignment to an independent revi
   assert.equal(orchestration.workerSessionsView().length, 2);
   assert.equal(orchestration.coordinationMessagesView()[0]?.kind, "review-request");
 
-  startWorker(orchestration, review.workerSession.id, review.executionAttempt.id, true);
-  orchestration.observeWorkerTerminal({
-    workerSessionId: review.workerSession.id,
-    executionAttemptId: review.executionAttempt.id,
-    status: "completed",
-    processGone: true,
-    reportedOutcome: {
-      status: "completed",
-      summary: "Independent Review completed.",
-      affectedArtifacts: [],
-      verificationResults: ["Reviewed the public interface and test evidence."],
-      reviewFindings: [{
-        basis: "risk",
-        disposition: "follow-up",
-        summary: "Consider a future compatibility test.",
-        evidence: "The current criterion covers behavior but not a future version skew.",
-      }],
-    },
-  });
-  assert.equal(state.readCommitment(commitment.id)?.review?.status, "passed");
-  assert.equal(state.readCommitment(commitment.id)?.state, "active");
-  assert.equal(orchestration.coordinationMessagesView()[1]?.kind, "review-finding");
-
   const taskCli: TaskCli = {
     async inspect() {
       return {
@@ -139,7 +116,123 @@ test("an implementing Worker hands one bounded assignment to an independent revi
     implementation.executionAttempt.id,
     verificationResult,
   );
+  assert.equal(state.readCommitment(commitment.id)?.state, "verifying");
+
+  startWorker(orchestration, review.workerSession.id, review.executionAttempt.id, true);
+  orchestration.observeWorkerTerminal({
+    workerSessionId: review.workerSession.id,
+    executionAttemptId: review.executionAttempt.id,
+    status: "completed",
+    processGone: true,
+    reportedOutcome: {
+      status: "completed",
+      summary: "Independent Review completed.",
+      affectedArtifacts: [],
+      verificationResults: ["Reviewed the public interface and test evidence."],
+      reviewFindings: [{
+        basis: "criterion",
+        disposition: "must-fix",
+        summary: "The public contract is incomplete.",
+        evidence: "The required export is absent.",
+      }],
+    },
+  });
+  assert.equal(state.readCommitment(commitment.id)?.review?.status, "changes-requested");
+  assert.equal(state.readCommitment(commitment.id)?.state, "active");
+  assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "blocked");
+  assert.equal(orchestration.coordinationMessagesView()[1]?.kind, "review-finding");
+
+  const repairTurn = state.appendOwnerMessage("Repair and re-review the must-fix finding.");
+  orchestration.resumeCommitment(commitment.id, repairTurn);
+  assert.equal(state.readCommitment(commitment.id)?.review?.status, "changes-requested");
+  const repair = orchestration.delegateEffectfulWorker({
+    objective: "Repair the public module contract.",
+    prompt: "Add the missing export in src/public.ts.",
+    targetProjectPath: checkout,
+    modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" },
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/public.ts"],
+    timeoutMs: 60_000,
+    checkoutIsolation: {
+      root: checkout,
+      baselineCommit: "b".repeat(40),
+      isolation: { kind: "branch", branch: "codex/public-repair" },
+    },
+    verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+  });
+  assert.deepEqual(repair.workerSession.assignment.coordination, {
+    role: "implementer",
+    repairOfReviewFindingIds: [state.readCommitment(commitment.id)!.review!.findings[0]!.id],
+  });
+  startWorker(orchestration, repair.workerSession.id, repair.executionAttempt.id, false);
+  orchestration.observeWorkerTerminal({
+    workerSessionId: repair.workerSession.id,
+    executionAttemptId: repair.executionAttempt.id,
+    status: "completed",
+    processGone: true,
+    observedChanges: ["src/public.ts"],
+    reportedOutcome: {
+      status: "completed",
+      summary: "Repaired the public contract.",
+      affectedArtifacts: ["src/public.ts"],
+      verificationResults: ["Repair is ready for refreshed Verification."],
+    },
+  });
+  const repairVerification = await operations.execute(
+    orchestration.workerVerificationRequest(repair.workerSession.id, repair.executionAttempt.id),
+  );
+  orchestration.observeWorkerVerificationResult(
+    repair.workerSession.id,
+    repair.executionAttempt.id,
+    repairVerification,
+  );
+  assert.equal(state.readCommitment(commitment.id)?.review?.status, "pending");
+  assert.equal(
+    state.readCommitment(commitment.id)?.review?.implementationWorkerSessionId,
+    repair.workerSession.id,
+  );
+  assert.throws(
+    () => orchestration.delegateReviewWorker({
+      implementationWorkerSessionId: implementation.workerSession.id,
+      prompt: "Re-review stale implementation.",
+      modelSelection: { provider: "anthropic", model: "claude-sonnet-5", nativeHarness: "claude" },
+      modelPolicyRevision: "review-policy-1",
+    }),
+    /refreshed Verification/i,
+  );
+  const reReview = orchestration.delegateReviewWorker({
+    implementationWorkerSessionId: repair.workerSession.id,
+    prompt: "Target the repaired public contract.",
+    modelSelection: { provider: "anthropic", model: "claude-sonnet-5", nativeHarness: "claude" },
+    modelPolicyRevision: "review-policy-1",
+  });
+  startWorker(orchestration, reReview.workerSession.id, reReview.executionAttempt.id, true);
+  orchestration.observeWorkerTerminal({
+    workerSessionId: reReview.workerSession.id,
+    executionAttemptId: reReview.executionAttempt.id,
+    status: "completed",
+    processGone: true,
+    reportedOutcome: {
+      status: "completed",
+      summary: "Targeted re-review passed.",
+      affectedArtifacts: [],
+      verificationResults: ["The repaired contract satisfies the cited criterion."],
+      reviewFindings: [],
+    },
+  });
   assert.equal(state.readCommitment(commitment.id)?.state, "accepted", JSON.stringify(state.readCommitment(commitment.id)));
+  assert.throws(
+    () => orchestration.recordCoordinationMessage({
+      fromWorkerSessionId: repair.workerSession.id,
+      toWorkerSessionId: reReview.workerSession.id,
+      commitmentId: commitment.id,
+      kind: "factual-question",
+      summary: "Try to assign a question after Review completed.",
+      evidence: ["The recipient is terminal."],
+    }),
+    /terminal Worker Session/i,
+  );
 
   const unrelatedTurn = state.appendOwnerMessage("Track an unrelated outcome.");
   const unrelated = orchestration.recordCommitment(unrelatedTurn, {
@@ -168,46 +261,9 @@ test("an implementing Worker hands one bounded assignment to an independent revi
   );
   assert.equal(orchestration.workerSessionsView().length, workerCount);
 
-  const repairTurn = state.appendOwnerMessage("Repair a must-fix Review finding.");
-  const repairable = orchestration.recordCommitment(repairTurn, {
-    outcome: "The repaired module passes independent Review.",
-    criteria: [{
-      kind: "target-project-operation",
-      description: "The declared test operation succeeds.",
-      operation: "test",
-    }],
-    review: { required: true, reasons: ["public-module"] },
-  });
-  state.appendCommitmentSnapshots([{
-    ...repairable,
-    condition: {
-      kind: "blocked",
-      reason: "Independent Review found a must-fix issue.",
-      nextAction: "Repair and request another independent Review.",
-    },
-    review: {
-      ...repairable.review!,
-      status: "changes-requested",
-      reviewerWorkerSessionId: review.workerSession.id,
-      findings: [{
-        id: "must-fix-finding",
-        basis: "criterion",
-        disposition: "must-fix",
-        summary: "The public contract is incomplete.",
-        evidence: "The required export is absent.",
-      }],
-    },
-  }]);
-  const resumeTurn = state.appendOwnerMessage("Resume after repairing the public contract.");
-  orchestration.resumeCommitment(repairable.id, resumeTurn);
-  assert.equal(state.readCommitment(repairable.id)?.review?.status, "pending");
-  assert.equal(state.readCommitment(repairable.id)?.review?.reviewerWorkerSessionId, undefined);
-  assert.equal(state.readCommitment(repairable.id)?.review?.findings.length, 1);
-  assert.equal(state.readCommitment(repairable.id)?.condition, undefined);
-
   state.close();
   state = openAuthoritativeState(stateDirectory);
-  assert.equal(state.readCoordinationMessages().length, 2);
+  assert.equal(state.readCoordinationMessages().length, 3);
   assert.equal(state.readCommitment(commitment.id)?.review?.findings.length, 1);
   state.close();
 });

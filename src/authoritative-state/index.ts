@@ -20,6 +20,7 @@ import {
 } from "../model-selection.ts";
 import {
   type ActingAuthority,
+  type ActingAuthorityEffectRequest,
   assertSupportedWorkerModelSelection,
   type CapabilityNotice,
   type Commitment,
@@ -46,6 +47,7 @@ import type {
 export type { ModelSelection } from "../model-selection.ts";
 export type {
   ActingAuthority,
+  ActingAuthorityEffectRequest,
   ActingAuthorityEvent,
   ActingAuthorityHandoff,
   CapabilityNotice,
@@ -562,7 +564,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     return rows.map((row) => JSON.parse(row.value_json) as T);
   };
 
-  type WorkerSnapshotEntry = {
+  type DurableSnapshotEntry = {
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
@@ -587,7 +589,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     snapshot: { id: string; state?: string; status?: string };
   };
 
-  const appendWorkerStateBatch = (entries: WorkerSnapshotEntry[]): void => {
+  const appendSnapshotBatch = (entries: DurableSnapshotEntry[]): void => {
     if (entries.length === 0) return;
     const predecessorBySubject = new Map<string, string | undefined>();
     database.exec("BEGIN IMMEDIATE");
@@ -660,9 +662,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     if (snapshots.length === 0) return;
     const subjectIdentity = snapshots[0]!.id;
     if (snapshots.some((snapshot) => snapshot.id !== subjectIdentity)) {
-      throw new Error("One Worker snapshot batch cannot contain multiple identities.");
+      throw new Error("One durable snapshot batch cannot contain multiple identities.");
     }
-    appendWorkerStateBatch(
+    appendSnapshotBatch(
       snapshots.map((snapshot) => ({
         kind,
         subjectPrefix,
@@ -670,6 +672,44 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         snapshot,
       })),
     );
+  };
+
+  const assertActingAuthorityDispatch = (effectIntent: EffectIntent): void => {
+    const actingAuthority = readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot").at(-1);
+    const authorization = effectIntent.authorization.actingAuthority;
+    if (!actingAuthority || actingAuthority.state === "ended") {
+      if (authorization) {
+        throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
+      }
+      return;
+    }
+    if (actingAuthority.state !== "active" || !authorization) {
+      throw new Error("Effect dispatch is blocked without active Acting Authority authorization.");
+    }
+    const grant = (actingAuthority.effectAuthorizations ?? []).find(
+      (candidate) => candidate.id === authorization.authorizationId,
+    );
+    if (
+      !grant ||
+      grant.actingAuthorityId !== actingAuthority.id ||
+      authorization.actingAuthorityId !== actingAuthority.id ||
+      grant.standingOrderId !== authorization.standingOrderId ||
+      grant.commitmentId !== effectIntent.commitmentId
+    ) {
+      throw new Error("Effect dispatch does not match its durable Acting Authority authorization.");
+    }
+    const reused = database
+      .prepare(`
+        SELECT 1
+          FROM facts
+         WHERE kind = 'effect-intent.snapshot'
+           AND json_extract(value_json, '$.authorization.actingAuthority.authorizationId') = ?
+         LIMIT 1
+      `)
+      .get(authorization.authorizationId);
+    if (reused) {
+      throw new Error("An Acting Authority effect authorization can dispatch only one effect intent.");
+    }
   };
 
   const readTargetProjectOperationAttemptRow = (
@@ -1075,6 +1115,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       if (!effectIntent && !workerSession.assignment.readOnly) {
         throw new Error("An effectful Worker launch cannot omit its effect intent.");
       }
+      if (effectIntent) assertActingAuthorityDispatch(effectIntent);
       const recordedAt = new Date().toISOString();
       let predecessorId = readCurrentSnapshot<WorkerSession>(
         "worker-session.snapshot",
@@ -1181,7 +1222,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     appendWorkerState(input) {
-      appendWorkerStateBatch([
+      appendSnapshotBatch([
         ...(input.executionAttempt
           ? [
               {
@@ -1439,6 +1480,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       if (!dispatching && !rejected) {
         throw new Error("New operations must atomically record dispatch or discovery rejection.");
       }
+      assertActingAuthorityDispatch(effectIntent);
       writeOperationAndEffect(attempt, effectIntent, undefined, true);
     },
 

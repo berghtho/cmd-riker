@@ -18,6 +18,7 @@ import type {
   CommitmentDraft,
   ConversationMessage,
   ActingAuthority,
+  ActingAuthorityEffectRequest,
   ActingAuthorityEvent,
   ActingAuthorityHandoff,
   StandingOrder,
@@ -51,7 +52,11 @@ export type PiTurnRequest = {
       reason: string,
       replacementCommitmentId?: string,
     ): void;
-    executeOperation(commitmentId: string, operation: "test"): Promise<TargetProjectOperationResult>;
+    executeOperation(
+      commitmentId: string,
+      operation: "test",
+      actingAuthorityEffect?: ActingAuthorityEffectRequest,
+    ): Promise<TargetProjectOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
   actingAuthority?: ActingAuthority;
@@ -93,6 +98,7 @@ export type PiTurnRequest = {
       prompt: string;
       commitmentId: string;
       targets: string[];
+      actingAuthorityEffect?: ActingAuthorityEffectRequest;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     delegateReview?(input: {
       implementationWorkerSessionId: string;
@@ -576,14 +582,20 @@ function commitmentTools(
       parameters: Type.Object({
         commitmentId: Type.String({ minLength: 1 }),
         operation: Type.Literal("test"),
+        actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, operation } = params as {
+        const { commitmentId, operation, actingAuthorityEffect } = params as {
           commitmentId: string;
           operation: "test";
+          actingAuthorityEffect?: ActingAuthorityEffectRequest;
         };
-        const result = await actions.executeOperation(commitmentId, operation);
+        const result = await actions.executeOperation(
+          commitmentId,
+          operation,
+          actingAuthorityEffect,
+        );
         observer.onMutation();
         return {
           content: [
@@ -681,6 +693,16 @@ const standingOrderEffectClassSchema = Type.Union([
   Type.Literal("restart"),
   Type.Literal("self-repair"),
 ]);
+
+const actingAuthorityEffectRequestSchema = Type.Object({
+  actingAuthorityId: Type.String({ minLength: 1 }),
+  commitmentId: Type.String({ minLength: 1 }),
+  effectClass: standingOrderEffectClassSchema,
+  target: Type.String({ minLength: 1 }),
+  reversible: Type.Boolean(),
+  externallyBinding: Type.Boolean(),
+  incrementalSpendUsd: Type.Number({ minimum: 0 }),
+});
 
 function authorityTools(
   request: PiTurnRequest,
@@ -782,7 +804,7 @@ function authorityTools(
           reversible: Type.Boolean(),
           externallyBinding: Type.Boolean(),
           incrementalSpendUsd: Type.Number({ minimum: 0 }),
-          effectIntentId: Type.Optional(Type.String({ minLength: 1 })),
+          effectIntentId: Type.String({ minLength: 1 }),
         })),
         decision: Type.Optional(Type.Object({
           decisionClass: Type.Union([
@@ -875,6 +897,7 @@ function workerTools(
         prompt: Type.String({ minLength: 1 }),
         commitmentId: Type.String({ minLength: 1 }),
         targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
+        actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -884,6 +907,7 @@ function workerTools(
             prompt: string;
             commitmentId: string;
             targets: string[];
+            actingAuthorityEffect?: ActingAuthorityEffectRequest;
           },
         );
         observer.onMutation();

@@ -18,6 +18,11 @@ export type TargetProjectOperationRequest = {
   workingDirectory: string;
   timeoutMs: number;
   causedByWorker?: WorkerExecutionAttribution;
+  actingAuthorityEffectAuthorization?: {
+    actingAuthorityId: string;
+    authorizationId: string;
+    standingOrderId: string;
+  };
 };
 
 export type TargetProjectOperationDiscovery =
@@ -82,6 +87,11 @@ type EffectIntentBase = {
     commitmentId: string;
     targetProjectPath: string;
     validatedAt: string;
+    actingAuthority?: {
+      actingAuthorityId: string;
+      authorizationId: string;
+      standingOrderId: string;
+    };
   };
   retryRule: string;
   status: "pending" | "dispatching" | "succeeded" | "unknown" | "rejected" | "reconciled";
@@ -280,6 +290,9 @@ export function createTargetProjectOperations(
               commitmentId: request.commitmentId,
               targetProjectPath: request.checkout,
               validatedAt: startedAt,
+              ...(request.actingAuthorityEffectAuthorization
+                ? { actingAuthority: request.actingAuthorityEffectAuthorization }
+                : {}),
             },
             retryRule: "Correct the discovery blocker before starting a new attempt.",
             status: "rejected",
@@ -313,6 +326,9 @@ export function createTargetProjectOperations(
           commitmentId: request.commitmentId,
           targetProjectPath: request.checkout,
           validatedAt: startedAt,
+          ...(request.actingAuthorityEffectAuthorization
+            ? { actingAuthority: request.actingAuthorityEffectAuthorization }
+            : {}),
         },
         retryRule: "Do not retry unless the prior effect is proven settled.",
         status: "pending",

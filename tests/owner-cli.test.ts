@@ -44,6 +44,190 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
   assert.match(second.stdout, /Lead Agent: Pinned Pi turn 2\./);
 });
 
+test("Owner CLI carries one attributed Commitment to objective Acceptance", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-commitment-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      assert.match(JSON.stringify(requestBody), /record_commitment/);
+      return {
+        toolCall: {
+          id: "commitment-call-1",
+          name: "record_commitment",
+          arguments: {
+            outcome: "Reply with the exact requested phrase.",
+            criteria: [
+              {
+                kind: "response-includes",
+                description: "The response includes Engage.",
+                expectedText: "Engage.",
+              },
+            ],
+          },
+        },
+      };
+    }
+    return "Engage.";
+  });
+  t.after(() => localModel.close());
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: localModel.baseUrl,
+      },
+      modelFallbacks: [],
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+
+  const result = await runCli(stateDirectory, "Reply with Engage and own that outcome.\n");
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Lead Agent: Engage\./);
+  assert.match(result.stdout, /Commitment [0-9a-f-]{36} accepted:/);
+  const state = openAuthoritativeState(stateDirectory);
+  const commitment = state.readCommitments()[0];
+  assert.equal(commitment?.state, "accepted");
+  assert.equal(commitment?.acceptance?.authority, "lead-agent");
+  assert.deepEqual(state.readOwnerConversation()?.messages.at(-1)?.modelSelection, {
+    provider: "local-openai",
+    model: "owner-model",
+    api: "openai-completions",
+    baseUrl: localModel.baseUrl,
+  });
+  state.close();
+});
+
+test("Owner CLI leaves subjective work for a later explicit Owner Acceptance", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-owner-acceptance-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      return {
+        toolCall: {
+          id: "commitment-call-subjective",
+          name: "record_commitment",
+          arguments: {
+            outcome: "Propose a product name for Owner judgment.",
+            criteria: [
+              {
+                kind: "owner-judgment",
+              },
+            ],
+          },
+        },
+      };
+    }
+    if (call === 2) return "I propose Riker.";
+    if (call === 3) {
+      const commitmentId = JSON.stringify(requestBody).match(
+        /([0-9a-f-]{36}): awaiting-acceptance/,
+      )?.[1];
+      assert(commitmentId);
+      return {
+        toolCall: {
+          id: "commitment-call-accept",
+          name: "accept_commitment",
+          arguments: { commitmentId },
+        },
+      };
+    }
+    return "Owner Acceptance recorded.";
+  });
+  t.after(() => localModel.close());
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: localModel.baseUrl,
+      },
+      modelFallbacks: [],
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+
+  const result = await runCli(
+    stateDirectory,
+    "Propose a product name and let me judge it.\nI explicitly accept that proposal.\n",
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /awaiting Owner Acceptance/);
+  assert.match(result.stdout, /Commitment [0-9a-f-]{36} accepted:/);
+  const state = openAuthoritativeState(stateDirectory);
+  const commitment = state.readCommitments()[0];
+  assert.equal(commitment?.state, "accepted");
+  assert.equal(commitment?.acceptance?.authority, "owner");
+  assert.equal(
+    commitment?.acceptance?.authority === "owner"
+      ? commitment.acceptance.ownerTurnId
+      : undefined,
+    state.readOwnerConversation()?.messages[2]?.turnId,
+  );
+  state.close();
+});
+
+test("Owner CLI uses the first policy-compliant fallback and attributes the completed turn", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-fallback-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const failingModel = await startLocalModel(() => ({ errorStatus: 503 }));
+  t.after(() => failingModel.close());
+  const localModel = await startLocalModel(() => "Fallback response.");
+  t.after(() => localModel.close());
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: failingModel.baseUrl,
+      },
+      modelFallbacks: [
+        {
+          provider: "local-openai",
+          model: "owner-model",
+          api: "openai-completions",
+          baseUrl: localModel.baseUrl,
+        },
+      ],
+      modelPolicyRevision: "owner-policy-2",
+    }),
+  );
+
+  const result = await runCli(stateDirectory, "Use the available Model.\n");
+
+  assert.equal(result.code, 0, result.stderr);
+  const state = openAuthoritativeState(stateDirectory);
+  const response = state.readOwnerConversation()?.messages.at(-1);
+  assert.equal(response?.role, "lead-agent");
+  assert.deepEqual(response?.modelSelection, {
+    provider: "local-openai",
+    model: "owner-model",
+    api: "openai-completions",
+    baseUrl: localModel.baseUrl,
+  });
+  assert.equal(response?.modelPolicyRevision, "owner-policy-2");
+  assert.equal(response?.selectionReason, "fallback-after-ineligible-candidate");
+  const attempts = state.readLeadTurnAttempts();
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0]?.status, "failed");
+  assert.equal(attempts[0]?.failureKind, "unavailable");
+  assert.equal(attempts[1]?.status, "completed");
+  assert.deepEqual(attempts[1]?.modelSelection, response?.modelSelection);
+  state.close();
+});
+
 test("Owner CLI reports missing configuration as a deterministic host diagnostic", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-missing-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
@@ -164,15 +348,17 @@ test("Owner CLI rejects Model URLs that could carry secrets", async (t) => {
 test("Owner CLI reports an unavailable configured Model without Lead Agent prose", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-model-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const failingModel = await startLocalModel(() => ({ errorStatus: 503 }));
+  t.after(() => failingModel.close());
   await writeFile(
     join(stateDirectory, "config.json"),
     JSON.stringify({
       targetProject: { path: "C:\\target-project" },
       modelSelection: {
         provider: "local-openai",
-        model: "missing-local-model",
+        model: "owner-model",
         api: "openai-completions",
-        baseUrl: "http://127.0.0.1:1/v1",
+        baseUrl: failingModel.baseUrl,
       },
       modelPolicyRevision: "owner-policy-1",
     }),
@@ -197,28 +383,32 @@ test("Owner CLI reports an unavailable configured Model without Lead Agent prose
     turnId: messages?.[0]?.turnId,
     modelSelection: {
       provider: "local-openai",
-      model: "missing-local-model",
+      model: "owner-model",
       api: "openai-completions",
-      baseUrl: "http://127.0.0.1:1/v1",
+      baseUrl: failingModel.baseUrl,
     },
     modelPolicyRevision: "owner-policy-1",
+    nativeHarness: null,
   });
   assert.match(messages?.[0]?.turnId ?? "", /^[0-9a-f-]{36}$/);
+  assert.equal(state.readLeadTurnAttempts()[0]?.status, "failed");
   state.close();
 });
 
 test("Owner CLI cannot activate the deterministic test adapter", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-no-fake-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const failingModel = await startLocalModel(() => ({ errorStatus: 503 }));
+  t.after(() => failingModel.close());
   await writeFile(
     join(stateDirectory, "config.json"),
     JSON.stringify({
       targetProject: { path: "C:\\target-project" },
       modelSelection: {
         provider: "local-openai",
-        model: "missing-local-model",
+        model: "owner-model",
         api: "openai-completions",
-        baseUrl: "http://127.0.0.1:1/v1",
+        baseUrl: failingModel.baseUrl,
       },
       modelPolicyRevision: "owner-policy-1",
     }),

@@ -17,19 +17,29 @@ import {
 } from "./authoritative-state/index.ts";
 import {
   PiAgentTurnAdapter,
+  PiTurnFailure,
   type PiTurnAdapter,
 } from "./conversation-runtime/index.ts";
 import {
   assertSupportedModelSelection,
   type ModelSelection,
 } from "./model-selection.ts";
+import {
+  assertValidatedLeadModelPolicy,
+  createOrchestrationCore,
+  defaultLeadModelRequirements,
+  type LeadModelRequirements,
+  type LeadModelPolicy,
+} from "./orchestration-core/index.ts";
 
 async function main(): Promise<void> {
   const stateDirectory = argumentValue("--state-dir");
   if (!stateDirectory) throw new Error("--state-dir is required.");
 
   const state = openAuthoritativeState(stateDirectory);
+  const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
   try {
+    let policyValidated = false;
     let conversation = state.readOwnerConversation();
     if (!conversation) {
       let configurationText: string;
@@ -51,12 +61,15 @@ async function main(): Promise<void> {
         throw invalidConfiguration();
       }
       const configuration = parseConfiguration(parsed);
+      await validatePolicy(adapter, configuration);
+      policyValidated = true;
       state.initialize(configuration);
       conversation = state.readOwnerConversation();
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
+    createOrchestrationCore(state).reconcileInterruptedCommitments();
+    if (!policyValidated) await validatePolicy(adapter, conversation);
 
-    const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
     if (process.stdin.isTTY && process.stdout.isTTY) {
       await runInteractiveConversation(state, adapter, conversation.targetProject.path);
     } else {
@@ -92,6 +105,7 @@ function runInteractiveConversation(
   const transcriptLines = (conversation?.messages ?? []).map((message) =>
     `${message.role === "owner" ? "Owner" : "Lead Agent"}: ${message.content}`,
   );
+  transcriptLines.push(...state.readCommitments().map(commitmentNotice));
   const transcript = new Text(transcriptLines.join("\n\n"));
   const input = new Input();
   let busy = false;
@@ -151,22 +165,137 @@ async function completeOwnerTurn(
 ): Promise<string> {
   const conversation = state.readOwnerConversation();
   if (!conversation) throw new Error("Authoritative state is not configured.");
+  const orchestration = createOrchestrationCore(state);
   const turnId = state.appendOwnerMessage(ownerInput);
-  let response: { content: string };
-  try {
-    response = await adapter.completeTurn({
-      conversation: conversation.messages,
-      ownerInput,
-      modelSelection: conversation.modelSelection,
-    });
-  } catch {
-    throw new HostDiagnostic(
-      "CMD_RIKER_MODEL_UNAVAILABLE",
-      "The configured Model did not complete the turn.",
+  const commitmentsBefore = new Map(
+    state
+      .readCommitments()
+      .map((commitment) => [commitment.id, commitmentFingerprint(commitment)]),
+  );
+  const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
+  for (const [index, modelSelection] of candidates.entries()) {
+    const validation = await adapter.validateSelection(
+      modelSelection,
+      conversation.modelRequirements ?? defaultLeadModelRequirements,
     );
+    if (orchestration.modelCandidateDecision(validation) === "skip") continue;
+    const attempt = orchestration.startLeadTurnAttempt({
+      ownerTurnId: turnId,
+      modelSelection,
+      modelPolicyRevision: conversation.modelPolicyRevision,
+      ...(index > 0
+        ? { selectionReason: "fallback-after-ineligible-candidate" as const }
+        : {}),
+    });
+    try {
+      const response = await adapter.completeTurn({
+        conversation: conversation.messages,
+        ownerInput,
+        modelSelection,
+        commitments: state.readCommitments(),
+        commitmentActions: {
+          record: (draft) => orchestration.recordCommitment(turnId, draft),
+          accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
+          resume: (commitmentId) => orchestration.resumeCommitment(commitmentId, turnId),
+          control: (commitmentId, action, reason, replacementCommitmentId) => {
+            if (action === "pause") orchestration.pauseCommitment(commitmentId, turnId, reason);
+            else if (action === "cancel") {
+              orchestration.cancelCommitment(commitmentId, turnId, reason);
+            } else {
+              if (!replacementCommitmentId) {
+                throw new Error("Supersession requires a replacement Commitment.");
+              }
+              orchestration.supersedeCommitment(
+                commitmentId,
+                turnId,
+                reason,
+                replacementCommitmentId,
+              );
+            }
+          },
+        },
+      });
+      state.appendLeadAgentMessage(turnId, response.content, {
+        modelSelection,
+        modelPolicyRevision: conversation.modelPolicyRevision,
+        ...(index > 0
+          ? { selectionReason: "fallback-after-ineligible-candidate" as const }
+          : {}),
+      });
+      orchestration.observeLeadResponse(turnId, response.content);
+      const notices = state
+        .readCommitments()
+        .filter(
+          (commitment) =>
+            commitmentsBefore.get(commitment.id) !== commitmentFingerprint(commitment),
+        )
+        .map(commitmentNotice);
+      const content = notices.length
+        ? `${response.content}\n\n${notices.join("\n")}`
+        : response.content;
+      orchestration.settleLeadTurnAttempt(attempt.id, "completed");
+      return content;
+    } catch (error) {
+      if (!(error instanceof PiTurnFailure)) throw error;
+      orchestration.settleLeadTurnAttempt(attempt.id, "failed", error.kind);
+      const decision = orchestration.modelFailureDecision(error);
+      if (decision === "fallback") continue;
+      if (decision === "revalidate") {
+        const updatedValidation = await adapter.validateSelection(
+          modelSelection,
+          conversation.modelRequirements ?? defaultLeadModelRequirements,
+        );
+        if (orchestration.modelCandidateDecision(updatedValidation) === "skip") continue;
+      }
+      orchestration.observeLeadTurnFailure(turnId, `Lead Model turn failed: ${error.kind}.`);
+      break;
+    }
   }
-  state.appendLeadAgentMessage(turnId, response.content);
-  return response.content;
+  throw new HostDiagnostic(
+    "CMD_RIKER_MODEL_UNAVAILABLE",
+    "The configured Model did not complete the turn.",
+  );
+}
+
+function commitmentFingerprint(commitment: {
+  state: string;
+  condition?: { kind: string };
+}): string {
+  return `${commitment.state}:${commitment.condition?.kind ?? "none"}`;
+}
+
+function commitmentNotice(commitment: {
+  id: string;
+  outcome: string;
+  state: string;
+  condition?: { kind: string };
+}): string {
+  const status =
+    commitment.state === "awaiting-acceptance"
+      ? "awaiting Owner Acceptance"
+      : commitment.condition?.kind ?? commitment.state;
+  return `Commitment ${commitment.id} ${status}: ${commitment.outcome}`;
+}
+
+async function validatePolicy(
+  adapter: PiTurnAdapter,
+  configuration: OwnerConfiguration,
+): Promise<void> {
+  const policy = leadModelPolicy(configuration);
+  const validations = [];
+  for (const modelSelection of [policy.default, ...policy.fallbacks]) {
+    validations.push(await adapter.validateSelection(modelSelection, policy.requirements));
+  }
+  assertValidatedLeadModelPolicy(policy, validations);
+}
+
+function leadModelPolicy(configuration: OwnerConfiguration): LeadModelPolicy {
+  return {
+    revision: configuration.modelPolicyRevision,
+    default: configuration.modelSelection,
+    fallbacks: configuration.modelFallbacks ?? [],
+    requirements: configuration.modelRequirements ?? defaultLeadModelRequirements,
+  };
 }
 
 function argumentValue(name: string): string | undefined {
@@ -191,30 +320,82 @@ function invalidConfiguration(): HostDiagnostic {
 }
 
 function parseConfiguration(value: unknown): OwnerConfiguration {
-  if (!isRecordWithKeys(value, ["targetProject", "modelSelection", "modelPolicyRevision"])) {
+  const legacyKeys = ["targetProject", "modelSelection", "modelPolicyRevision"];
+  const acceptedKeySets = [
+    legacyKeys,
+    [...legacyKeys, "modelFallbacks"],
+    [...legacyKeys, "modelRequirements"],
+    [...legacyKeys, "modelFallbacks", "modelRequirements"],
+  ];
+  if (!acceptedKeySets.some((keys) => isRecordWithKeys(value, keys))) {
     throw invalidConfiguration();
   }
-  const targetProject = value.targetProject;
-  const modelSelection = value.modelSelection;
+  const configuration = value as Record<string, unknown>;
+  const targetProject = configuration.targetProject;
+  const modelSelection = configuration.modelSelection;
   if (
     !isRecordWithKeys(targetProject, ["path"]) ||
     typeof targetProject.path !== "string" ||
     !targetProject.path.trim() ||
-    typeof value.modelPolicyRevision !== "string" ||
-    !value.modelPolicyRevision.trim()
+    typeof configuration.modelPolicyRevision !== "string" ||
+    !configuration.modelPolicyRevision.trim()
   ) {
     throw invalidConfiguration();
   }
   const selection = parseModelSelection(modelSelection);
+  const fallbacks = configuration.modelFallbacks;
+  if (fallbacks !== undefined && !Array.isArray(fallbacks)) throw invalidConfiguration();
+  const parsedFallbacks = fallbacks?.map(parseModelSelection);
+  const requirements = configuration.modelRequirements !== undefined
+    ? parseModelRequirements(configuration.modelRequirements)
+    : undefined;
   try {
     assertSupportedModelSelection(selection);
+    for (const fallback of parsedFallbacks ?? []) assertSupportedModelSelection(fallback);
   } catch {
     throw invalidConfiguration();
   }
   return {
     targetProject: { path: targetProject.path },
     modelSelection: selection,
-    modelPolicyRevision: value.modelPolicyRevision,
+    ...(parsedFallbacks ? { modelFallbacks: parsedFallbacks } : {}),
+    ...(requirements ? { modelRequirements: requirements } : {}),
+    modelPolicyRevision: configuration.modelPolicyRevision,
+  };
+}
+
+function parseModelRequirements(value: unknown): LeadModelRequirements {
+  if (!isRecordWithKeys(value, [
+    "requiredCapabilities",
+    "minimumContextWindow",
+    "dataHandling",
+    "maximumInputCostPerMillionUsd",
+  ])) {
+    throw invalidConfiguration();
+  }
+  if (
+    !Array.isArray(value.requiredCapabilities) ||
+    value.requiredCapabilities.length === 0 ||
+    !value.requiredCapabilities.every(
+      (capability) => capability === "text" || capability === "image",
+    ) ||
+    typeof value.minimumContextWindow !== "number" ||
+    !Number.isInteger(value.minimumContextWindow) ||
+    value.minimumContextWindow < 1 ||
+    (value.dataHandling !== "loopback-only" &&
+      value.dataHandling !== "supported-integrations") ||
+    (value.maximumInputCostPerMillionUsd !== null &&
+      (typeof value.maximumInputCostPerMillionUsd !== "number" ||
+        !Number.isFinite(value.maximumInputCostPerMillionUsd) ||
+        value.maximumInputCostPerMillionUsd < 0))
+  ) {
+    throw invalidConfiguration();
+  }
+  return {
+    requiredCapabilities: value.requiredCapabilities,
+    minimumContextWindow: value.minimumContextWindow,
+    dataHandling: value.dataHandling,
+    maximumInputCostPerMillionUsd: value.maximumInputCostPerMillionUsd,
   };
 }
 

@@ -23,6 +23,7 @@ async function exerciseContract(
         turnId: "turn-1",
         modelSelection: selection,
         modelPolicyRevision: "owner-policy-1",
+        nativeHarness: null,
       },
       {
         sequence: 2,
@@ -31,6 +32,7 @@ async function exerciseContract(
         turnId: "turn-1",
         modelSelection: selection,
         modelPolicyRevision: "owner-policy-1",
+        nativeHarness: null,
       },
     ],
     ownerInput: "What did I say?",
@@ -56,6 +58,22 @@ test("production adapter completes a turn through pinned pi-agent-core", async (
     "Pinned Pi response.",
     modelSelection(localModel.baseUrl),
   );
+});
+
+test("production validation reports a failed context hard gate", async (t) => {
+  const localModel = await startLocalModel(() => "Unused response.");
+  t.after(() => localModel.close());
+  const selection = modelSelection(localModel.baseUrl);
+
+  const validation = await new PiAgentTurnAdapter().validateSelection(selection, {
+    requiredCapabilities: ["text"],
+    minimumContextWindow: 65_536,
+    dataHandling: "loopback-only",
+    maximumInputCostPerMillionUsd: 0,
+  });
+
+  assert.equal(validation.availability, "passed");
+  assert.equal(validation.hardGates.context, "failed");
 });
 
 test("production adapter refuses a Model URL that can carry secrets", async () => {

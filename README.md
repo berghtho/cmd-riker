@@ -34,6 +34,13 @@ An uninitialized state directory requires a secret-free `config.json`:
     "model": "gpt-5.4-mini",
     "api": "openai-codex-responses"
   },
+  "modelFallbacks": [],
+  "modelRequirements": {
+    "requiredCapabilities": ["text"],
+    "minimumContextWindow": 1,
+    "dataHandling": "supported-integrations",
+    "maximumInputCostPerMillionUsd": null
+  },
   "modelPolicyRevision": "owner-policy-1"
 }
 ```
@@ -66,6 +73,19 @@ npm run live-smoke -- --state-dir C:\path\to\cmd-riker-state
 The smoke prompt is fixed unless `--prompt` is supplied. Missing configuration, unavailable Pi
 authentication, or an unavailable Model produces a stable `CMD_RIKER_*` host diagnostic and no Lead
 Agent prose.
+
+The Lead Model policy tries the configured default and then each fallback in order. Every candidate
+must independently pass the configured capability, context, data-handling, cost, authentication,
+identity, and availability gates; an unknown or failed gate makes only that candidate ineligible. A
+fallback is attributed on the completed Lead turn together with the active policy revision.
+
+The Lead Agent can visibly accept bounded conversational work as a durable Commitment. CMD Riker
+records its `Committed -> Ready -> Active -> Verifying` history, verifies declared response
+postconditions, and grants objective Acceptance itself. Criteria reserved for Owner judgment stop at
+`Awaiting Acceptance` until a later Owner turn explicitly accepts them. Commitment state,
+Verification evidence, Acceptance authority, and the concise conversation status survive restart.
+Interrupted active work becomes reconciling with a recovery action; later Owner turns can resume,
+pause, cancel, or supersede it through the same conversation.
 
 ## Workflow skills
 

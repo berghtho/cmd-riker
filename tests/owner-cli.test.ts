@@ -40,6 +40,16 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
   assert.equal(first.code, 0, first.stderr);
   assert.match(first.stdout, /Lead Agent: Pinned Pi turn 1\./);
 
+  const policyState = openAuthoritativeState(stateDirectory);
+  const durableConversation = policyState.readOwnerConversation();
+  assert.ok(durableConversation);
+  const { messages: _messages, ...durableConfiguration } = durableConversation;
+  policyState.replaceOwnerConfiguration({
+    ...durableConfiguration,
+    modelPolicyRevision: "owner-policy-2",
+  });
+  policyState.close();
+
   await writeFile(
     join(stateDirectory, "config.json"),
     JSON.stringify({
@@ -64,6 +74,7 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
   assert.deepEqual(state.readOwnerConversation()?.forgeAuthorities, {
     github: { account: "owner-login", repository: "owner/repository" },
   });
+  assert.equal(state.readOwnerConversation()?.modelPolicyRevision, "owner-policy-2");
   state.close();
 });
 

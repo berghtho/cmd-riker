@@ -186,8 +186,20 @@ async function main(): Promise<void> {
       if (!conversation) {
         await validatePolicy(adapter, configuration);
         policyValidated = true;
+        state.initialize(configuration);
+      } else {
+        const {
+          messages: _messages,
+          forgeAuthorities: _durableForgeAuthorities,
+          ...durableConfiguration
+        } = conversation;
+        state.initialize({
+          ...durableConfiguration,
+          ...(configuration.forgeAuthorities
+            ? { forgeAuthorities: configuration.forgeAuthorities }
+            : {}),
+        });
       }
-      state.initialize(configuration);
       conversation = state.readOwnerConversation();
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");

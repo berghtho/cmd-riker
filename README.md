@@ -37,7 +37,15 @@ An uninitialized state directory requires a secret-free `config.json`:
     "dataHandling": "supported-integrations",
     "maximumInputCostPerMillionUsd": null
   },
-  "modelPolicyRevision": "owner-policy-1"
+  "modelPolicyRevision": "owner-policy-1",
+  "workerModelPolicy": {
+    "revision": "worker-policy-1",
+    "selection": {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "nativeHarness": "codex"
+    }
+  }
 }
 ```
 
@@ -102,10 +110,29 @@ mapping in `cmd-riker.operations.json` at the checkout root:
 The `test` task must be public in a supported root `Taskfile.yml`/`Taskfile.yaml` variant. CMD Riker
 verifies the checkout, current platform, Task version, resolved Taskfile, and declared task before it
 atomically records the ready Operation Attempt and pending effect intent, claims a bounded dispatch
-lease, and invokes Task. One Commitment cannot have overlapping or unresolved effects. `artifacts`
+lease, and invokes Task. One Authorized Write Root cannot have overlapping or unresolved effects. `artifacts`
 contains up to 32 checkout-relative file paths, each at most 16 MiB, whose SHA-256 changes are
 attributed to the operation result; use an empty array when the operation has no declared file
 artifact.
+
+With pinned Codex CLI `0.147.0` authenticated through ChatGPT, the Lead Agent can delegate an
+effectful assignment for an active Commitment that declares the `test` criterion. CMD Riker records
+the assignment's targets, effect classes, Authorized Write Root, Command Authority, time and cost
+bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. The
+checkout must be clean and use a non-default branch or secondary Git worktree. Immediately before
+`turn/start`, the production adapter requires Windows sandbox readiness and uses Codex `workspaceWrite`
+with no additional writable roots, no command network, no temporary-directory exception, and approval
+policy `never`. A real in-root/out-of-root probe runs under the same policy; failure to prove either
+side stops before effect dispatch. The orchestrator interrupts the native attempt when its durable
+deadline expires and retains effect uncertainty rather than claiming rollback.
+
+Only the current Worker generation can settle the effect. A safely terminated, structured Worker
+outcome must agree with a real non-empty Git diff against the recorded baseline and stay inside the
+assigned targets. It then triggers the declared typed `test` operation, whose durable result provides
+Verification and objective Acceptance. The Authorized Write Root remains reserved until that result is
+linked to the Worker effect; restart resumes a not-yet-dispatched Verification without replaying the
+Worker. Connection loss after dispatch leaves the effect unknown and reconciling; it is never
+automatically replayed.
 
 ## Workflow skills
 

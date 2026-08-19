@@ -18,7 +18,9 @@ import type {
 } from "../orchestration-core/index.ts";
 import type {
   EffectIntent,
+  TargetProjectOperationEffectIntent,
   TargetProjectOperationAttempt,
+  WorkerAssignmentEffectIntent,
 } from "../target-project-operations/index.ts";
 
 export type { ModelSelection } from "../model-selection.ts";
@@ -100,25 +102,31 @@ export interface AuthoritativeState {
   startWorkerExecution(
     workerSessionSnapshots: WorkerSession[],
     executionAttempt: WorkerExecutionAttempt,
+    effectIntent?: EffectIntent,
   ): void;
   appendWorkerState(input: {
     workerSession?: WorkerSession;
     executionAttempt?: WorkerExecutionAttempt;
     questions?: WorkerQuestion[];
+    effectIntent?: EffectIntent;
   }): void;
+  settleWorkerVerification(
+    effectIntent: WorkerAssignmentEffectIntent,
+    commitmentSnapshots: Commitment[],
+  ): void;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
   claimTargetProjectOperationDispatch(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
   settleTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
   readTargetProjectOperationAttempt(attemptId: string): TargetProjectOperationAttempt | undefined;
   readTargetProjectOperationAttempts(): TargetProjectOperationAttempt[];
@@ -399,7 +407,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
-      | "worker-question.snapshot",
+      | "worker-question.snapshot"
+      | "effect-intent.snapshot",
     subjectId: string,
   ): { id: string; value: T } | undefined => {
     const row = database
@@ -441,9 +450,18 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
-      | "worker-question.snapshot";
-    subjectPrefix: "worker-session" | "worker-execution-attempt" | "worker-question";
-    transitionPrefix: "worker-session" | "worker-execution-attempt" | "worker-question";
+      | "worker-question.snapshot"
+      | "effect-intent.snapshot";
+    subjectPrefix:
+      | "worker-session"
+      | "worker-execution-attempt"
+      | "worker-question"
+      | "effect-intent";
+    transitionPrefix:
+      | "worker-session"
+      | "worker-execution-attempt"
+      | "worker-question"
+      | "effect-intent";
     snapshot: { id: string; state?: string; status?: string };
   };
 
@@ -564,7 +582,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
 
   const writeOperationAndEffect = (
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
     predecessors?: { attemptId: string; effectIntentId: string },
     rejectConflictingCommitmentEffect = false,
   ): void => {
@@ -586,14 +604,20 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
             SELECT 1
               FROM facts current
              WHERE current.kind = 'effect-intent.snapshot'
-               AND json_extract(current.value_json, '$.commitmentId') = ?
+                AND (
+                  COALESCE(
+                    json_extract(current.value_json, '$.authorizedWriteRootKey'),
+                    lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
+                  ) = ?
+                  OR json_extract(current.value_json, '$.commitmentId') = ?
+                )
                AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
                AND NOT EXISTS (
                  SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
                )
              LIMIT 1
           `)
-          .get(effectIntent.commitmentId);
+          .get(effectIntent.authorizedWriteRootKey, effectIntent.commitmentId);
         if (conflict) {
           throw new Error("A conflicting Target Project effect is already open for this Commitment.");
         }
@@ -865,7 +889,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return rows.map((row) => JSON.parse(row.value_json) as LeadTurnAttempt);
     },
 
-    startWorkerExecution(workerSessionSnapshots, executionAttempt) {
+    startWorkerExecution(workerSessionSnapshots, executionAttempt, effectIntent) {
       const workerSession = workerSessionSnapshots.at(-1);
       if (
         !workerSession ||
@@ -877,6 +901,20 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       ) {
         throw new Error("A Worker launch requires matching Session and attempt identities.");
       }
+      if (
+        effectIntent &&
+        (effectIntent.kind !== "worker-assignment" ||
+          effectIntent.workerSessionId !== workerSession.id ||
+          effectIntent.executionAttemptId !== executionAttempt.id ||
+          executionAttempt.effectIntentId !== effectIntent.id ||
+          workerSession.assignment.readOnly ||
+          effectIntent.status !== "pending")
+      ) {
+        throw new Error("An effectful Worker launch requires one matching pending effect intent.");
+      }
+      if (!effectIntent && !workerSession.assignment.readOnly) {
+        throw new Error("An effectful Worker launch cannot omit its effect intent.");
+      }
       const recordedAt = new Date().toISOString();
       let predecessorId = readCurrentWorkerSnapshot<WorkerSession>(
         "worker-session.snapshot",
@@ -884,6 +922,34 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       )?.id;
       database.exec("BEGIN IMMEDIATE");
       try {
+        if (effectIntent) {
+          const conflict = database
+            .prepare(`
+              SELECT 1
+                FROM facts current
+               WHERE current.kind = 'effect-intent.snapshot'
+                 AND COALESCE(
+                   json_extract(current.value_json, '$.authorizedWriteRootKey'),
+                   lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
+                 ) = ?
+                 AND (
+                   json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
+                   OR (
+                     json_extract(current.value_json, '$.kind') = 'worker-assignment'
+                     AND json_extract(current.value_json, '$.status') = 'succeeded'
+                     AND json_extract(current.value_json, '$.verificationOperationAttemptId') IS NULL
+                   )
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+                 )
+               LIMIT 1
+            `)
+            .get(effectIntent.authorizedWriteRootKey);
+          if (conflict) {
+            throw new Error("A conflicting Target Project effect is already open for this Authorized Write Root.");
+          }
+        }
         for (const snapshot of workerSessionSnapshots) {
           const factId = randomUUID();
           database
@@ -926,6 +992,27 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
             VALUES (?, 'worker-execution-attempt.launch-intent-recorded', ?, ?)
           `)
           .run(randomUUID(), attemptFactId, recordedAt);
+        if (effectIntent) {
+          const effectFactId = randomUUID();
+          database
+            .prepare(`
+              INSERT INTO facts (
+                id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+              ) VALUES (?, ?, 'effect-intent.snapshot', ?, NULL, ?)
+            `)
+            .run(
+              effectFactId,
+              `effect-intent:${effectIntent.id}`,
+              JSON.stringify(effectIntent),
+              recordedAt,
+            );
+          database
+            .prepare(`
+              INSERT INTO transitions (id, kind, fact_id, recorded_at)
+              VALUES (?, 'effect-intent.pending', ?, ?)
+            `)
+            .run(randomUUID(), effectFactId, recordedAt);
+        }
         database.exec("COMMIT");
       } catch (error) {
         database.exec("ROLLBACK");
@@ -961,7 +1048,86 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
               },
             ]
           : []),
+        ...(input.effectIntent
+          ? [
+              {
+                kind: "effect-intent.snapshot" as const,
+                subjectPrefix: "effect-intent" as const,
+                transitionPrefix: "effect-intent" as const,
+                snapshot: input.effectIntent,
+              },
+            ]
+          : []),
       ]);
+    },
+
+    settleWorkerVerification(effectIntent, commitmentSnapshots) {
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      const commitment = commitmentSnapshots.at(-1);
+      const currentCommitment = commitment ? readCommitmentRow(commitment.id) : undefined;
+      if (
+        currentEffect?.value.kind !== "worker-assignment" ||
+        currentEffect.value.status !== "succeeded" ||
+        currentEffect.value.verificationOperationAttemptId ||
+        !effectIntent.verificationOperationAttemptId ||
+        !commitment ||
+        !currentCommitment ||
+        commitmentSnapshots.some((snapshot) => snapshot.id !== commitment.id)
+      ) {
+        throw new Error("Worker Verification settlement requires current attributed state.");
+      }
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const recordedAt = new Date().toISOString();
+        const effectFactId = randomUUID();
+        database
+          .prepare(`
+            INSERT INTO facts (
+              id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+            ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
+          `)
+          .run(
+            effectFactId,
+            `effect-intent:${effectIntent.id}`,
+            JSON.stringify(effectIntent),
+            currentEffect.id,
+            recordedAt,
+          );
+        database
+          .prepare(`
+            INSERT INTO transitions (id, kind, fact_id, recorded_at)
+            VALUES (?, 'effect-intent.succeeded', ?, ?)
+          `)
+          .run(randomUUID(), effectFactId, recordedAt);
+        let predecessorId = currentCommitment.id;
+        for (const snapshot of commitmentSnapshots) {
+          const factId = randomUUID();
+          database
+            .prepare(`
+              INSERT INTO facts (
+                id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+              ) VALUES (?, ?, 'commitment.snapshot', ?, ?, ?)
+            `)
+            .run(
+              factId,
+              `commitment:${snapshot.id}`,
+              JSON.stringify(snapshot),
+              predecessorId,
+              recordedAt,
+            );
+          database
+            .prepare(`
+              INSERT INTO transitions (id, kind, fact_id, recorded_at)
+              VALUES (?, ?, ?, ?)
+            `)
+            .run(randomUUID(), `commitment.${snapshot.state}`, factId, recordedAt);
+          predecessorId = factId;
+        }
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
     },
 
     readCapabilityNotice(id) {
@@ -1222,6 +1388,7 @@ function ensureSchema(database: DatabaseSync): void {
         'worker-execution-attempt.blocked',
         'worker-execution-attempt.failed',
         'worker-execution-attempt.cancelled',
+        'worker-execution-attempt.timed-out',
         'worker-execution-attempt.continuity-lost',
         'worker-question.open',
         'worker-question.answer-recorded',
@@ -1250,6 +1417,9 @@ function ensureSchema(database: DatabaseSync): void {
   const row = database
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts'")
     .get() as { sql: string };
+  const transitionsRow = database
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transitions'")
+    .get() as { sql: string };
   if (
     row.sql.includes("'commitment.snapshot'") &&
     row.sql.includes("'lead-turn-attempt.snapshot'") &&
@@ -1258,7 +1428,8 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'worker-question.snapshot'") &&
     row.sql.includes("'capability-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
-    row.sql.includes("'effect-intent.snapshot'")
+    row.sql.includes("'effect-intent.snapshot'") &&
+    transitionsRow.sql.includes("'worker-execution-attempt.timed-out'")
   ) {
     return;
   }
@@ -1329,6 +1500,7 @@ function ensureSchema(database: DatabaseSync): void {
           'worker-execution-attempt.blocked',
           'worker-execution-attempt.failed',
           'worker-execution-attempt.cancelled',
+          'worker-execution-attempt.timed-out',
           'worker-execution-attempt.continuity-lost',
           'worker-question.open',
           'worker-question.answer-recorded',

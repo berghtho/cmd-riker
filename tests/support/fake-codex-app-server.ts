@@ -1,8 +1,12 @@
 import { createInterface } from "node:readline";
+import { writeFile } from "node:fs/promises";
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let initialized = false;
 let threadStarted = false;
+let effectful = false;
+let sandboxProbeCount = 0;
+const sandboxReadiness = process.argv[2] ?? "ready";
 
 for await (const line of lines) {
   const message = JSON.parse(line) as {
@@ -21,11 +25,43 @@ for await (const line of lines) {
     initialized = true;
     continue;
   }
+  if (message.method === "windowsSandbox/readiness") {
+    respond(message.id!, { status: sandboxReadiness });
+    continue;
+  }
+  if (message.method === "command/exec") {
+    const sandboxPolicy = message.params?.sandboxPolicy as
+      | {
+          type?: string;
+          networkAccess?: boolean;
+          writableRoots?: string[];
+          excludeTmpdirEnvVar?: boolean;
+        }
+      | undefined;
+    const command = message.params?.command as string[] | undefined;
+    if (
+      sandboxPolicy?.type !== "workspaceWrite" ||
+      sandboxPolicy.networkAccess !== false ||
+      sandboxPolicy.excludeTmpdirEnvVar !== true ||
+      sandboxPolicy.writableRoots?.length !== 0 ||
+      !command?.at(-1)
+    ) {
+      process.exit(26);
+    }
+    if (sandboxProbeCount++ === 0) {
+      await writeFile(command.at(-1)!, "cmd-riker-isolation-probe");
+      respond(message.id!, { exitCode: 0, stdout: "", stderr: "" });
+    } else {
+      respond(message.id!, { exitCode: 1, stdout: "", stderr: "access denied" });
+    }
+    continue;
+  }
   if (message.method === "thread/start") {
+    effectful = message.params?.sandbox === "workspace-write";
     if (
       !initialized ||
       message.params?.approvalPolicy !== "never" ||
-      message.params?.sandbox !== "read-only" ||
+      (!effectful && message.params?.sandbox !== "read-only") ||
       message.params?.ephemeral !== true ||
       message.params?.model !== "gpt-5.6-sol"
     ) {
@@ -33,7 +69,7 @@ for await (const line of lines) {
     }
     threadStarted = true;
     respond(message.id!, {
-      thread: { id: "thread-read-only-1" },
+      thread: { id: effectful ? "thread-workspace-write-1" : "thread-read-only-1" },
       model: "gpt-5.6-sol",
       reasoningEffort: "high",
     });
@@ -45,14 +81,33 @@ for await (const line of lines) {
       | undefined;
     if (
       !threadStarted ||
-      message.params?.threadId !== "thread-read-only-1" ||
+      message.params?.threadId !==
+        (effectful ? "thread-workspace-write-1" : "thread-read-only-1") ||
       message.params?.approvalPolicy !== "never" ||
-      sandboxPolicy?.type !== "readOnly" ||
+      sandboxPolicy?.type !== (effectful ? "workspaceWrite" : "readOnly") ||
       sandboxPolicy.networkAccess !== false
     ) {
       process.exit(23);
     }
-    respond(message.id!, { turn: { id: "turn-read-only-1", status: "inProgress" } });
+    const threadId = effectful ? "thread-workspace-write-1" : "thread-read-only-1";
+    const turnId = effectful ? "turn-workspace-write-1" : "turn-read-only-1";
+    respond(message.id!, { turn: { id: turnId, status: "inProgress" } });
+    if (effectful) {
+      notify("item/agentMessage/delta", {
+        threadId,
+        turnId,
+        itemId: "message-effectful-1",
+        delta:
+          "Implemented bounded change.\n" +
+          'CMD_RIKER_OUTCOME: {"status":"completed","summary":"Implemented bounded change.",' +
+          '"affectedArtifacts":["src/index.ts"],"verificationResults":["Ready for host Verification."]}',
+      });
+      notify("turn/completed", {
+        threadId,
+        turn: { id: turnId, status: "completed" },
+      });
+      continue;
+    }
     notify("item/agentMessage/delta", {
       threadId: "thread-read-only-1",
       turnId: "turn-read-only-1",

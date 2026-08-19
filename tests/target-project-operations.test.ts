@@ -10,8 +10,8 @@ import {
   createTargetProjectOperations,
   NativeGitCheckoutInspector,
   NativeTaskCli,
-  type EffectIntent,
   type TaskCli,
+  type TargetProjectOperationEffectIntent,
   type TargetProjectOperationAttempt,
 } from "../src/target-project-operations/index.ts";
 
@@ -84,6 +84,7 @@ test("a declared typed Target Project operation is dispatched durably and verifi
               operationAttemptId: "conflicting-operation-attempt",
               kind: "target-project-operation",
               expectedEffect: "Conflicting test operation.",
+              authorizedWriteRootKey: checkout,
               authorization: {
                 kind: "lead-agent-command-authority",
                 commitmentId: currentAttempt.commitmentId,
@@ -203,12 +204,13 @@ test("restart makes a dispatched Target Project operation uncertain and blocks r
       status: "ready" as const,
       startedAt,
     };
-  const pendingEffect: EffectIntent = {
+  const pendingEffect: TargetProjectOperationEffectIntent = {
       id: "effect-intent-1",
       commitmentId: commitment.id,
       operationAttemptId: "operation-attempt-1",
       kind: "target-project-operation",
       expectedEffect: "Run the declared test task.",
+      authorizedWriteRootKey: configuration.targetProject.path.toLowerCase(),
       authorization: {
         kind: "lead-agent-command-authority" as const,
         commitmentId: commitment.id,

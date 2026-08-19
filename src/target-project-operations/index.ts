@@ -5,12 +5,19 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 import type { Commitment } from "../orchestration-core/index.ts";
 
+export type WorkerExecutionAttribution = {
+  workerSessionId: string;
+  executionAttemptId: string;
+  generation: number;
+};
+
 export type TargetProjectOperationRequest = {
   commitmentId: string;
   operation: { kind: "test"; inputs: Record<string, never> };
   checkout: string;
   workingDirectory: string;
   timeoutMs: number;
+  causedByWorker?: WorkerExecutionAttribution;
 };
 
 export type TargetProjectOperationDiscovery =
@@ -47,6 +54,7 @@ export type TargetProjectOperationResult = {
   uncertainty: null | { reason: string; nextAction: string };
   startedAt: string;
   completedAt: string;
+  causedByWorker?: WorkerExecutionAttribution;
 };
 
 export type TargetProjectOperationAttempt = {
@@ -61,14 +69,14 @@ export type TargetProjectOperationAttempt = {
   status: "ready" | "running" | TargetProjectOperationResult["status"];
   startedAt: string;
   result?: TargetProjectOperationResult;
+  causedByWorker?: WorkerExecutionAttribution;
 };
 
-export type EffectIntent = {
+type EffectIntentBase = {
   id: string;
   commitmentId: string;
-  operationAttemptId: string;
-  kind: "target-project-operation";
   expectedEffect: string;
+  authorizedWriteRootKey: string;
   authorization: {
     kind: "lead-agent-command-authority";
     commitmentId: string;
@@ -79,6 +87,21 @@ export type EffectIntent = {
   status: "pending" | "dispatching" | "succeeded" | "unknown" | "rejected";
   lease?: { claimedAt: string; expiresAt: string };
 };
+
+export type TargetProjectOperationEffectIntent = EffectIntentBase & {
+  kind: "target-project-operation";
+  operationAttemptId: string;
+  causedByWorker?: WorkerExecutionAttribution;
+};
+
+export type WorkerAssignmentEffectIntent = EffectIntentBase & {
+  kind: "worker-assignment";
+  workerSessionId: string;
+  executionAttemptId: string;
+  verificationOperationAttemptId?: string;
+};
+
+export type EffectIntent = TargetProjectOperationEffectIntent | WorkerAssignmentEffectIntent;
 
 export type TaskCliInspection = {
   version: string;
@@ -111,15 +134,15 @@ interface TargetProjectOperationState {
   readCommitment(commitmentId: string): Commitment | undefined;
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
   claimTargetProjectOperationDispatch(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
   settleTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
 }
 
@@ -181,6 +204,7 @@ export function createTargetProjectOperations(
           uncertainty: null,
           startedAt,
           completedAt: new Date().toISOString(),
+          ...(request.causedByWorker ? { causedByWorker: request.causedByWorker } : {}),
         };
         state.startTargetProjectOperation(
           {
@@ -191,6 +215,7 @@ export function createTargetProjectOperations(
             checkout: request.checkout,
             workingDirectory: request.workingDirectory,
             timeoutMs: request.timeoutMs,
+            ...(request.causedByWorker ? { causedByWorker: request.causedByWorker } : {}),
             discovery,
             status,
             startedAt,
@@ -201,6 +226,7 @@ export function createTargetProjectOperations(
             commitmentId: request.commitmentId,
             operationAttemptId,
             kind: "target-project-operation",
+            authorizedWriteRootKey: normalizedAuthorizedWriteRoot(request.checkout),
             expectedEffect: "Discover and run the declared Target Project test operation.",
             authorization: {
               kind: "lead-agent-command-authority",
@@ -210,6 +236,7 @@ export function createTargetProjectOperations(
             },
             retryRule: "Correct the discovery blocker before starting a new attempt.",
             status: "rejected",
+            ...(request.causedByWorker ? { causedByWorker: request.causedByWorker } : {}),
           },
         );
         return result;
@@ -225,12 +252,14 @@ export function createTargetProjectOperations(
         discovery: declaration.discovery,
         status: "running",
         startedAt,
+        ...(request.causedByWorker ? { causedByWorker: request.causedByWorker } : {}),
       };
       const effectIntent: EffectIntent = {
         id: effectIntentId,
         commitmentId: request.commitmentId,
         operationAttemptId,
         kind: "target-project-operation",
+        authorizedWriteRootKey: normalizedAuthorizedWriteRoot(request.checkout),
         expectedEffect: `Run declared Task task ${JSON.stringify(declaration.task)} for semantic operation test.`,
         authorization: {
           kind: "lead-agent-command-authority",
@@ -240,6 +269,7 @@ export function createTargetProjectOperations(
         },
         retryRule: "Do not retry unless the prior effect is proven settled.",
         status: "pending",
+        ...(request.causedByWorker ? { causedByWorker: request.causedByWorker } : {}),
       };
       const artifactsBefore = await observeArtifacts(request.checkout, declaration.artifacts);
       state.startTargetProjectOperation({ ...attempt, status: "ready" }, effectIntent);
@@ -325,6 +355,7 @@ export function createTargetProjectOperations(
         uncertainty,
         startedAt,
         completedAt: new Date().toISOString(),
+        ...(request.causedByWorker ? { causedByWorker: request.causedByWorker } : {}),
       };
       state.settleTargetProjectOperation(
         { ...attempt, status, result },
@@ -724,6 +755,11 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
+}
+
+function normalizedAuthorizedWriteRoot(path: string): string {
+  const normalized = resolve(path);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function isWithin(parent: string, candidate: string): boolean {

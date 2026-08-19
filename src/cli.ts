@@ -231,6 +231,24 @@ async function completeOwnerTurn(
                     model: conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: conversation.workerModelPolicy!.revision,
                   }),
+                delegateEffectful: (input: {
+                  objective: string;
+                  prompt: string;
+                  commitmentId: string;
+                  targets: string[];
+                }) =>
+                  workerSupervisor.delegateEffectful({
+                    ...input,
+                    targetProjectPath: conversation.targetProject.path,
+                    model: conversation.workerModelPolicy!.selection.model,
+                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                    timeoutMs: 20 * 60_000,
+                    verification: {
+                      operation: "test",
+                      workingDirectory: conversation.targetProject.path,
+                      timeoutMs: 120_000,
+                    },
+                  }),
                 answer: (questionId: string, answers: Record<string, string[]>) =>
                   workerSupervisor.answer(questionId, turnId, answers),
                 cancel: (workerSessionId: string, reason: string) =>
@@ -326,7 +344,11 @@ async function availableWorkerSupervisor(
         "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
       );
     }
-    return createWorkerSupervisor(state, createCodexWorkerHarness(runtime));
+    return createWorkerSupervisor(
+      state,
+      createCodexWorkerHarness(runtime),
+      createTargetProjectOperations(state),
+    );
   } catch (error) {
     orchestration.reconcileInterruptedWorkers(
       "The Codex capability could not be proven after host restart.",

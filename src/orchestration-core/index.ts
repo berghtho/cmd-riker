@@ -280,6 +280,7 @@ export type ReviewFinding = {
   summary: string;
   evidence: string;
   leadDisposition?: {
+    authority: "lead-agent";
     kind: "must-fix" | "documented-exception" | "follow-up";
     rationale: string;
     decidedAt: string;
@@ -1846,6 +1847,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           ? {
               ...finding,
               leadDisposition: {
+                authority: "lead-agent" as const,
                 kind: decision.disposition,
                 rationale: decision.rationale,
                 decidedAt,

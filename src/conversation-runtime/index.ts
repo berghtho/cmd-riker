@@ -17,6 +17,8 @@ import type {
   Commitment,
   CommitmentDraft,
   ConversationMessage,
+  WorkerQuestion,
+  WorkerSession,
 } from "../authoritative-state/index.ts";
 import {
   defaultLeadModelRequirements,
@@ -45,6 +47,17 @@ export type PiTurnRequest = {
       replacementCommitmentId?: string,
     ): void;
     executeOperation(commitmentId: string, operation: "test"): Promise<TargetProjectOperationResult>;
+  };
+  workers?: readonly WorkerSession[];
+  workerQuestions?: readonly WorkerQuestion[];
+  workerActions?: {
+    delegate(input: {
+      objective: string;
+      prompt: string;
+      commitmentId?: string;
+    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+    answer(questionId: string, answers: Record<string, string[]>): Promise<void>;
+    cancel(workerSessionId: string, reason: string): Promise<void>;
   };
 };
 
@@ -225,11 +238,15 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       } catch (error) {
         throw new PiTurnFailure("unavailable", "The configured Model is unavailable.", false, error);
       }
-      const tools = commitmentTools(request, {
+      const mutationObserver = {
         onMutation: () => {
           commitmentMutationApplied = true;
         },
-      });
+      };
+      const tools = [
+        ...commitmentTools(request, mutationObserver),
+        ...workerTools(request, mutationObserver),
+      ];
       const commitmentContext = (request.commitments ?? [])
         .map(
           (commitment) =>
@@ -238,6 +255,26 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
               ? ` (${commitment.condition.kind}: ${commitment.condition.reason}; next: ${commitment.condition.nextAction})`
               : "") +
             ` - ${commitment.outcome}`,
+        )
+        .join("\n");
+      const workerContext = (request.workers ?? [])
+        .map(
+          (worker) =>
+            `${worker.id}: ${worker.state} - ${worker.assignment.objective} ` +
+            `(attempt ${worker.currentExecutionAttemptId})` +
+            (worker.outcome
+              ? `; outcome ${worker.outcome.status}: ${worker.outcome.summary}; ` +
+                `${worker.outcome.affectedArtifacts.length} affected artifact(s); ` +
+                `${worker.outcome.unresolvedUncertainty ?? "no unresolved uncertainty"}`
+              : ""),
+        )
+        .join("\n");
+      const questionContext = (request.workerQuestions ?? [])
+        .filter((question) => question.status === "open")
+        .map(
+          (question) =>
+            `${question.id} from Worker Session ${question.workerSessionId}: ` +
+            question.questions.map((item) => `${item.id}: ${item.question}`).join("; "),
         )
         .join("\n");
       const initialState = {
@@ -253,8 +290,15 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "Commitment the Owner asks to continue. Use control_commitment only for the Owner's explicit pause, " +
           "cancel, or supersede instruction." +
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
-          "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
-          (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : ""),
+           "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
+           (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
+           (request.workerActions
+             ? "\nA proven Codex 0.147.0 Worker capability is available only for read-only, " +
+               "network-disabled Target Project assignments. It supports native questions and cancellation. " +
+               "Do not claim write capability, rollback, or exact resume after connection loss."
+             : "") +
+           (workerContext ? `\nCurrent Worker Sessions:\n${workerContext}` : "") +
+           (questionContext ? `\nOpen Worker questions:\n${questionContext}` : ""),
         model: execution.model,
         messages: request.conversation.map(toPiMessage),
         tools,
@@ -554,6 +598,107 @@ function commitmentTools(
             },
           ],
           details: { commitmentId, state: "accepted" },
+        };
+      },
+    },
+  ];
+}
+
+function workerTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  if (!request.workerActions) return [];
+  const actions = request.workerActions;
+  return [
+    {
+      name: "delegate_read_only_codex",
+      label: "Delegate Read-only Codex Worker",
+      description:
+        "Start one bounded, network-disabled, read-only Codex Worker Session without waiting for its outcome.",
+      parameters: Type.Object({
+        objective: Type.String({ minLength: 1 }),
+        prompt: Type.String({ minLength: 1 }),
+        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const result = await actions.delegate(
+          params as { objective: string; prompt: string; commitmentId?: string },
+        );
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Worker Session ${result.workerSessionId} started read-only ` +
+                `execution attempt ${result.executionAttemptId}.`,
+            },
+          ],
+          details: result,
+        };
+      },
+    },
+    {
+      name: "answer_worker_question",
+      label: "Answer Worker Question",
+      description: "Deliver the Owner's answer to one open native Codex question by durable identity.",
+      parameters: Type.Object({
+        questionId: Type.String({ minLength: 1 }),
+        answers: Type.Record(
+          Type.String(),
+          Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        ),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { questionId, answers } = params as {
+          questionId: string;
+          answers: Record<string, string[]>;
+        };
+        await actions.answer(questionId, answers);
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Answer recorded for Worker question ${questionId}; ` +
+                "native delivery is pending confirmation.",
+            },
+          ],
+          details: { questionId, deliveryState: "answer-recorded" },
+        };
+      },
+    },
+    {
+      name: "cancel_worker_session",
+      label: "Cancel Worker Session",
+      description:
+        "Record cancellation intent, then interrupt one active Codex Worker Session. This does not roll back effects.",
+      parameters: Type.Object({
+        workerSessionId: Type.String({ minLength: 1 }),
+        reason: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { workerSessionId, reason } = params as {
+          workerSessionId: string;
+          reason: string;
+        };
+        await actions.cancel(workerSessionId, reason);
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Cancellation intent recorded for Worker Session ${workerSessionId}; ` +
+                "interruption requested without a rollback claim.",
+            },
+          ],
+          details: { workerSessionId },
         };
       },
     },

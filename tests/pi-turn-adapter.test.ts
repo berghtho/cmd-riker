@@ -88,6 +88,51 @@ test("production adapter refuses a Model URL that can carry secrets", async () =
   );
 });
 
+test("production adapter advertises only the proven read-only Codex Worker controls", async (t) => {
+  let delegated: unknown;
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      const serialized = JSON.stringify(requestBody);
+      assert.match(serialized, /delegate_read_only_codex/);
+      assert.match(serialized, /answer_worker_question/);
+      assert.match(serialized, /cancel_worker_session/);
+      assert.doesNotMatch(serialized, /delegate_write|resume_worker/);
+      return {
+        toolCall: {
+          id: "worker-call-1",
+          name: "delegate_read_only_codex",
+          arguments: {
+            objective: "Inspect architecture",
+            prompt: "Report the module seams.",
+          },
+        },
+      };
+    }
+    return "The read-only Codex Worker Session is running.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Delegate a read-only architecture inspection.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    workerActions: {
+      async delegate(input) {
+        delegated = input;
+        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+      },
+      async answer() {},
+      async cancel() {},
+    },
+  });
+
+  assert.deepEqual(delegated, {
+    objective: "Inspect architecture",
+    prompt: "Report the module seams.",
+  });
+  assert.equal(result.content, "The read-only Codex Worker Session is running.");
+});
+
 function modelSelection(baseUrl: string): ModelSelection {
   return {
     provider: "local-openai",

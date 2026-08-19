@@ -8,9 +8,13 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import type {
+  CapabilityNotice,
   Commitment,
   LeadTurnAttempt,
   OwnerConfiguration,
+  WorkerExecutionAttempt,
+  WorkerQuestion,
+  WorkerSession,
 } from "../orchestration-core/index.ts";
 import type {
   EffectIntent,
@@ -19,6 +23,7 @@ import type {
 
 export type { ModelSelection } from "../model-selection.ts";
 export type {
+  CapabilityNotice,
   Commitment,
   CommitmentCriterion,
   CommitmentDraft,
@@ -27,6 +32,12 @@ export type {
   LeadTurnAttempt,
   ModelCandidateValidation,
   OwnerConfiguration,
+  WorkerExecutionAttempt,
+  WorkerModelSelection,
+  WorkerOutcome,
+  WorkerQuestion,
+  WorkerReportedOutcome,
+  WorkerSession,
 } from "../orchestration-core/index.ts";
 
 export type ConversationMessage =
@@ -77,6 +88,26 @@ export interface AuthoritativeState {
   appendLeadTurnAttemptSnapshots(snapshots: LeadTurnAttempt[]): void;
   readLeadTurnAttempt(attemptId: string): LeadTurnAttempt | undefined;
   readLeadTurnAttempts(): LeadTurnAttempt[];
+  appendWorkerSessionSnapshots(snapshots: WorkerSession[]): void;
+  readWorkerSession(workerSessionId: string): WorkerSession | undefined;
+  readWorkerSessions(): WorkerSession[];
+  appendWorkerExecutionAttemptSnapshots(snapshots: WorkerExecutionAttempt[]): void;
+  readWorkerExecutionAttempt(attemptId: string): WorkerExecutionAttempt | undefined;
+  readWorkerExecutionAttempts(): WorkerExecutionAttempt[];
+  appendWorkerQuestionSnapshots(snapshots: WorkerQuestion[]): void;
+  readWorkerQuestion(questionId: string): WorkerQuestion | undefined;
+  readWorkerQuestions(): WorkerQuestion[];
+  startWorkerExecution(
+    workerSessionSnapshots: WorkerSession[],
+    executionAttempt: WorkerExecutionAttempt,
+  ): void;
+  appendWorkerState(input: {
+    workerSession?: WorkerSession;
+    executionAttempt?: WorkerExecutionAttempt;
+    questions?: WorkerQuestion[];
+  }): void;
+  readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
+  appendCapabilityNotice(notice: CapabilityNotice): void;
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: EffectIntent,
@@ -123,6 +154,10 @@ type FactDraft =
     }
   | { kind: "commitment.snapshot"; value: Commitment }
   | { kind: "lead-turn-attempt.snapshot"; value: LeadTurnAttempt }
+  | { kind: "worker-session.snapshot"; value: WorkerSession }
+  | { kind: "worker-execution-attempt.snapshot"; value: WorkerExecutionAttempt }
+  | { kind: "worker-question.snapshot"; value: WorkerQuestion }
+  | { kind: "capability-notice.snapshot"; value: CapabilityNotice }
   | { kind: "target-project-operation-attempt.snapshot"; value: TargetProjectOperationAttempt }
   | { kind: "effect-intent.snapshot"; value: EffectIntent };
 
@@ -140,6 +175,10 @@ type TransitionKind =
   | "owner-conversation.lead-agent-message-recorded"
   | `commitment.${Commitment["state"]}`
   | `lead-turn-attempt.${LeadTurnAttempt["status"]}`
+  | `worker-session.${WorkerSession["state"]}`
+  | `worker-execution-attempt.${WorkerExecutionAttempt["status"]}`
+  | `worker-question.${WorkerQuestion["status"]}`
+  | `capability-notice.${CapabilityNotice["state"]}`
   | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
   | `effect-intent.${EffectIntent["status"]}`;
 
@@ -164,6 +203,26 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       .get() as { id: string; value_json: string } | undefined;
     if (!row) return undefined;
     return { id: row.id, value: parseConfiguration(row.value_json) };
+  };
+
+  const readCapabilityNoticeRow = (
+    id: CapabilityNotice["id"],
+  ): { id: string; value: CapabilityNotice } | undefined => {
+    const row = database
+      .prepare(`
+        SELECT id, value_json
+          FROM facts current
+         WHERE current.kind = 'capability-notice.snapshot'
+           AND current.subject_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         LIMIT 1
+      `)
+      .get(`capability-notice:${id}`) as { id: string; value_json: string } | undefined;
+    return row
+      ? { id: row.id, value: JSON.parse(row.value_json) as CapabilityNotice }
+      : undefined;
   };
 
   const appendFact = (
@@ -334,6 +393,131 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       database.exec("ROLLBACK");
       throw error;
     }
+  };
+
+  const readCurrentWorkerSnapshot = <T>(
+    kind:
+      | "worker-session.snapshot"
+      | "worker-execution-attempt.snapshot"
+      | "worker-question.snapshot",
+    subjectId: string,
+  ): { id: string; value: T } | undefined => {
+    const row = database
+      .prepare(`
+        SELECT id, value_json
+          FROM facts current
+         WHERE current.kind = ?
+           AND current.subject_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         LIMIT 1
+      `)
+      .get(kind, subjectId) as { id: string; value_json: string } | undefined;
+    return row ? { id: row.id, value: JSON.parse(row.value_json) as T } : undefined;
+  };
+
+  const readCurrentWorkerSnapshots = <T>(
+    kind:
+      | "worker-session.snapshot"
+      | "worker-execution-attempt.snapshot"
+      | "worker-question.snapshot",
+  ): T[] => {
+    const rows = database
+      .prepare(`
+        SELECT current.value_json
+          FROM facts current
+         WHERE current.kind = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         ORDER BY current.sequence
+      `)
+      .all(kind) as Array<{ value_json: string }>;
+    return rows.map((row) => JSON.parse(row.value_json) as T);
+  };
+
+  type WorkerSnapshotEntry = {
+    kind:
+      | "worker-session.snapshot"
+      | "worker-execution-attempt.snapshot"
+      | "worker-question.snapshot";
+    subjectPrefix: "worker-session" | "worker-execution-attempt" | "worker-question";
+    transitionPrefix: "worker-session" | "worker-execution-attempt" | "worker-question";
+    snapshot: { id: string; state?: string; status?: string };
+  };
+
+  const appendWorkerStateBatch = (entries: WorkerSnapshotEntry[]): void => {
+    if (entries.length === 0) return;
+    const predecessorBySubject = new Map<string, string | undefined>();
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const entry of entries) {
+        const subjectId = `${entry.subjectPrefix}:${entry.snapshot.id}`;
+        if (!predecessorBySubject.has(subjectId)) {
+          predecessorBySubject.set(
+            subjectId,
+            readCurrentWorkerSnapshot(entry.kind, subjectId)?.id,
+          );
+        }
+        const factId = randomUUID();
+        const recordedAt = new Date().toISOString();
+        database
+          .prepare(`
+            INSERT INTO facts (
+              id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+          `)
+          .run(
+            factId,
+            subjectId,
+            entry.kind,
+            JSON.stringify(entry.snapshot),
+            predecessorBySubject.get(subjectId) ?? null,
+            recordedAt,
+          );
+        database
+          .prepare(`
+            INSERT INTO transitions (id, kind, fact_id, recorded_at)
+            VALUES (?, ?, ?, ?)
+          `)
+          .run(
+            randomUUID(),
+            `${entry.transitionPrefix}.${entry.snapshot.state ?? entry.snapshot.status}`,
+            factId,
+            recordedAt,
+          );
+        predecessorBySubject.set(subjectId, factId);
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
+  const appendWorkerSnapshots = <T extends { id: string; state?: string; status?: string }>(
+    kind:
+      | "worker-session.snapshot"
+      | "worker-execution-attempt.snapshot"
+      | "worker-question.snapshot",
+    subjectPrefix: "worker-session" | "worker-execution-attempt" | "worker-question",
+    transitionPrefix: "worker-session" | "worker-execution-attempt" | "worker-question",
+    snapshots: T[],
+  ): void => {
+    if (snapshots.length === 0) return;
+    const subjectIdentity = snapshots[0]!.id;
+    if (snapshots.some((snapshot) => snapshot.id !== subjectIdentity)) {
+      throw new Error("One Worker snapshot batch cannot contain multiple identities.");
+    }
+    appendWorkerStateBatch(
+      snapshots.map((snapshot) => ({
+        kind,
+        subjectPrefix,
+        transitionPrefix,
+        snapshot,
+      })),
+    );
   };
 
   const readTargetProjectOperationAttemptRow = (
@@ -681,6 +865,180 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return rows.map((row) => JSON.parse(row.value_json) as LeadTurnAttempt);
     },
 
+    startWorkerExecution(workerSessionSnapshots, executionAttempt) {
+      const workerSession = workerSessionSnapshots.at(-1);
+      if (
+        !workerSession ||
+        workerSessionSnapshots.some((snapshot) => snapshot.id !== workerSession.id) ||
+        executionAttempt.workerSessionId !== workerSession.id ||
+        workerSession.currentExecutionAttemptId !== executionAttempt.id ||
+        workerSession.state !== "starting" ||
+        executionAttempt.status !== "launch-intent-recorded"
+      ) {
+        throw new Error("A Worker launch requires matching Session and attempt identities.");
+      }
+      const recordedAt = new Date().toISOString();
+      let predecessorId = readCurrentWorkerSnapshot<WorkerSession>(
+        "worker-session.snapshot",
+        `worker-session:${workerSession.id}`,
+      )?.id;
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        for (const snapshot of workerSessionSnapshots) {
+          const factId = randomUUID();
+          database
+            .prepare(`
+              INSERT INTO facts (
+                id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+              ) VALUES (?, ?, 'worker-session.snapshot', ?, ?, ?)
+            `)
+            .run(
+              factId,
+              `worker-session:${snapshot.id}`,
+              JSON.stringify(snapshot),
+              predecessorId ?? null,
+              recordedAt,
+            );
+          database
+            .prepare(`
+              INSERT INTO transitions (id, kind, fact_id, recorded_at)
+              VALUES (?, ?, ?, ?)
+            `)
+            .run(randomUUID(), `worker-session.${snapshot.state}`, factId, recordedAt);
+          predecessorId = factId;
+        }
+        const attemptFactId = randomUUID();
+        database
+          .prepare(`
+            INSERT INTO facts (
+              id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+            ) VALUES (?, ?, 'worker-execution-attempt.snapshot', ?, NULL, ?)
+          `)
+          .run(
+            attemptFactId,
+            `worker-execution-attempt:${executionAttempt.id}`,
+            JSON.stringify(executionAttempt),
+            recordedAt,
+          );
+        database
+          .prepare(`
+            INSERT INTO transitions (id, kind, fact_id, recorded_at)
+            VALUES (?, 'worker-execution-attempt.launch-intent-recorded', ?, ?)
+          `)
+          .run(randomUUID(), attemptFactId, recordedAt);
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+
+    appendWorkerState(input) {
+      appendWorkerStateBatch([
+        ...(input.executionAttempt
+          ? [
+              {
+                kind: "worker-execution-attempt.snapshot" as const,
+                subjectPrefix: "worker-execution-attempt" as const,
+                transitionPrefix: "worker-execution-attempt" as const,
+                snapshot: input.executionAttempt,
+              },
+            ]
+          : []),
+        ...(input.questions ?? []).map((question) => ({
+          kind: "worker-question.snapshot" as const,
+          subjectPrefix: "worker-question" as const,
+          transitionPrefix: "worker-question" as const,
+          snapshot: question,
+        })),
+        ...(input.workerSession
+          ? [
+              {
+                kind: "worker-session.snapshot" as const,
+                subjectPrefix: "worker-session" as const,
+                transitionPrefix: "worker-session" as const,
+                snapshot: input.workerSession,
+              },
+            ]
+          : []),
+      ]);
+    },
+
+    readCapabilityNotice(id) {
+      return readCapabilityNoticeRow(id)?.value;
+    },
+
+    appendCapabilityNotice(notice) {
+      const current = readCapabilityNoticeRow(notice.id);
+      appendFact(
+        { kind: "capability-notice.snapshot", value: notice },
+        `capability-notice.${notice.state}`,
+        current?.id,
+      );
+    },
+
+    appendWorkerSessionSnapshots(snapshots) {
+      appendWorkerSnapshots(
+        "worker-session.snapshot",
+        "worker-session",
+        "worker-session",
+        snapshots,
+      );
+    },
+
+    readWorkerSession(workerSessionId) {
+      return readCurrentWorkerSnapshot<WorkerSession>(
+        "worker-session.snapshot",
+        `worker-session:${workerSessionId}`,
+      )?.value;
+    },
+
+    readWorkerSessions() {
+      return readCurrentWorkerSnapshots<WorkerSession>("worker-session.snapshot");
+    },
+
+    appendWorkerExecutionAttemptSnapshots(snapshots) {
+      appendWorkerSnapshots(
+        "worker-execution-attempt.snapshot",
+        "worker-execution-attempt",
+        "worker-execution-attempt",
+        snapshots,
+      );
+    },
+
+    readWorkerExecutionAttempt(attemptId) {
+      return readCurrentWorkerSnapshot<WorkerExecutionAttempt>(
+        "worker-execution-attempt.snapshot",
+        `worker-execution-attempt:${attemptId}`,
+      )?.value;
+    },
+
+    readWorkerExecutionAttempts() {
+      return readCurrentWorkerSnapshots<WorkerExecutionAttempt>(
+        "worker-execution-attempt.snapshot",
+      );
+    },
+
+    appendWorkerQuestionSnapshots(snapshots) {
+      appendWorkerSnapshots(
+        "worker-question.snapshot",
+        "worker-question",
+        "worker-question",
+        snapshots,
+      );
+    },
+
+    readWorkerQuestion(questionId) {
+      return readCurrentWorkerSnapshot<WorkerQuestion>(
+        "worker-question.snapshot",
+        `worker-question:${questionId}`,
+      )?.value;
+    },
+
+    readWorkerQuestions() {
+      return readCurrentWorkerSnapshots<WorkerQuestion>("worker-question.snapshot");
+    },
+
     startTargetProjectOperation(attempt, effectIntent) {
       if (
         readTargetProjectOperationAttemptRow(attempt.id) ||
@@ -814,6 +1172,10 @@ function ensureSchema(database: DatabaseSync): void {
         'owner-conversation.lead-agent-message',
         'commitment.snapshot',
         'lead-turn-attempt.snapshot',
+        'worker-session.snapshot',
+        'worker-execution-attempt.snapshot',
+        'worker-question.snapshot',
+        'capability-notice.snapshot',
         'target-project-operation-attempt.snapshot',
         'effect-intent.snapshot'
       )),
@@ -843,6 +1205,30 @@ function ensureSchema(database: DatabaseSync): void {
         'lead-turn-attempt.started',
         'lead-turn-attempt.completed',
         'lead-turn-attempt.failed',
+        'worker-session.starting',
+        'worker-session.running',
+        'worker-session.waiting-question',
+        'worker-session.cancellation-requested',
+        'worker-session.reconciling',
+        'worker-session.completed',
+        'worker-session.blocked',
+        'worker-session.failed',
+        'worker-session.cancelled',
+        'worker-execution-attempt.starting',
+        'worker-execution-attempt.launch-intent-recorded',
+        'worker-execution-attempt.dispatching',
+        'worker-execution-attempt.running',
+        'worker-execution-attempt.completed',
+        'worker-execution-attempt.blocked',
+        'worker-execution-attempt.failed',
+        'worker-execution-attempt.cancelled',
+        'worker-execution-attempt.continuity-lost',
+        'worker-question.open',
+        'worker-question.answer-recorded',
+        'worker-question.delivered',
+        'worker-question.cancelled',
+        'capability-notice.active',
+        'capability-notice.cleared',
         'target-project-operation-attempt.running',
         'target-project-operation-attempt.ready',
         'target-project-operation-attempt.succeeded',
@@ -867,6 +1253,10 @@ function ensureSchema(database: DatabaseSync): void {
   if (
     row.sql.includes("'commitment.snapshot'") &&
     row.sql.includes("'lead-turn-attempt.snapshot'") &&
+    row.sql.includes("'worker-session.snapshot'") &&
+    row.sql.includes("'worker-execution-attempt.snapshot'") &&
+    row.sql.includes("'worker-question.snapshot'") &&
+    row.sql.includes("'capability-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'")
   ) {
@@ -891,6 +1281,10 @@ function ensureSchema(database: DatabaseSync): void {
           'owner-conversation.lead-agent-message',
           'commitment.snapshot',
           'lead-turn-attempt.snapshot',
+          'worker-session.snapshot',
+          'worker-execution-attempt.snapshot',
+          'worker-question.snapshot',
+          'capability-notice.snapshot',
           'target-project-operation-attempt.snapshot',
           'effect-intent.snapshot'
         )),
@@ -918,6 +1312,30 @@ function ensureSchema(database: DatabaseSync): void {
           'lead-turn-attempt.started',
           'lead-turn-attempt.completed',
           'lead-turn-attempt.failed',
+          'worker-session.starting',
+          'worker-session.running',
+          'worker-session.waiting-question',
+          'worker-session.cancellation-requested',
+          'worker-session.reconciling',
+          'worker-session.completed',
+          'worker-session.blocked',
+          'worker-session.failed',
+          'worker-session.cancelled',
+          'worker-execution-attempt.starting',
+          'worker-execution-attempt.launch-intent-recorded',
+          'worker-execution-attempt.dispatching',
+          'worker-execution-attempt.running',
+          'worker-execution-attempt.completed',
+          'worker-execution-attempt.blocked',
+          'worker-execution-attempt.failed',
+          'worker-execution-attempt.cancelled',
+          'worker-execution-attempt.continuity-lost',
+          'worker-question.open',
+          'worker-question.answer-recorded',
+          'worker-question.delivered',
+          'worker-question.cancelled',
+          'capability-notice.active',
+          'capability-notice.cleared',
           'target-project-operation-attempt.running',
           'target-project-operation-attempt.ready',
           'target-project-operation-attempt.succeeded',
@@ -961,6 +1379,7 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
     ...(Array.isArray(value.modelFallbacks) ? { modelFallbacks: value.modelFallbacks } : {}),
     ...(value.modelRequirements ? { modelRequirements: value.modelRequirements } : {}),
     modelPolicyRevision: value.modelPolicyRevision,
+    ...(value.workerModelPolicy ? { workerModelPolicy: value.workerModelPolicy } : {}),
   };
 }
 
@@ -968,6 +1387,17 @@ function validateConfiguration(configuration: OwnerConfiguration): void {
   assertSupportedModelSelection(configuration.modelSelection);
   for (const fallback of configuration.modelFallbacks ?? []) {
     assertSupportedModelSelection(fallback);
+  }
+  if (configuration.workerModelPolicy) {
+    const { revision, selection } = configuration.workerModelPolicy;
+    if (
+      !revision.trim() ||
+      selection.provider !== "openai" ||
+      selection.nativeHarness !== "codex" ||
+      selection.model !== "gpt-5.6-sol"
+    ) {
+      throw new Error("Worker Model Policy must select the proven Codex gpt-5.6-sol capability.");
+    }
   }
 }
 
@@ -982,6 +1412,14 @@ function factSubject(input: FactDraft): string {
       return `commitment:${input.value.id}`;
     case "lead-turn-attempt.snapshot":
       return `lead-turn-attempt:${input.value.id}`;
+    case "worker-session.snapshot":
+      return `worker-session:${input.value.id}`;
+    case "worker-execution-attempt.snapshot":
+      return `worker-execution-attempt:${input.value.id}`;
+    case "worker-question.snapshot":
+      return `worker-question:${input.value.id}`;
+    case "capability-notice.snapshot":
+      return `capability-notice:${input.value.id}`;
     case "target-project-operation-attempt.snapshot":
       return `target-project-operation-attempt:${input.value.id}`;
     case "effect-intent.snapshot":
@@ -995,7 +1433,8 @@ function sameConfiguration(left: OwnerConfiguration, right: OwnerConfiguration):
     sameSelection(left.modelSelection, right.modelSelection) &&
     sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
     JSON.stringify(left.modelRequirements) === JSON.stringify(right.modelRequirements) &&
-    left.modelPolicyRevision === right.modelPolicyRevision
+    left.modelPolicyRevision === right.modelPolicyRevision &&
+    JSON.stringify(left.workerModelPolicy) === JSON.stringify(right.workerModelPolicy)
   );
 }
 

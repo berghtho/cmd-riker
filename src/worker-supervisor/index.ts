@@ -141,6 +141,12 @@ export interface WorkerSupervisor {
     timeoutMs: number;
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+  delegateReview(input: {
+    implementationWorkerSessionId: string;
+    prompt: string;
+    model: string;
+    modelPolicyRevision: string;
+  }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
   answer(
     questionId: string,
     ownerTurnId: string,
@@ -484,6 +490,20 @@ export function createWorkerSupervisor(
         ...assignment,
         modelSelection,
         checkoutIsolation,
+      });
+      void startExecution(workerSession, executionAttempt).catch(() => {});
+      return {
+        workerSessionId: workerSession.id,
+        executionAttemptId: executionAttempt.id,
+      };
+    },
+
+    async delegateReview(input) {
+      const { model, ...assignment } = input;
+      const modelSelection: WorkerModelSelection = { ...harness.selection, model };
+      const { workerSession, executionAttempt } = orchestration.delegateReviewWorker({
+        ...assignment,
+        modelSelection,
       });
       void startExecution(workerSession, executionAttempt).catch(() => {});
       return {

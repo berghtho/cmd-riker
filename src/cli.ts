@@ -338,6 +338,20 @@ async function completeOwnerTurn(
         ownerInput,
         modelSelection,
         commitments: state.readCommitments(),
+        standingOrders: orchestration.standingOrdersView(),
+        ...(orchestration.actingAuthorityView()
+          ? { actingAuthority: orchestration.actingAuthorityView()! }
+          : {}),
+        authorityActions: {
+          recordStandingOrder: (draft) => orchestration.recordStandingOrder(turnId, draft),
+          revokeStandingOrder: (standingOrderId, reason) =>
+            orchestration.revokeStandingOrder(standingOrderId, turnId, reason),
+          beginActingAuthority: (input) => orchestration.beginActingAuthority(turnId, input),
+          recordActingAuthorityEvent: (actingAuthorityId, input) =>
+            orchestration.recordActingAuthorityEvent(actingAuthorityId, input),
+          prepareActingAuthorityHandoff: (actingAuthorityId) =>
+            orchestration.prepareActingAuthorityHandoff(actingAuthorityId, turnId),
+        },
         workers: orchestration.workerSessionsView(),
         workerQuestions: orchestration.workerQuestionsView(),
         ...(workerSupervisor
@@ -357,6 +371,15 @@ async function completeOwnerTurn(
                   workerSupervisor.delegate({
                     ...input,
                     targetProjectPath: conversation.targetProject.path,
+                    model: conversation.workerModelPolicy!.selection.model,
+                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                  }),
+                delegateReview: (input: {
+                  implementationWorkerSessionId: string;
+                  prompt: string;
+                }) =>
+                  workerSupervisor.delegateReview({
+                    ...input,
                     model: conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: conversation.workerModelPolicy!.revision,
                   }),
@@ -433,6 +456,13 @@ async function completeOwnerTurn(
           ? { selectionReason: "fallback-after-ineligible-candidate" as const }
           : {}),
       });
+      const pendingHandoff = orchestration.actingAuthorityView();
+      if (
+        pendingHandoff?.state === "handoff-pending" &&
+        pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
+      ) {
+        orchestration.observeActingAuthorityHandoffDelivered(pendingHandoff.id, turnId);
+      }
       orchestration.observeLeadResponse(turnId, response.content);
       const notices = state
         .readCommitments()

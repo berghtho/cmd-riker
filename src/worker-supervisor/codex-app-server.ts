@@ -712,6 +712,7 @@ export function parseWorkerReportedOutcome(output: string): {
     !reported.summary.trim() ||
     !isStringArray(reported.affectedArtifacts) ||
     !isStringArray(reported.verificationResults) ||
+    (reported.reviewFindings !== undefined && !isReportedReviewFindings(reported.reviewFindings)) ||
     (reported.unresolvedUncertainty !== undefined &&
       typeof reported.unresolvedUncertainty !== "string")
   ) {
@@ -724,6 +725,9 @@ export function parseWorkerReportedOutcome(output: string): {
       summary: reported.summary,
       affectedArtifacts: reported.affectedArtifacts,
       verificationResults: reported.verificationResults,
+      ...(isReportedReviewFindings(reported.reviewFindings)
+        ? { reviewFindings: reported.reviewFindings }
+        : {}),
       ...(typeof reported.unresolvedUncertainty === "string"
         ? { unresolvedUncertainty: reported.unresolvedUncertainty }
         : {}),
@@ -733,6 +737,22 @@ export function parseWorkerReportedOutcome(output: string): {
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isReportedReviewFindings(
+  value: unknown,
+): value is NonNullable<WorkerReportedOutcome["reviewFindings"]> {
+  return Array.isArray(value) && value.every((item) => {
+    const finding = asRecord(item);
+    return (
+      ["criterion", "evidence", "risk"].includes(String(finding.basis)) &&
+      ["must-fix", "follow-up"].includes(String(finding.disposition)) &&
+      typeof finding.summary === "string" &&
+      finding.summary.trim().length > 0 &&
+      typeof finding.evidence === "string" &&
+      finding.evidence.trim().length > 0
+    );
+  });
 }
 
 export async function inspectProcess(pid: number): Promise<{ pid: number; startedAt: string | null } | null> {

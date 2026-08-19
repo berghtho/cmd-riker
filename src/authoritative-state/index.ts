@@ -19,11 +19,14 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import {
+  type ActingAuthority,
   assertSupportedWorkerModelSelection,
   type CapabilityNotice,
   type Commitment,
+  type CoordinationMessage,
   type LeadTurnAttempt,
   type OwnerConfiguration,
+  type StandingOrder,
   type WorkerExecutionAttempt,
   type WorkerQuestion,
   type WorkerSession,
@@ -42,15 +45,24 @@ import type {
 
 export type { ModelSelection } from "../model-selection.ts";
 export type {
+  ActingAuthority,
+  ActingAuthorityEvent,
+  ActingAuthorityHandoff,
   CapabilityNotice,
   Commitment,
   CommitmentCriterion,
   CommitmentDraft,
   CommitmentState,
+  CoordinationMessage,
   LeadModelPolicy,
   LeadTurnAttempt,
   ModelCandidateValidation,
   OwnerConfiguration,
+  StandingOrder,
+  StandingOrderDraft,
+  StandingOrderEffectClass,
+  ReviewFinding,
+  ReviewReason,
   WorkerExecutionAttempt,
   WorkerModelSelection,
   WorkerOutcome,
@@ -185,6 +197,14 @@ export interface AuthoritativeState {
   ): void;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
+  readStandingOrder(standingOrderId: string): StandingOrder | undefined;
+  readStandingOrders(): StandingOrder[];
+  appendStandingOrderSnapshots(snapshots: StandingOrder[]): void;
+  readActingAuthority(actingAuthorityId: string): ActingAuthority | undefined;
+  readActingAuthorities(): ActingAuthority[];
+  appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
+  appendCoordinationMessage(message: CoordinationMessage): void;
+  readCoordinationMessages(): CoordinationMessage[];
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -237,6 +257,9 @@ type FactDraft =
   | { kind: "worker-execution-attempt.snapshot"; value: WorkerExecutionAttempt }
   | { kind: "worker-question.snapshot"; value: WorkerQuestion }
   | { kind: "capability-notice.snapshot"; value: CapabilityNotice }
+  | { kind: "standing-order.snapshot"; value: StandingOrder }
+  | { kind: "acting-authority.snapshot"; value: ActingAuthority }
+  | { kind: "coordination-message.recorded"; value: CoordinationMessage }
   | { kind: "target-project-operation-attempt.snapshot"; value: TargetProjectOperationAttempt }
   | { kind: "effect-intent.snapshot"; value: EffectIntent };
 
@@ -258,6 +281,9 @@ type TransitionKind =
   | `worker-execution-attempt.${WorkerExecutionAttempt["status"]}`
   | `worker-question.${WorkerQuestion["status"]}`
   | `capability-notice.${CapabilityNotice["state"]}`
+  | `standing-order.${StandingOrder["state"]}`
+  | `acting-authority.${ActingAuthority["state"]}`
+  | "coordination-message.recorded"
   | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
   | `effect-intent.${EffectIntent["status"]}`;
 
@@ -492,6 +518,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot"
       | "effect-intent.snapshot",
     subjectId: string,
   ): { id: string; value: T } | undefined => {
@@ -514,7 +542,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
-      | "worker-question.snapshot",
+      | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot",
   ): T[] => {
     const rows = database
       .prepare(`
@@ -535,16 +565,22 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot"
       | "effect-intent.snapshot";
     subjectPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
+      | "standing-order"
+      | "acting-authority"
       | "effect-intent";
     transitionPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
+      | "standing-order"
+      | "acting-authority"
       | "effect-intent";
     snapshot: { id: string; state?: string; status?: string };
   };
@@ -602,9 +638,21 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
-      | "worker-question.snapshot",
-    subjectPrefix: "worker-session" | "worker-execution-attempt" | "worker-question",
-    transitionPrefix: "worker-session" | "worker-execution-attempt" | "worker-question",
+      | "worker-question.snapshot"
+      | "standing-order.snapshot"
+      | "acting-authority.snapshot",
+    subjectPrefix:
+      | "worker-session"
+      | "worker-execution-attempt"
+      | "worker-question"
+      | "standing-order"
+      | "acting-authority",
+    transitionPrefix:
+      | "worker-session"
+      | "worker-execution-attempt"
+      | "worker-question"
+      | "standing-order"
+      | "acting-authority",
     snapshots: T[],
   ): void => {
     if (snapshots.length === 0) return;
@@ -1225,6 +1273,65 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         `capability-notice.${notice.state}`,
         current?.id,
       );
+    },
+
+    appendStandingOrderSnapshots(snapshots) {
+      appendWorkerSnapshots(
+        "standing-order.snapshot",
+        "standing-order",
+        "standing-order",
+        snapshots,
+      );
+    },
+
+    readStandingOrder(standingOrderId) {
+      return readCurrentWorkerSnapshot<StandingOrder>(
+        "standing-order.snapshot",
+        `standing-order:${standingOrderId}`,
+      )?.value;
+    },
+
+    readStandingOrders() {
+      return readCurrentWorkerSnapshots<StandingOrder>("standing-order.snapshot");
+    },
+
+    appendActingAuthoritySnapshots(snapshots) {
+      appendWorkerSnapshots(
+        "acting-authority.snapshot",
+        "acting-authority",
+        "acting-authority",
+        snapshots,
+      );
+    },
+
+    readActingAuthority(actingAuthorityId) {
+      return readCurrentWorkerSnapshot<ActingAuthority>(
+        "acting-authority.snapshot",
+        `acting-authority:${actingAuthorityId}`,
+      )?.value;
+    },
+
+    readActingAuthorities() {
+      return readCurrentWorkerSnapshots<ActingAuthority>("acting-authority.snapshot");
+    },
+
+    appendCoordinationMessage(message) {
+      appendFact(
+        { kind: "coordination-message.recorded", value: message },
+        "coordination-message.recorded",
+      );
+    },
+
+    readCoordinationMessages() {
+      const rows = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'coordination-message.recorded'
+           ORDER BY sequence
+        `)
+        .all() as Array<{ value_json: string }>;
+      return rows.map((row) => JSON.parse(row.value_json) as CoordinationMessage);
     },
 
     appendWorkerSessionSnapshots(snapshots) {
@@ -1990,6 +2097,9 @@ function ensureSchema(database: DatabaseSync): void {
         'worker-execution-attempt.snapshot',
         'worker-question.snapshot',
         'capability-notice.snapshot',
+        'standing-order.snapshot',
+        'acting-authority.snapshot',
+        'coordination-message.recorded',
         'target-project-operation-attempt.snapshot',
         'effect-intent.snapshot'
       )),
@@ -2044,6 +2154,12 @@ function ensureSchema(database: DatabaseSync): void {
         'worker-question.cancelled',
         'capability-notice.active',
         'capability-notice.cleared',
+        'standing-order.active',
+        'standing-order.revoked',
+        'acting-authority.active',
+        'acting-authority.handoff-pending',
+        'acting-authority.ended',
+        'coordination-message.recorded',
         'target-project-operation-attempt.running',
         'target-project-operation-attempt.ready',
         'target-project-operation-attempt.succeeded',
@@ -2097,6 +2213,9 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'worker-execution-attempt.snapshot'") &&
     row.sql.includes("'worker-question.snapshot'") &&
     row.sql.includes("'capability-notice.snapshot'") &&
+    row.sql.includes("'standing-order.snapshot'") &&
+    row.sql.includes("'acting-authority.snapshot'") &&
+    row.sql.includes("'coordination-message.recorded'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
@@ -2127,6 +2246,9 @@ function ensureSchema(database: DatabaseSync): void {
           'worker-execution-attempt.snapshot',
           'worker-question.snapshot',
           'capability-notice.snapshot',
+          'standing-order.snapshot',
+          'acting-authority.snapshot',
+          'coordination-message.recorded',
           'target-project-operation-attempt.snapshot',
           'effect-intent.snapshot'
         )),
@@ -2179,6 +2301,12 @@ function ensureSchema(database: DatabaseSync): void {
           'worker-question.cancelled',
           'capability-notice.active',
           'capability-notice.cleared',
+          'standing-order.active',
+          'standing-order.revoked',
+          'acting-authority.active',
+          'acting-authority.handoff-pending',
+          'acting-authority.ended',
+          'coordination-message.recorded',
           'target-project-operation-attempt.running',
           'target-project-operation-attempt.ready',
           'target-project-operation-attempt.succeeded',
@@ -2289,6 +2417,12 @@ function factSubject(input: FactDraft): string {
       return `worker-question:${input.value.id}`;
     case "capability-notice.snapshot":
       return `capability-notice:${input.value.id}`;
+    case "standing-order.snapshot":
+      return `standing-order:${input.value.id}`;
+    case "acting-authority.snapshot":
+      return `acting-authority:${input.value.id}`;
+    case "coordination-message.recorded":
+      return `coordination-message:${input.value.id}`;
     case "target-project-operation-attempt.snapshot":
       return `target-project-operation-attempt:${input.value.id}`;
     case "effect-intent.snapshot":

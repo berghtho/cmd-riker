@@ -17,6 +17,11 @@ import type {
   Commitment,
   CommitmentDraft,
   ConversationMessage,
+  ActingAuthority,
+  ActingAuthorityEvent,
+  ActingAuthorityHandoff,
+  StandingOrder,
+  StandingOrderDraft,
   WorkerQuestion,
   WorkerSession,
 } from "../authoritative-state/index.ts";
@@ -48,6 +53,25 @@ export type PiTurnRequest = {
     ): void;
     executeOperation(commitmentId: string, operation: "test"): Promise<TargetProjectOperationResult>;
   };
+  standingOrders?: readonly StandingOrder[];
+  actingAuthority?: ActingAuthority;
+  authorityActions?: {
+    recordStandingOrder(draft: StandingOrderDraft): StandingOrder;
+    revokeStandingOrder(standingOrderId: string, reason: string): void;
+    beginActingAuthority(input: {
+      commitmentIds: string[];
+      standingOrderIds: string[];
+    }): ActingAuthority;
+    recordActingAuthorityEvent(
+      actingAuthorityId: string,
+      input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect"> & {
+        effect?: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">;
+      },
+    ): ActingAuthorityEvent;
+    prepareActingAuthorityHandoff(
+      actingAuthorityId: string,
+    ): ActingAuthorityHandoff;
+  };
   workers?: readonly WorkerSession[];
   workerQuestions?: readonly WorkerQuestion[];
   workerActions?: {
@@ -67,6 +91,10 @@ export type PiTurnRequest = {
       prompt: string;
       commitmentId: string;
       targets: string[];
+    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+    delegateReview?(input: {
+      implementationWorkerSessionId: string;
+      prompt: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
@@ -257,6 +285,7 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       };
       const tools = [
         ...commitmentTools(request, mutationObserver),
+        ...authorityTools(request, mutationObserver),
         ...workerTools(request, mutationObserver),
       ];
       const commitmentContext = (request.commitments ?? [])
@@ -289,6 +318,16 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
             question.questions.map((item) => `${item.id}: ${item.question}`).join("; "),
         )
         .join("\n");
+      const standingOrderContext = (request.standingOrders ?? [])
+        .map((order) =>
+          `${order.id}: ${order.state} until ${order.validUntil}; Commitments ${order.commitmentIds.join(", ")}; ` +
+          `effects ${order.effectClasses.join(", ")}; targets ${order.targets.join(", ")}`
+        )
+        .join("\n");
+      const actingAuthorityContext = request.actingAuthority
+        ? `${request.actingAuthority.id}: ${request.actingAuthority.state}; Commitments ` +
+          `${request.actingAuthority.commitmentIds.join(", ")}; ${request.actingAuthority.events.length} event(s)`
+        : "none";
       const initialState = {
         systemPrompt:
           "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
@@ -304,6 +343,13 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
            "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
+           (request.authorityActions
+             ? "\nStanding Orders are created or revoked only from explicit Owner instructions. Silence never begins Acting Authority. " +
+               "During Acting Authority, record material decisions, effects, exceptions, risks, and uncertainty. " +
+               "When the Owner returns, prepare the durable handoff before returning command."
+             : "") +
+           (standingOrderContext ? `\nStanding Orders:\n${standingOrderContext}` : "") +
+           `\nActing Authority: ${actingAuthorityContext}` +
            (request.workerActions ? workerCapabilityPrompt(request.workerActions) : "") +
            (workerContext ? `\nCurrent Worker Sessions:\n${workerContext}` : "") +
            (questionContext ? `\nOpen Worker questions:\n${questionContext}` : ""),
@@ -492,6 +538,17 @@ function commitmentTools(
       parameters: Type.Object({
         outcome: Type.String({ minLength: 1 }),
         criteria: Type.Array(commitmentCriterionSchema, { minItems: 1 }),
+        review: Type.Optional(Type.Object({
+          required: Type.Literal(true),
+          reasons: Type.Array(Type.Union([
+            Type.Literal("public-module"),
+            Type.Literal("authorization"),
+            Type.Literal("data"),
+            Type.Literal("deployment"),
+            Type.Literal("self-repair"),
+            Type.Literal("objective-check-gap"),
+          ]), { minItems: 1 }),
+        })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -612,6 +669,148 @@ function commitmentTools(
   ];
 }
 
+const standingOrderEffectClassSchema = Type.Union([
+  Type.Literal("product-decision"),
+  Type.Literal("prioritization"),
+  Type.Literal("merge"),
+  Type.Literal("deploy"),
+  Type.Literal("update"),
+  Type.Literal("restart"),
+  Type.Literal("self-repair"),
+  Type.Literal("irreversible-effect"),
+  Type.Literal("externally-binding-effect"),
+]);
+
+function authorityTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  if (!request.authorityActions) return [];
+  const actions = request.authorityActions;
+  return [
+    {
+      name: "record_standing_order",
+      label: "Record Standing Order",
+      description:
+        "Record an explicit, bounded, expiring Owner instruction. Never infer this from silence or old conversation.",
+      parameters: Type.Object({
+        title: Type.String({ minLength: 1 }),
+        instruction: Type.String({ minLength: 1 }),
+        commitmentIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        effectClasses: Type.Array(standingOrderEffectClassSchema, { minItems: 1 }),
+        targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        maximumIncrementalSpendUsd: Type.Number({ minimum: 0 }),
+        validUntil: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const order = actions.recordStandingOrder(params as StandingOrderDraft);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Standing Order ${order.id} is active until ${order.validUntil}.` }],
+          details: order,
+        };
+      },
+    },
+    {
+      name: "revoke_standing_order",
+      label: "Revoke Standing Order",
+      description: "Revoke one Standing Order from the Owner's explicit instruction.",
+      parameters: Type.Object({
+        standingOrderId: Type.String({ minLength: 1 }),
+        reason: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { standingOrderId, reason } = params as { standingOrderId: string; reason: string };
+        actions.revokeStandingOrder(standingOrderId, reason);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Standing Order ${standingOrderId} revoked.` }],
+          details: { standingOrderId, state: "revoked" },
+        };
+      },
+    },
+    {
+      name: "begin_acting_authority",
+      label: "Begin Acting Authority",
+      description:
+        "Begin an explicitly Owner-authorized absence period for bounded Commitments and active Standing Orders.",
+      parameters: Type.Object({
+        commitmentIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        standingOrderIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const acting = actions.beginActingAuthority(params as {
+          commitmentIds: string[];
+          standingOrderIds: string[];
+        });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Acting Authority ${acting.id} began within its recorded bounds.` }],
+          details: acting,
+        };
+      },
+    },
+    {
+      name: "record_acting_authority_event",
+      label: "Record Acting Authority Event",
+      description:
+        "Record one material decision, effect, exception, risk, or uncertainty during active Acting Authority.",
+      parameters: Type.Object({
+        actingAuthorityId: Type.String({ minLength: 1 }),
+        kind: Type.Union([
+          Type.Literal("decision"),
+          Type.Literal("effect"),
+          Type.Literal("exception"),
+          Type.Literal("risk"),
+          Type.Literal("uncertainty"),
+        ]),
+        commitmentId: Type.String({ minLength: 1 }),
+        summary: Type.String({ minLength: 1 }),
+        evidence: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        effect: Type.Optional(Type.Object({
+          effectClass: standingOrderEffectClassSchema,
+          target: Type.String({ minLength: 1 }),
+          reversible: Type.Boolean(),
+          externallyBinding: Type.Boolean(),
+          incrementalSpendUsd: Type.Number({ minimum: 0 }),
+        })),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { actingAuthorityId, ...event } = params as Parameters<
+          typeof actions.recordActingAuthorityEvent
+        >[1] & { actingAuthorityId: string };
+        const recorded = actions.recordActingAuthorityEvent(actingAuthorityId, event);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Acting Authority ${recorded.kind} ${recorded.id} recorded.` }],
+          details: recorded,
+        };
+      },
+    },
+    {
+      name: "prepare_acting_authority_handoff",
+      label: "Prepare Acting Authority Handoff",
+      description:
+        "Prepare the returning Owner's durable decisions, effects, exceptions, risks, and uncertainty handoff before command returns.",
+      parameters: Type.Object({ actingAuthorityId: Type.String({ minLength: 1 }) }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { actingAuthorityId } = params as { actingAuthorityId: string };
+        const handoff = actions.prepareActingAuthorityHandoff(actingAuthorityId);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Acting Authority handoff: ${JSON.stringify(handoff)}` }],
+          details: handoff,
+        };
+      },
+    },
+  ];
+}
+
 function workerTools(
   request: PiTurnRequest,
   observer: { onMutation(): void },
@@ -683,6 +882,35 @@ function workerTools(
                 `execution attempt ${result.executionAttemptId} inside its Authorized Write Root.`,
             },
           ],
+          details: result,
+        };
+      },
+    });
+  }
+  if (actions.delegateReview) {
+    tools.push({
+      name: "delegate_independent_review",
+      label: "Delegate Independent Review",
+      description:
+        "Start a separate read-only Worker Session to review one completed implementing Worker against criteria, evidence, and concrete risks.",
+      parameters: Type.Object({
+        implementationWorkerSessionId: Type.String({ minLength: 1 }),
+        prompt: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const result = await actions.delegateReview!(params as {
+          implementationWorkerSessionId: string;
+          prompt: string;
+        });
+        observer.onMutation();
+        return {
+          content: [{
+            type: "text",
+            text:
+              `Independent Review Worker Session ${result.workerSessionId} started ` +
+              `as execution attempt ${result.executionAttemptId}.`,
+          }],
           details: result,
         };
       },

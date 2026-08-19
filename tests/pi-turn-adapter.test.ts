@@ -181,6 +181,77 @@ test("production adapter exposes only proven Copilot Worker controls", async (t)
   assert.equal(result.content, "The read-only Copilot Worker Session is running.");
 });
 
+test("production adapter exposes explicit authority controls and independent Review", async (t) => {
+  let recordedTitle: string | undefined;
+  let firstRequest = "";
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      firstRequest = JSON.stringify(requestBody);
+      return {
+        toolCall: {
+          id: "standing-order-call-1",
+          name: "record_standing_order",
+          arguments: {
+            title: "Integrate while absent",
+            instruction: "Merge the verified Commitment.",
+            commitmentIds: ["commitment-1"],
+            effectClasses: ["merge"],
+            targets: ["main"],
+            maximumIncrementalSpendUsd: 0,
+            validUntil: "2026-08-20T10:00:00.000Z",
+          },
+        },
+      };
+    }
+    return "The bounded Standing Order is recorded.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Record this Standing Order.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    authorityActions: {
+      recordStandingOrder(draft) {
+        recordedTitle = draft.title;
+        return {
+          id: "standing-order-1",
+          ...draft,
+          validFrom: "2026-08-19T10:00:00.000Z",
+          createdByOwnerTurnId: "owner-turn-1",
+          state: "active",
+        };
+      },
+      revokeStandingOrder() {},
+      beginActingAuthority() {
+        throw new Error("Not called.");
+      },
+      recordActingAuthorityEvent() {
+        throw new Error("Not called.");
+      },
+      prepareActingAuthorityHandoff() {
+        throw new Error("Not called.");
+      },
+    },
+    workerActions: {
+      async delegate() {
+        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+      },
+      async delegateReview() {
+        return { workerSessionId: "reviewer-1", executionAttemptId: "review-attempt-1" };
+      },
+    },
+  });
+
+  assert.equal(recordedTitle, "Integrate while absent");
+  assert.match(firstRequest, /record_standing_order/);
+  assert.match(firstRequest, /begin_acting_authority/);
+  assert.match(firstRequest, /record_acting_authority_event/);
+  assert.match(firstRequest, /prepare_acting_authority_handoff/);
+  assert.match(firstRequest, /delegate_independent_review/);
+  assert.equal(result.content, "The bounded Standing Order is recorded.");
+});
+
 test("production adapter delegates effectful work only through the bounded assignment tool", async (t) => {
   let delegated: unknown;
   const localModel = await startLocalModel((call) => {

@@ -90,6 +90,14 @@ export type CommitmentState =
   | "cancelled"
   | "superseded";
 
+export type ReviewReason =
+  | "public-module"
+  | "authorization"
+  | "data"
+  | "deployment"
+  | "self-repair"
+  | "objective-check-gap";
+
 export type Commitment = {
   id: string;
   outcome: string;
@@ -131,10 +139,21 @@ export type Commitment = {
         ownerTurnId: string;
         acceptedAt: string;
       };
+  review?: {
+    required: true;
+    reasons: ReviewReason[];
+    status: "pending" | "passed" | "changes-requested";
+    reviewerWorkerSessionId?: string;
+    findings: ReviewFinding[];
+  };
 };
 
 export type CommitmentDraft = {
   outcome: string;
+  review?: {
+    required: true;
+    reasons: ReviewReason[];
+  };
   criteria: Array<
     | {
         kind: "response-includes";
@@ -248,6 +267,17 @@ type WorkerAssignmentBase = {
     targetProjectPath: string;
     modelPolicyRevision: string;
     commitmentId?: string;
+    coordination?:
+      | { role: "implementer" }
+      | { role: "reviewer"; reviewOfWorkerSessionId: string };
+};
+
+export type ReviewFinding = {
+  id: string;
+  basis: "criterion" | "evidence" | "risk";
+  disposition: "must-fix" | "follow-up";
+  summary: string;
+  evidence: string;
 };
 
 export type WorkerAssignment =
@@ -284,6 +314,7 @@ export type WorkerOutcome = {
   affectedArtifacts: string[];
   materialCommands: string[];
   verificationResults: string[];
+  reviewFindings?: ReviewFinding[];
   unresolvedUncertainty?: string;
   evidence: {
     providerSessionId?: string;
@@ -298,6 +329,7 @@ export type WorkerReportedOutcome = {
   summary: string;
   affectedArtifacts: string[];
   verificationResults: string[];
+  reviewFindings?: Array<Omit<ReviewFinding, "id">>;
   unresolvedUncertainty?: string;
 };
 
@@ -365,6 +397,105 @@ export type CapabilityNotice = {
   observedAt: string;
 };
 
+export type StandingOrderEffectClass =
+  | "product-decision"
+  | "prioritization"
+  | "merge"
+  | "deploy"
+  | "update"
+  | "restart"
+  | "self-repair"
+  | "irreversible-effect"
+  | "externally-binding-effect";
+
+export type StandingOrder = {
+  id: string;
+  title: string;
+  instruction: string;
+  commitmentIds: string[];
+  effectClasses: StandingOrderEffectClass[];
+  targets: string[];
+  maximumIncrementalSpendUsd: number;
+  validFrom: string;
+  validUntil: string;
+  createdByOwnerTurnId: string;
+  state: "active" | "revoked";
+  revocation?: {
+    ownerTurnId: string;
+    reason: string;
+    revokedAt: string;
+  };
+};
+
+export type StandingOrderDraft = Pick<
+  StandingOrder,
+  | "title"
+  | "instruction"
+  | "commitmentIds"
+  | "effectClasses"
+  | "targets"
+  | "maximumIncrementalSpendUsd"
+  | "validUntil"
+>;
+
+export type ActingAuthorityEvent = {
+  id: string;
+  kind: "decision" | "effect" | "exception" | "risk" | "uncertainty";
+  commitmentId: string;
+  summary: string;
+  evidence: string[];
+  recordedAt: string;
+  effect?: {
+    effectClass: StandingOrderEffectClass;
+    target: string;
+    reversible: boolean;
+    externallyBinding: boolean;
+    incrementalSpendUsd: number;
+    standingOrderId: string;
+  };
+};
+
+export type ActingAuthorityHandoff = {
+  preparedForOwnerTurnId: string;
+  preparedAt: string;
+  decisions: string[];
+  effects: string[];
+  exceptions: string[];
+  risks: string[];
+  uncertainty: string[];
+  deliveredAt?: string;
+};
+
+export type ActingAuthority = {
+  id: string;
+  state: "active" | "handoff-pending" | "ended";
+  commitmentIds: string[];
+  standingOrderIds: string[];
+  startedByOwnerTurnId: string;
+  startedAt: string;
+  events: ActingAuthorityEvent[];
+  handoff?: ActingAuthorityHandoff;
+};
+
+export type CoordinationMessage = {
+  id: string;
+  fromWorkerSessionId: string;
+  toWorkerSessionId: string;
+  commitmentId: string;
+  kind:
+    | "review-request"
+    | "review-finding"
+    | "evidence"
+    | "blocker"
+    | "factual-question"
+    | "factual-answer"
+    | "completion";
+  summary: string;
+  evidence: string[];
+  reviewFindingId?: string;
+  recordedAt: string;
+};
+
 export interface OrchestrationState {
   readOwnerConversation(): OwnerConfiguration | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
@@ -402,6 +533,14 @@ export interface OrchestrationState {
   ): void;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
+  readStandingOrder(standingOrderId: string): StandingOrder | undefined;
+  readStandingOrders(): StandingOrder[];
+  appendStandingOrderSnapshots(snapshots: StandingOrder[]): void;
+  readActingAuthority(actingAuthorityId: string): ActingAuthority | undefined;
+  readActingAuthorities(): ActingAuthority[];
+  appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
+  appendCoordinationMessage(message: CoordinationMessage): void;
+  readCoordinationMessages(): CoordinationMessage[];
   settleTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -414,6 +553,30 @@ export interface OrchestrationState {
 }
 
 export interface OrchestrationCore {
+  standingOrdersView(): StandingOrder[];
+  actingAuthorityView(): ActingAuthority | undefined;
+  recordStandingOrder(ownerTurnId: string, draft: StandingOrderDraft): StandingOrder;
+  revokeStandingOrder(standingOrderId: string, ownerTurnId: string, reason: string): void;
+  beginActingAuthority(ownerTurnId: string, input: {
+    commitmentIds: string[];
+    standingOrderIds: string[];
+  }): ActingAuthority;
+  recordActingAuthorityEvent(
+    actingAuthorityId: string,
+    input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect"> & {
+      effect?: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">;
+    },
+  ): ActingAuthorityEvent;
+  prepareActingAuthorityHandoff(
+    actingAuthorityId: string,
+    ownerTurnId: string,
+  ): ActingAuthorityHandoff;
+  observeActingAuthorityHandoffDelivered(
+    actingAuthorityId: string,
+    ownerTurnId: string,
+  ): void;
+  coordinationMessagesView(): CoordinationMessage[];
+  recordCoordinationMessage(input: Omit<CoordinationMessage, "id" | "recordedAt">): CoordinationMessage;
   workerSessionsView(): WorkerSession[];
   workerQuestionsView(): WorkerQuestion[];
   workerSessionView(workerSessionId: string): WorkerSession | undefined;
@@ -507,6 +670,12 @@ export interface OrchestrationCore {
     };
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
+  delegateReviewWorker(input: {
+    implementationWorkerSessionId: string;
+    prompt: string;
+    modelSelection: WorkerModelSelection;
+    modelPolicyRevision: string;
+  }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
   observeWorkerAttemptStarted(input: {
     workerSessionId: string;
     executionAttemptId: string;
@@ -580,6 +749,185 @@ export interface OrchestrationCore {
 
 export function createOrchestrationCore(state: OrchestrationState): OrchestrationCore {
   return {
+    standingOrdersView() {
+      return state.readStandingOrders();
+    },
+
+    actingAuthorityView() {
+      return state.readActingAuthorities().at(-1);
+    },
+
+    coordinationMessagesView() {
+      return state.readCoordinationMessages();
+    },
+
+    recordCoordinationMessage(input) {
+      return recordCoordinationMessage(state, input);
+    },
+
+    recordStandingOrder(ownerTurnId, draft) {
+      requireOwnerTurn(state, ownerTurnId);
+      validateStandingOrderDraft(state, draft);
+      const now = new Date().toISOString();
+      const standingOrder: StandingOrder = {
+        id: randomUUID(),
+        ...draft,
+        validFrom: now,
+        createdByOwnerTurnId: ownerTurnId,
+        state: "active",
+      };
+      state.appendStandingOrderSnapshots([standingOrder]);
+      return standingOrder;
+    },
+
+    revokeStandingOrder(standingOrderId, ownerTurnId, reason) {
+      requireOwnerTurn(state, ownerTurnId);
+      if (!reason.trim()) throw new Error("Standing Order revocation requires a reason.");
+      const standingOrder = state.readStandingOrder(standingOrderId);
+      if (!standingOrder) throw new Error(`Unknown Standing Order ${standingOrderId}.`);
+      if (standingOrder.state !== "active") {
+        throw new Error(`Standing Order ${standingOrderId} is already revoked.`);
+      }
+      state.appendStandingOrderSnapshots([{
+        ...standingOrder,
+        state: "revoked",
+        revocation: {
+          ownerTurnId,
+          reason,
+          revokedAt: new Date().toISOString(),
+        },
+      }]);
+    },
+
+    beginActingAuthority(ownerTurnId, input) {
+      requireOwnerTurn(state, ownerTurnId);
+      if (input.commitmentIds.length === 0 || input.standingOrderIds.length === 0) {
+        throw new Error("Acting Authority requires bounded Commitments and active Standing Orders.");
+      }
+      const current = state.readActingAuthorities().at(-1);
+      if (current && current.state !== "ended") {
+        throw new Error(`Acting Authority ${current.id} has not returned command.`);
+      }
+      const commitments = input.commitmentIds.map((id) => {
+        const commitment = state.readCommitment(id);
+        if (!commitment) throw new Error(`Unknown Commitment ${id}.`);
+        if (["accepted", "cancelled", "superseded"].includes(commitment.state)) {
+          throw new Error(`Acting Authority requires a nonterminal Commitment; ${id} is terminal.`);
+        }
+        return commitment;
+      });
+      const now = Date.now();
+      const orders = input.standingOrderIds.map((id) => {
+        const order = state.readStandingOrder(id);
+        if (!order || order.state !== "active" || Date.parse(order.validUntil) <= now) {
+          throw new Error(`Acting Authority requires active Standing Order ${id}.`);
+        }
+        return order;
+      });
+      for (const commitment of commitments) {
+        if (!orders.some((order) => order.commitmentIds.includes(commitment.id))) {
+          throw new Error(`No active Standing Order covers Commitment ${commitment.id}.`);
+        }
+      }
+      const actingAuthority: ActingAuthority = {
+        id: randomUUID(),
+        state: "active",
+        commitmentIds: [...new Set(input.commitmentIds)],
+        standingOrderIds: [...new Set(input.standingOrderIds)],
+        startedByOwnerTurnId: ownerTurnId,
+        startedAt: new Date().toISOString(),
+        events: [],
+      };
+      state.appendActingAuthoritySnapshots([actingAuthority]);
+      return actingAuthority;
+    },
+
+    recordActingAuthorityEvent(actingAuthorityId, input) {
+      const actingAuthority = requireActiveActingAuthority(state, actingAuthorityId);
+      if (!actingAuthority.commitmentIds.includes(input.commitmentId)) {
+        throw new Error("Acting Authority cannot expand beyond its bounded Commitments.");
+      }
+      if (!input.summary.trim() || input.evidence.length === 0 || input.evidence.some((item) => !item.trim())) {
+        throw new Error("An Acting Authority event requires a summary and concrete evidence.");
+      }
+      if ((input.kind === "effect") !== Boolean(input.effect)) {
+        throw new Error("Only an Acting Authority effect event carries effect details.");
+      }
+      let effect: ActingAuthorityEvent["effect"];
+      if (input.effect) {
+        if (input.effect.incrementalSpendUsd < 0 || !Number.isFinite(input.effect.incrementalSpendUsd)) {
+          throw new Error("Acting Authority effect cost must be finite and nonnegative.");
+        }
+        const standingOrder = applicableStandingOrder(
+          state,
+          actingAuthority,
+          input.commitmentId,
+          input.effect,
+        );
+        if (!standingOrder) {
+          throw new Error("The Acting Authority effect has no applicable active Standing Order.");
+        }
+        effect = { ...input.effect, standingOrderId: standingOrder.id };
+      }
+      const event: ActingAuthorityEvent = {
+        id: randomUUID(),
+        kind: input.kind,
+        commitmentId: input.commitmentId,
+        summary: input.summary,
+        evidence: input.evidence,
+        recordedAt: new Date().toISOString(),
+        ...(effect ? { effect } : {}),
+      };
+      state.appendActingAuthoritySnapshots([{
+        ...actingAuthority,
+        events: [...actingAuthority.events, event],
+      }]);
+      return event;
+    },
+
+    prepareActingAuthorityHandoff(actingAuthorityId, ownerTurnId) {
+      requireOwnerTurn(state, ownerTurnId);
+      const actingAuthority = state.readActingAuthority(actingAuthorityId);
+      if (!actingAuthority) throw new Error(`Unknown Acting Authority ${actingAuthorityId}.`);
+      if (actingAuthority.state === "ended") {
+        throw new Error(`Acting Authority ${actingAuthorityId} already returned command.`);
+      }
+      if (actingAuthority.handoff) return actingAuthority.handoff;
+      const summaries = (kind: ActingAuthorityEvent["kind"]): string[] =>
+        actingAuthority.events.filter((event) => event.kind === kind).map((event) => event.summary);
+      const handoff: ActingAuthorityHandoff = {
+        preparedForOwnerTurnId: ownerTurnId,
+        preparedAt: new Date().toISOString(),
+        decisions: summaries("decision"),
+        effects: summaries("effect"),
+        exceptions: summaries("exception"),
+        risks: summaries("risk"),
+        uncertainty: summaries("uncertainty"),
+      };
+      state.appendActingAuthoritySnapshots([{
+        ...actingAuthority,
+        state: "handoff-pending",
+        handoff,
+      }]);
+      return handoff;
+    },
+
+    observeActingAuthorityHandoffDelivered(actingAuthorityId, ownerTurnId) {
+      requireOwnerTurn(state, ownerTurnId);
+      const actingAuthority = state.readActingAuthority(actingAuthorityId);
+      if (!actingAuthority?.handoff || actingAuthority.state !== "handoff-pending") {
+        throw new Error("Acting Authority has no pending handoff to deliver.");
+      }
+      if (actingAuthority.handoff.preparedForOwnerTurnId !== ownerTurnId) {
+        throw new Error("Acting Authority handoff belongs to a different prepared Owner turn.");
+      }
+      state.appendActingAuthoritySnapshots([{
+        ...actingAuthority,
+        state: "ended",
+        handoff: { ...actingAuthority.handoff, deliveredAt: new Date().toISOString() },
+      }]);
+    },
+
     workerSessionsView() {
       return state.readWorkerSessions();
     },
@@ -721,6 +1069,16 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         createdByOwnerTurnId: ownerTurnId,
         activeOwnerTurnId: ownerTurnId,
         state: "committed",
+        ...(draft.review
+          ? {
+              review: {
+                required: true as const,
+                reasons: [...new Set(draft.review.reasons)],
+                status: "pending" as const,
+                findings: [],
+              },
+            }
+          : {}),
       };
       const ready = { ...committed, state: "ready" as const };
       const active = { ...ready, state: "active" as const };
@@ -1177,6 +1535,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           },
           recoveryConstraint: "reconcile-before-replay",
           verification: input.verification,
+          coordination: { role: "implementer" },
         },
         state: "starting",
         currentExecutionAttemptId: executionAttemptId,
@@ -1208,6 +1567,72 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         status: "pending",
       };
       state.startWorkerExecution([workerSession], executionAttempt, effectIntent);
+      return { workerSession, executionAttempt };
+    },
+
+    delegateReviewWorker(input) {
+      const implementationWorker = requireWorkerSession(state, input.implementationWorkerSessionId);
+      if (
+        implementationWorker.assignment.readOnly ||
+        implementationWorker.assignment.coordination?.role !== "implementer" ||
+        implementationWorker.state !== "completed" ||
+        !implementationWorker.outcome ||
+        !implementationWorker.assignment.commitmentId
+      ) {
+        throw new Error("Independent Review requires one completed implementing Worker assignment.");
+      }
+      const commitment = state.readCommitment(implementationWorker.assignment.commitmentId);
+      if (!commitment?.review?.required || commitment.review.status !== "pending") {
+        throw new Error("The implementing Worker Commitment has no pending independent Review.");
+      }
+      if (!input.prompt.trim() || !input.modelSelection.model.trim() || !input.modelPolicyRevision.trim()) {
+        throw new Error("A reviewing Worker requires a prompt and Model Policy.");
+      }
+      const workerSessionId = randomUUID();
+      const executionAttemptId = randomUUID();
+      const reviewContract =
+        "Review independently. Findings must cite exactly one basis: criterion, evidence, or risk. " +
+        "Do not modify files. In CMD_RIKER_OUTCOME include reviewFindings as an array of " +
+        "{basis, disposition, summary, evidence}; disposition is must-fix or follow-up.\n\n" +
+        `Implementation outcome: ${JSON.stringify(implementationWorker.outcome)}`;
+      const workerSession: WorkerSession = {
+        id: workerSessionId,
+        assignment: {
+          objective: `Independently review Worker Session ${implementationWorker.id}.`,
+          prompt: `${input.prompt}\n\n${reviewContract}`,
+          targetProjectPath: implementationWorker.assignment.targetProjectPath,
+          readOnly: true,
+          modelPolicyRevision: input.modelPolicyRevision,
+          commitmentId: implementationWorker.assignment.commitmentId,
+          coordination: {
+            role: "reviewer",
+            reviewOfWorkerSessionId: implementationWorker.id,
+          },
+        },
+        state: "starting",
+        currentExecutionAttemptId: executionAttemptId,
+      };
+      const executionAttempt: WorkerExecutionAttempt = {
+        id: executionAttemptId,
+        workerSessionId,
+        generation: 1,
+        modelSelection: input.modelSelection,
+        modelPolicyRevision: input.modelPolicyRevision,
+        status: "launch-intent-recorded",
+      };
+      state.startWorkerExecution([workerSession], executionAttempt);
+      state.appendCommitmentSnapshots([{
+        ...commitment,
+        review: { ...commitment.review, reviewerWorkerSessionId: workerSessionId },
+      }]);
+      recordCoordinationMessage(state, {
+        fromWorkerSessionId: implementationWorker.id,
+        toWorkerSessionId: workerSessionId,
+        commitmentId: commitment.id,
+        kind: "review-request",
+        summary: "Review the completed implementation against its criteria, evidence, and concrete risks.",
+        evidence: implementationWorker.outcome.verificationResults,
+      });
       return { workerSession, executionAttempt };
     },
 
@@ -1634,9 +2059,18 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       const contradictoryReadOnlyReport = Boolean(input.reportedOutcome?.affectedArtifacts.length);
       const missingReport = input.status === "completed" && !input.reportedOutcome;
       const reportedBlocked = input.reportedOutcome?.status === "blocked";
+      const reviewAssignment = worker.assignment.coordination?.role === "reviewer"
+        ? worker.assignment.coordination
+        : undefined;
+      const reviewFindings = reviewAssignment
+        ? normalizeReviewFindings(input.reportedOutcome?.reviewFindings)
+        : undefined;
+      const invalidReviewReport = Boolean(
+        reviewAssignment && input.status === "completed" && !reviewFindings,
+      );
       const attemptStatus = cancelled
         ? "cancelled"
-        : input.status !== "completed" || missingReport || contradictoryReadOnlyReport
+        : input.status !== "completed" || missingReport || contradictoryReadOnlyReport || invalidReviewReport
           ? "failed"
           : reportedBlocked
             ? "blocked"
@@ -1661,17 +2095,22 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           `${harnessName} native turn ${attempt.nativeExecutionId ?? attempt.id} ended ${input.status}.`,
           ...(input.processGone ? ["The recorded native process is proven gone."] : []),
         ],
+        ...(reviewFindings ? { reviewFindings } : {}),
         ...(input.reportedOutcome?.unresolvedUncertainty ||
         input.status === "failed" ||
         !input.processGone ||
         missingReport ||
         contradictoryReadOnlyReport
+        || invalidReviewReport
           ? {
               unresolvedUncertainty:
                 (contradictoryReadOnlyReport
                   ? "A read-only Worker reported affected artifacts."
                   : undefined) ??
                 (missingReport ? "The Worker omitted its required structured outcome." : undefined) ??
+                (invalidReviewReport
+                  ? "The reviewing Worker omitted valid criterion-, evidence-, or risk-based findings."
+                  : undefined) ??
                 input.reportedOutcome?.unresolvedUncertainty ??
                 input.detail ??
                 (!input.processGone ? "The recorded native process is not proven gone." : "Worker failed."),
@@ -1713,6 +2152,14 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           outcome,
         },
       });
+      if (attemptStatus === "completed" && reviewAssignment && reviewFindings) {
+        settleIndependentReview(
+          state,
+          worker,
+          reviewAssignment.reviewOfWorkerSessionId,
+          reviewFindings,
+        );
+      }
       return "settled";
     },
 
@@ -1975,7 +2422,13 @@ function buildTargetProjectOperationVerification(
     })),
   };
   const settled: Commitment = passed
-    ? {
+    ? commitment.review?.required && commitment.review.status !== "passed"
+      ? {
+          ...verifying,
+          verification,
+          review: commitment.review,
+        }
+      : {
         ...verifying,
         state: "accepted",
         verification,
@@ -1984,7 +2437,7 @@ function buildTargetProjectOperationVerification(
           basis: "objective-criteria",
           acceptedAt: new Date().toISOString(),
         },
-      }
+        }
     : {
         ...verifying,
         state: "active",
@@ -2037,6 +2490,198 @@ function validateCommitmentDraft(draft: CommitmentDraft): void {
   if (hasOperationCriterion && draft.criteria.some((criterion) => criterion.kind !== "target-project-operation")) {
     throw new Error("A Target Project operation Commitment cannot mix response criteria.");
   }
+  if (draft.review && draft.review.reasons.length === 0) {
+    throw new Error("A required independent Review must name a concrete reason.");
+  }
+}
+
+function normalizeReviewFindings(
+  findings: WorkerReportedOutcome["reviewFindings"],
+): ReviewFinding[] | undefined {
+  if (!Array.isArray(findings)) return undefined;
+  if (findings.some((finding) =>
+    !["criterion", "evidence", "risk"].includes(finding.basis) ||
+    !["must-fix", "follow-up"].includes(finding.disposition) ||
+    !finding.summary.trim() ||
+    !finding.evidence.trim()
+  )) {
+    return undefined;
+  }
+  return findings.map((finding) => ({ ...finding, id: randomUUID() }));
+}
+
+function settleIndependentReview(
+  state: OrchestrationState,
+  reviewingWorker: WorkerSession,
+  implementationWorkerSessionId: string,
+  findings: ReviewFinding[],
+): void {
+  const implementationWorker = requireWorkerSession(state, implementationWorkerSessionId);
+  const commitmentId = reviewingWorker.assignment.commitmentId;
+  if (
+    !commitmentId ||
+    implementationWorker.assignment.commitmentId !== commitmentId ||
+    implementationWorker.assignment.readOnly ||
+    implementationWorker.assignment.coordination?.role !== "implementer"
+  ) {
+    throw new Error("Review outcome is not tied to the implementing Worker assignment.");
+  }
+  const commitment = state.readCommitment(commitmentId);
+  if (
+    !commitment?.review?.required ||
+    commitment.review.status !== "pending" ||
+    commitment.review.reviewerWorkerSessionId !== reviewingWorker.id
+  ) {
+    throw new Error("Review outcome is not attributed to the pending independent Review.");
+  }
+  const mustFix = findings.some((finding) => finding.disposition === "must-fix");
+  const reviewed: Commitment = mustFix
+    ? {
+        ...commitment,
+        state: "active",
+        condition: {
+          kind: "blocked",
+          reason: "Independent Review found one or more must-fix defects.",
+          nextAction: "Adjudicate and repair the cited criterion-, evidence-, or risk-based findings.",
+        },
+        review: { ...commitment.review, status: "changes-requested", findings },
+      }
+    : commitment.verification?.passed
+      ? {
+          ...commitment,
+          state: "accepted",
+          review: { ...commitment.review, status: "passed", findings },
+          acceptance: {
+            authority: "lead-agent",
+            basis: "objective-criteria",
+            acceptedAt: new Date().toISOString(),
+          },
+        }
+      : {
+          ...commitment,
+          state: "active",
+          review: { ...commitment.review, status: "passed", findings },
+        };
+  state.appendCommitmentSnapshots([reviewed]);
+  for (const finding of findings) {
+    recordCoordinationMessage(state, {
+      fromWorkerSessionId: reviewingWorker.id,
+      toWorkerSessionId: implementationWorker.id,
+      commitmentId,
+      kind: "review-finding",
+      summary: finding.summary,
+      evidence: [finding.evidence],
+      reviewFindingId: finding.id,
+    });
+  }
+}
+
+function recordCoordinationMessage(
+  state: OrchestrationState,
+  input: Omit<CoordinationMessage, "id" | "recordedAt">,
+): CoordinationMessage {
+  const sender = requireWorkerSession(state, input.fromWorkerSessionId);
+  const recipient = requireWorkerSession(state, input.toWorkerSessionId);
+  if (sender.id === recipient.id) throw new Error("A Coordination Message requires two Worker Sessions.");
+  if (
+    !input.summary.trim() ||
+    input.evidence.length === 0 ||
+    input.evidence.some((item) => !item.trim())
+  ) {
+    throw new Error("A Coordination Message requires a summary and evidence.");
+  }
+  if (
+    sender.assignment.commitmentId !== input.commitmentId ||
+    recipient.assignment.commitmentId !== input.commitmentId
+  ) {
+    throw new Error("A Coordination Message cannot create work or expand assignment scope.");
+  }
+  const reviewRelation =
+    recipient.assignment.coordination?.role === "reviewer" &&
+    recipient.assignment.coordination.reviewOfWorkerSessionId === sender.id;
+  const findingRelation =
+    sender.assignment.coordination?.role === "reviewer" &&
+    sender.assignment.coordination.reviewOfWorkerSessionId === recipient.id;
+  if (input.kind === "review-request" && !reviewRelation) {
+    throw new Error("A review request requires an existing matching reviewing assignment.");
+  }
+  if (input.kind === "review-finding" && (!findingRelation || !input.reviewFindingId)) {
+    throw new Error("A review finding requires the attributed reviewing assignment and finding.");
+  }
+  const message: CoordinationMessage = {
+    id: randomUUID(),
+    ...input,
+    recordedAt: new Date().toISOString(),
+  };
+  state.appendCoordinationMessage(message);
+  return message;
+}
+
+function requireOwnerTurn(state: OrchestrationState, ownerTurnId: string): void {
+  if (state.ownerTurnSequence(ownerTurnId) === undefined) {
+    throw new Error(`Unknown Owner turn ${ownerTurnId}.`);
+  }
+}
+
+function validateStandingOrderDraft(state: OrchestrationState, draft: StandingOrderDraft): void {
+  if (!draft.title.trim() || !draft.instruction.trim()) {
+    throw new Error("A Standing Order requires a title and instruction.");
+  }
+  if (
+    draft.commitmentIds.length === 0 ||
+    draft.effectClasses.length === 0 ||
+    draft.targets.length === 0
+  ) {
+    throw new Error("A Standing Order requires bounded Commitments, effect classes, and targets.");
+  }
+  if (
+    draft.commitmentIds.some((id) => !state.readCommitment(id)) ||
+    draft.targets.some((target) => !target.trim())
+  ) {
+    throw new Error("A Standing Order must reference existing Commitments and named targets.");
+  }
+  if (
+    !Number.isFinite(draft.maximumIncrementalSpendUsd) ||
+    draft.maximumIncrementalSpendUsd < 0
+  ) {
+    throw new Error("A Standing Order cost bound must be finite and nonnegative.");
+  }
+  if (!Number.isFinite(Date.parse(draft.validUntil)) || Date.parse(draft.validUntil) <= Date.now()) {
+    throw new Error("A Standing Order requires a future expiration.");
+  }
+}
+
+function requireActiveActingAuthority(
+  state: OrchestrationState,
+  actingAuthorityId: string,
+): ActingAuthority {
+  const actingAuthority = state.readActingAuthority(actingAuthorityId);
+  if (!actingAuthority) throw new Error(`Unknown Acting Authority ${actingAuthorityId}.`);
+  if (actingAuthority.state !== "active") {
+    throw new Error(`Acting Authority ${actingAuthorityId} is not active.`);
+  }
+  return actingAuthority;
+}
+
+function applicableStandingOrder(
+  state: OrchestrationState,
+  actingAuthority: ActingAuthority,
+  commitmentId: string,
+  effect: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">,
+): StandingOrder | undefined {
+  const now = Date.now();
+  return actingAuthority.standingOrderIds
+    .map((id) => state.readStandingOrder(id))
+    .find((order) =>
+      order?.state === "active" &&
+      Date.parse(order.validUntil) > now &&
+      order.commitmentIds.includes(commitmentId) &&
+      order.effectClasses.includes(effect.effectClass) &&
+      order.targets.includes(effect.target) &&
+      effect.incrementalSpendUsd <= order.maximumIncrementalSpendUsd &&
+      (!effect.externallyBinding || order.effectClasses.includes("externally-binding-effect")) &&
+      (effect.reversible || order.effectClasses.includes("irreversible-effect"))
+    );
 }
 
 function requireControlledCommitment(

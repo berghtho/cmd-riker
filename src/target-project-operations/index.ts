@@ -84,8 +84,21 @@ type EffectIntentBase = {
     validatedAt: string;
   };
   retryRule: string;
-  status: "pending" | "dispatching" | "succeeded" | "unknown" | "rejected";
+  status: "pending" | "dispatching" | "succeeded" | "unknown" | "rejected" | "reconciled";
   lease?: { claimedAt: string; expiresAt: string };
+  reconciliation?: EffectReconciliation;
+};
+
+export type EffectReconciliation = {
+  disposition: "confirmed-applied" | "confirmed-not-applied" | "compensated";
+  evidence: {
+    source: "target-project-readback" | "provider-readback" | "compensation-result";
+    reference: string;
+    summary: string;
+    observedAt: string;
+  };
+  reconciledAt: string;
+  reconciledBy: "lead-agent";
 };
 
 export type TargetProjectOperationEffectIntent = EffectIntentBase & {

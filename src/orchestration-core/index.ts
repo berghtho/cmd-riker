@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { ModelSelection } from "../model-selection.ts";
 import type {
   EffectIntent,
+  EffectReconciliation,
   TargetProjectOperationEffectIntent,
   TargetProjectOperationAttempt,
   TargetProjectOperationRequest,
@@ -378,6 +379,7 @@ export interface OrchestrationState {
   readTargetProjectOperationAttempts(): TargetProjectOperationAttempt[];
   readEffectIntent(effectIntentId: string): EffectIntent | undefined;
   readEffectIntents(): EffectIntent[];
+  reconcileEffectIntent(effectIntent: EffectIntent): void;
 }
 
 export interface OrchestrationCore {
@@ -408,6 +410,11 @@ export interface OrchestrationCore {
   ): void;
   recordCommitment(ownerTurnId: string, draft: CommitmentDraft): Commitment;
   reconcileInterruptedCommitments(): void;
+  reconcileEffect(input: {
+    effectIntentId: string;
+    disposition: EffectReconciliation["disposition"];
+    evidence: EffectReconciliation["evidence"];
+  }): void;
   resumeCommitment(commitmentId: string, ownerTurnId: string): void;
   pauseCommitment(commitmentId: string, ownerTurnId: string, reason: string): void;
   cancelCommitment(commitmentId: string, ownerTurnId: string, reason: string): void;
@@ -784,6 +791,30 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           },
         ]);
       }
+    },
+
+    reconcileEffect(input) {
+      const effectIntent = state.readEffectIntent(input.effectIntentId);
+      if (!effectIntent || effectIntent.status !== "unknown") {
+        throw new Error("Only an uncertain effect can be reconciled.");
+      }
+      if (
+        !input.evidence.reference.trim() ||
+        !input.evidence.summary.trim() ||
+        !Number.isFinite(Date.parse(input.evidence.observedAt))
+      ) {
+        throw new Error("Effect reconciliation requires attributed external evidence.");
+      }
+      state.reconcileEffectIntent({
+        ...effectIntent,
+        status: "reconciled",
+        reconciliation: {
+          disposition: input.disposition,
+          evidence: input.evidence,
+          reconciledAt: new Date().toISOString(),
+          reconciledBy: "lead-agent",
+        },
+      });
     },
 
     resumeCommitment(commitmentId, ownerTurnId) {

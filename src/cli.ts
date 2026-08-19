@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import {
-  openAuthoritativeState,
+  openAuthoritativeStateSafely,
   type AuthoritativeState,
   type OwnerConfiguration,
 } from "./authoritative-state/index.ts";
@@ -43,7 +43,17 @@ async function main(): Promise<void> {
   const stateDirectory = argumentValue("--state-dir");
   if (!stateDirectory) throw new Error("--state-dir is required.");
 
-  const state = openAuthoritativeState(stateDirectory);
+  const openedState = openAuthoritativeStateSafely(stateDirectory);
+  if (openedState.kind === "recovery-required") {
+    throw new HostDiagnostic(
+      "CMD_RIKER_STATE_RECOVERY_REQUIRED",
+      "Authoritative State integrity is not trusted; product mutations are disabled. " +
+        `Damaged evidence is preserved at ${openedState.recovery.damagedEvidenceDirectory}. ` +
+        "Restore a verified backup and reconcile every possible post-backup external effect. " +
+        `Observed failure: ${openedState.recovery.reason}`,
+    );
+  }
+  const state = openedState.state;
   const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
   try {
     let policyValidated = false;

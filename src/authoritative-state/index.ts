@@ -1,7 +1,15 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { backup as backupDatabase, DatabaseSync } from "node:sqlite";
 
 import {
   assertSupportedModelSelection,
@@ -66,6 +74,55 @@ export type ConversationMessage =
 export type OwnerConversation = OwnerConfiguration & {
   messages: ConversationMessage[];
 };
+
+export type AuthoritativeStateRecovery = {
+  version: 1;
+  phase: "damaged-state" | "post-backup-reconciliation";
+  mutationPolicy: "disabled";
+  reason: string;
+  detectedAt: string;
+  damagedEvidenceDirectory: string;
+  restoredBackup?: AuthoritativeStateBackup;
+  postBackupInventory?: PostBackupEffectInventory;
+  postBackupReconciliations?: PostBackupEffectReconciliation[];
+};
+
+export type AuthoritativeStateBackup = {
+  version: 1;
+  databasePath: string;
+  sha256: string;
+  createdAt: string;
+  lastJournalSequence: number;
+};
+
+export type PostBackupEffectInventory = {
+  assessedAt: string;
+  source: "external-effect-inventory";
+  reference: string;
+  summary: string;
+  effects: Array<{
+    id: string;
+    scope: string;
+    expectedEffect: string;
+  }>;
+};
+
+export type PostBackupEffectReconciliation = {
+  effectId: string;
+  disposition: "confirmed-applied" | "confirmed-not-applied" | "compensated";
+  evidence: {
+    source: "target-project-readback" | "provider-readback" | "compensation-result";
+    reference: string;
+    summary: string;
+    observedAt: string;
+  };
+  reconciledAt: string;
+  reconciledBy: "lead-agent";
+};
+
+export type AuthoritativeStateOpenResult =
+  | { kind: "operational"; state: AuthoritativeState }
+  | { kind: "recovery-required"; recovery: AuthoritativeStateRecovery };
 
 export interface AuthoritativeState {
   storageStatus(): { journalMode: "wal" };
@@ -132,10 +189,12 @@ export interface AuthoritativeState {
   readTargetProjectOperationAttempts(): TargetProjectOperationAttempt[];
   readEffectIntent(effectIntentId: string): EffectIntent | undefined;
   readEffectIntents(): EffectIntent[];
+  reconcileEffectIntent(effectIntent: EffectIntent): void;
   readCommitmentHistory(commitmentId: string): Array<{
     sequence: number;
     commitment: Commitment;
   }>;
+  createBackup(databasePath: string): Promise<AuthoritativeStateBackup>;
   close(): void;
 }
 
@@ -192,9 +251,22 @@ type TransitionKind =
 
 export function openAuthoritativeState(stateDirectory: string): AuthoritativeState {
   mkdirSync(stateDirectory, { recursive: true });
+  if (loadRecoveryStatus(stateDirectory)) {
+    throw new Error("Authoritative state recovery is active; product mutations are disabled.");
+  }
   const database = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"));
-  database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
-  ensureSchema(database);
+  try {
+    database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
+    assertDatabaseIntegrity(database);
+    ensureSchema(database);
+  } catch (error) {
+    try {
+      database.close();
+    } catch {
+      // Preserve the original database failure; the next safe open captures the files as evidence.
+    }
+    throw error;
+  }
 
   const readConfigurationRow = (): { id: string; value: OwnerConfiguration } | undefined => {
     const row = database
@@ -1301,6 +1373,50 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return rows.map((row) => JSON.parse(row.value_json) as EffectIntent);
     },
 
+    reconcileEffectIntent(effectIntent) {
+      const current = readEffectIntentRow(effectIntent.id);
+      if (!current || current.value.status !== "unknown") {
+        throw new Error("Only an uncertain effect can be reconciled.");
+      }
+      if (
+        effectIntent.status !== "reconciled" ||
+        !effectIntent.reconciliation ||
+        effectIntent.kind !== current.value.kind ||
+        effectIntent.commitmentId !== current.value.commitmentId ||
+        effectIntent.authorizedWriteRootKey !== current.value.authorizedWriteRootKey
+      ) {
+        throw new Error("Effect reconciliation must preserve the original effect identity and scope.");
+      }
+      const recordedAt = new Date().toISOString();
+      const factId = randomUUID();
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        database
+          .prepare(`
+            INSERT INTO facts (
+              id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+            ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
+          `)
+          .run(
+            factId,
+            `effect-intent:${effectIntent.id}`,
+            JSON.stringify(effectIntent),
+            current.id,
+            recordedAt,
+          );
+        database
+          .prepare(`
+            INSERT INTO transitions (id, kind, fact_id, recorded_at)
+            VALUES (?, 'effect-intent.reconciled', ?, ?)
+          `)
+          .run(randomUUID(), factId, recordedAt);
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+
     readCommitmentHistory(commitmentId) {
       const rows = database
         .prepare(`
@@ -1320,10 +1436,304 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       }));
     },
 
+    async createBackup(databasePath) {
+      const destination = resolve(databasePath);
+      const liveDatabase = resolve(join(stateDirectory, "authoritative-state.sqlite"));
+      if (destination === liveDatabase) {
+        throw new Error("An Authoritative State backup cannot replace the live database.");
+      }
+      if (existsSync(destination) || existsSync(backupManifestPath(destination))) {
+        throw new Error("An Authoritative State backup requires a new destination.");
+      }
+      mkdirSync(dirname(destination), { recursive: true });
+      assertDatabaseIntegrity(database);
+      const row = database.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM facts").get() as {
+        sequence: number;
+      };
+      await backupDatabase(database, destination);
+      verifyDatabaseFile(destination);
+      const manifest: AuthoritativeStateBackup = {
+        version: 1,
+        databasePath: destination,
+        sha256: sha256File(destination),
+        createdAt: new Date().toISOString(),
+        lastJournalSequence: row.sequence,
+      };
+      writeFileSync(backupManifestPath(destination), JSON.stringify(manifest, null, 2), "utf8");
+      return manifest;
+    },
+
     close() {
       database.close();
     },
   };
+}
+
+export function openAuthoritativeStateSafely(
+  stateDirectory: string,
+): AuthoritativeStateOpenResult {
+  mkdirSync(stateDirectory, { recursive: true });
+  const activeRecovery = loadRecoveryStatus(stateDirectory);
+  if (activeRecovery) return { kind: "recovery-required", recovery: activeRecovery };
+  try {
+    return { kind: "operational", state: openAuthoritativeState(stateDirectory) };
+  } catch (error) {
+    const recovery = preserveDamagedState(
+      stateDirectory,
+      error instanceof Error ? error.message : "SQLite integrity could not be established.",
+    );
+    return { kind: "recovery-required", recovery };
+  }
+}
+
+export function restoreAuthoritativeStateBackup(input: {
+  stateDirectory: string;
+  backupPath: string;
+  postBackupInventory: PostBackupEffectInventory;
+}): AuthoritativeStateRecovery {
+  const stateDirectory = resolve(input.stateDirectory);
+  const recovery = loadRecoveryStatus(stateDirectory);
+  if (!recovery) throw new Error("Authoritative State restore requires an active recovery.");
+  validatePostBackupInventory(input.postBackupInventory);
+  const backup = readVerifiedBackup(input.backupPath);
+  const databasePath = resolve(join(stateDirectory, "authoritative-state.sqlite"));
+  if (dirname(databasePath) !== stateDirectory) {
+    throw new Error("Authoritative State restore target escaped its state directory.");
+  }
+  const restoreCandidate = join(stateDirectory, `restore-candidate-${randomUUID()}.sqlite`);
+  copyFileSync(backup.databasePath, restoreCandidate);
+  try {
+    verifyDatabaseFile(restoreCandidate);
+    const preserveSuffix = `${new Date().toISOString().replaceAll(":", "-")}-${randomUUID()}`;
+    for (const fileName of [
+      "authoritative-state.sqlite",
+      "authoritative-state.sqlite-wal",
+      "authoritative-state.sqlite-shm",
+    ]) {
+      const source = join(stateDirectory, fileName);
+      if (existsSync(source)) {
+        copyFileSync(
+          source,
+          join(recovery.damagedEvidenceDirectory, `pre-restore-${preserveSuffix}-${fileName}`),
+        );
+      }
+    }
+    rmSync(databasePath, { force: true });
+    rmSync(`${databasePath}-wal`, { force: true });
+    rmSync(`${databasePath}-shm`, { force: true });
+    renameSync(restoreCandidate, databasePath);
+  } catch (error) {
+    rmSync(restoreCandidate, { force: true });
+    throw error;
+  }
+  copyFileSync(
+    backupManifestPath(backup.databasePath),
+    join(recovery.damagedEvidenceDirectory, "restored-backup-manifest.json"),
+  );
+  const restored: AuthoritativeStateRecovery = {
+    ...recovery,
+    phase: "post-backup-reconciliation",
+    reason:
+      "A verified backup was restored; every possible later external effect must be reconciled before mutations resume.",
+    restoredBackup: backup,
+    postBackupInventory: input.postBackupInventory,
+    postBackupReconciliations: [],
+  };
+  writeRecoveryStatus(stateDirectory, restored);
+  return restored;
+}
+
+export function reconcilePostBackupEffect(input: {
+  stateDirectory: string;
+  effectId: string;
+  disposition: PostBackupEffectReconciliation["disposition"];
+  evidence: PostBackupEffectReconciliation["evidence"];
+}): AuthoritativeStateRecovery {
+  const stateDirectory = resolve(input.stateDirectory);
+  const recovery = loadRecoveryStatus(stateDirectory);
+  if (recovery?.phase !== "post-backup-reconciliation" || !recovery.postBackupInventory) {
+    throw new Error("Post-backup effect reconciliation requires a restored recovery state.");
+  }
+  const effect = recovery.postBackupInventory.effects.find((candidate) => candidate.id === input.effectId);
+  if (!effect) throw new Error(`Unknown post-backup effect ${input.effectId}.`);
+  if (recovery.postBackupReconciliations?.some((item) => item.effectId === input.effectId)) {
+    throw new Error(`Post-backup effect ${input.effectId} is already reconciled.`);
+  }
+  validateExternalEvidence(input.evidence);
+  if (input.disposition === "compensated" && input.evidence.source !== "compensation-result") {
+    throw new Error("A compensated effect requires attributed compensation evidence.");
+  }
+  const updated: AuthoritativeStateRecovery = {
+    ...recovery,
+    postBackupReconciliations: [
+      ...(recovery.postBackupReconciliations ?? []),
+      {
+        effectId: effect.id,
+        disposition: input.disposition,
+        evidence: input.evidence,
+        reconciledAt: new Date().toISOString(),
+        reconciledBy: "lead-agent",
+      },
+    ],
+  };
+  writeRecoveryStatus(stateDirectory, updated);
+  return updated;
+}
+
+export function completeAuthoritativeStateRecovery(stateDirectoryInput: string): void {
+  const stateDirectory = resolve(stateDirectoryInput);
+  const recovery = loadRecoveryStatus(stateDirectory);
+  if (recovery?.phase !== "post-backup-reconciliation" || !recovery.postBackupInventory) {
+    throw new Error("Authoritative State recovery is not ready for completion.");
+  }
+  const reconciled = new Set(
+    (recovery.postBackupReconciliations ?? []).map((item) => item.effectId),
+  );
+  const unresolved = recovery.postBackupInventory.effects.find((effect) => !reconciled.has(effect.id));
+  if (unresolved) {
+    throw new Error(
+      `Post-backup effect ${unresolved.id} requires external evidence before recovery can complete.`,
+    );
+  }
+  verifyDatabaseFile(join(stateDirectory, "authoritative-state.sqlite"));
+  writeFileSync(
+    join(recovery.damagedEvidenceDirectory, "completed-recovery.json"),
+    JSON.stringify(
+      { ...recovery, completedAt: new Date().toISOString(), mutationPolicy: "enabled" },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  rmSync(recoveryStatusPath(stateDirectory), { force: true });
+}
+
+function assertDatabaseIntegrity(database: DatabaseSync): void {
+  const rows = database.prepare("PRAGMA integrity_check").all() as Array<{
+    integrity_check: string;
+  }>;
+  if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") {
+    const detail = rows.map((row) => row.integrity_check).join("; ");
+    throw new Error(`SQLite integrity check failed${detail ? `: ${detail}` : "."}`);
+  }
+}
+
+function verifyDatabaseFile(databasePath: string): void {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assertDatabaseIntegrity(database);
+  } finally {
+    database.close();
+  }
+}
+
+function readVerifiedBackup(databasePathInput: string): AuthoritativeStateBackup {
+  const databasePath = resolve(databasePathInput);
+  const manifestPath = backupManifestPath(databasePath);
+  if (!existsSync(databasePath) || !existsSync(manifestPath)) {
+    throw new Error("Restore requires a CMD Riker backup and its integrity manifest.");
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as AuthoritativeStateBackup;
+  if (
+    manifest.version !== 1 ||
+    resolve(manifest.databasePath) !== databasePath ||
+    manifest.sha256 !== sha256File(databasePath)
+  ) {
+    throw new Error("Authoritative State backup integrity verification failed.");
+  }
+  verifyDatabaseFile(databasePath);
+  return { ...manifest, databasePath };
+}
+
+function sha256File(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function backupManifestPath(databasePath: string): string {
+  return `${databasePath}.manifest.json`;
+}
+
+function validatePostBackupInventory(inventory: PostBackupEffectInventory): void {
+  if (
+    inventory.source !== "external-effect-inventory" ||
+    !Number.isFinite(Date.parse(inventory.assessedAt)) ||
+    !inventory.reference.trim() ||
+    !inventory.summary.trim()
+  ) {
+    throw new Error("Restore requires an attributed inventory of possible post-backup effects.");
+  }
+  const identities = new Set<string>();
+  for (const effect of inventory.effects) {
+    if (
+      !effect.id.trim() ||
+      !effect.scope.trim() ||
+      !effect.expectedEffect.trim() ||
+      identities.has(effect.id)
+    ) {
+      throw new Error("Post-backup effect inventory requires unique attributed effects.");
+    }
+    identities.add(effect.id);
+  }
+}
+
+function validateExternalEvidence(
+  evidence: PostBackupEffectReconciliation["evidence"],
+): void {
+  if (
+    !evidence.reference.trim() ||
+    !evidence.summary.trim() ||
+    !Number.isFinite(Date.parse(evidence.observedAt))
+  ) {
+    throw new Error("Effect reconciliation requires attributed external evidence.");
+  }
+}
+
+function preserveDamagedState(
+  stateDirectory: string,
+  reason: string,
+): AuthoritativeStateRecovery {
+  const detectedAt = new Date().toISOString();
+  const damagedEvidenceDirectory = join(
+    stateDirectory,
+    "recovery-evidence",
+    `${detectedAt.replaceAll(":", "-")}-${randomUUID()}`,
+  );
+  mkdirSync(damagedEvidenceDirectory, { recursive: true });
+  for (const fileName of [
+    "authoritative-state.sqlite",
+    "authoritative-state.sqlite-wal",
+    "authoritative-state.sqlite-shm",
+  ]) {
+    const source = join(stateDirectory, fileName);
+    if (existsSync(source)) copyFileSync(source, join(damagedEvidenceDirectory, fileName));
+  }
+  const recovery: AuthoritativeStateRecovery = {
+    version: 1,
+    phase: "damaged-state",
+    mutationPolicy: "disabled",
+    reason,
+    detectedAt,
+    damagedEvidenceDirectory,
+  };
+  writeFileSync(recoveryStatusPath(stateDirectory), JSON.stringify(recovery, null, 2), "utf8");
+  return recovery;
+}
+
+function loadRecoveryStatus(stateDirectory: string): AuthoritativeStateRecovery | undefined {
+  const path = recoveryStatusPath(stateDirectory);
+  if (!existsSync(path)) return undefined;
+  return JSON.parse(readFileSync(path, "utf8")) as AuthoritativeStateRecovery;
+}
+
+function writeRecoveryStatus(
+  stateDirectory: string,
+  recovery: AuthoritativeStateRecovery,
+): void {
+  writeFileSync(recoveryStatusPath(stateDirectory), JSON.stringify(recovery, null, 2), "utf8");
+}
+
+function recoveryStatusPath(stateDirectory: string): string {
+  return join(stateDirectory, "authoritative-state-recovery.json");
 }
 
 function ensureSchema(database: DatabaseSync): void {
@@ -1408,7 +1818,8 @@ function ensureSchema(database: DatabaseSync): void {
         'effect-intent.pending',
         'effect-intent.succeeded',
         'effect-intent.unknown',
-        'effect-intent.rejected'
+        'effect-intent.rejected',
+        'effect-intent.reconciled'
       )),
       fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id),
       recorded_at TEXT NOT NULL
@@ -1429,7 +1840,8 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'capability-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
-    transitionsRow.sql.includes("'worker-execution-attempt.timed-out'")
+    transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
+    transitionsRow.sql.includes("'effect-intent.reconciled'")
   ) {
     return;
   }
@@ -1520,7 +1932,8 @@ function ensureSchema(database: DatabaseSync): void {
           'effect-intent.pending',
           'effect-intent.succeeded',
           'effect-intent.unknown',
-          'effect-intent.rejected'
+          'effect-intent.rejected',
+          'effect-intent.reconciled'
         )),
         fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id),
         recorded_at TEXT NOT NULL

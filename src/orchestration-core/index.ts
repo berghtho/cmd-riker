@@ -114,6 +114,10 @@ export type Commitment = {
       | "recovery-exhausted"
       | "trusted-base-loss"
       | "mission-critical-impairment";
+    ownerAttentionCause?: {
+      kind: "worker-recovery-exhausted";
+      workerSessionId: string;
+    };
   };
   disposition?: {
     kind: "cancelled" | "superseded";
@@ -668,6 +672,7 @@ export interface OrchestrationCore {
       kind: NonNullable<Commitment["condition"]>["ownerAttention"];
       reason: string;
       nextAction: string;
+      cause?: NonNullable<Commitment["condition"]>["ownerAttentionCause"];
     },
   ): Commitment;
   reconcileInterruptedCommitments(): void;
@@ -1277,6 +1282,18 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (["accepted", "cancelled", "superseded"].includes(commitment.state)) {
         throw new Error(`Terminal Commitment ${commitmentId} cannot require Owner attention.`);
       }
+      if (input.cause) {
+        if (input.kind !== "recovery-exhausted") {
+          throw new Error("Only exhausted recovery attention can reference a Worker recovery cause.");
+        }
+        const worker = requireWorkerSession(state, input.cause.workerSessionId);
+        if (
+          worker.ownerAttention?.kind !== "recovery-exhausted" ||
+          worker.assignment.commitmentId !== commitmentId
+        ) {
+          throw new Error("Commitment attention must reference an exhausted Worker in the same scope.");
+        }
+      }
       const material: Commitment = {
         ...commitment,
         condition: {
@@ -1284,6 +1301,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           reason: input.reason,
           nextAction: input.nextAction,
           ownerAttention: input.kind,
+          ...(input.cause ? { ownerAttentionCause: input.cause } : {}),
         },
       };
       state.appendCommitmentSnapshots([material]);

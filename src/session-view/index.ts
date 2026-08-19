@@ -151,6 +151,12 @@ export function projectSessionView(
         : [];
     }),
   );
+  const promotedWorkerAttentionIds = new Set(
+    [...commitments.values()].flatMap((commitment) =>
+      commitment.condition?.ownerAttentionCause?.kind === "worker-recovery-exhausted"
+        ? [commitment.condition.ownerAttentionCause.workerSessionId]
+        : []),
+  );
   const exceptions: SessionViewException[] = [];
   const pausedCommitments = new Set<string>();
 
@@ -358,6 +364,7 @@ export function projectSessionView(
     if (
       !worker.ownerAttention ||
       recoveryOwnedWorkerIds.has(worker.id) ||
+      promotedWorkerAttentionIds.has(worker.id) ||
       (linkedCommitment && isTerminalCommitment(linkedCommitment))
     ) {
       continue;

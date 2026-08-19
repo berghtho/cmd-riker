@@ -50,6 +50,7 @@ export type PiTurnRequest = {
         kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
         reason: string;
         nextAction: string;
+        cause?: { kind: "worker-recovery-exhausted"; workerSessionId: string };
       },
     ): void;
     accept(commitmentId: string): void;
@@ -634,7 +635,7 @@ function commitmentTools(
       name: "record_material_commitment_attention",
       label: "Record Material Commitment Attention",
       description:
-        "Record an Owner-facing Commitment blocker only for a reserved decision, exhausted recovery, trusted-base loss, or mission-critical impairment, with the actual fact and recovery condition.",
+        "Record an Owner-facing Commitment blocker only for a reserved decision, exhausted recovery, trusted-base loss, or mission-critical impairment, with the actual fact and recovery condition. When promoting an exhausted Worker recovery, include that Worker as the causal source.",
       parameters: Type.Object({
         commitmentId: Type.String({ minLength: 1 }),
         kind: Type.Union([
@@ -645,16 +646,26 @@ function commitmentTools(
         ]),
         reason: Type.String({ minLength: 1 }),
         nextAction: Type.String({ minLength: 1 }),
+        cause: Type.Optional(Type.Object({
+          kind: Type.Literal("worker-recovery-exhausted"),
+          workerSessionId: Type.String({ minLength: 1 }),
+        })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, kind, reason, nextAction } = params as {
+        const { commitmentId, kind, reason, nextAction, cause } = params as {
           commitmentId: string;
           kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
           reason: string;
           nextAction: string;
+          cause?: { kind: "worker-recovery-exhausted"; workerSessionId: string };
         };
-        actions.recordOwnerAttention(commitmentId, { kind, reason, nextAction });
+        actions.recordOwnerAttention(commitmentId, {
+          kind,
+          reason,
+          nextAction,
+          ...(cause ? { cause } : {}),
+        });
         observer.onMutation();
         return {
           content: [{ type: "text", text: `Material attention recorded for Commitment ${commitmentId}.` }],

@@ -292,6 +292,28 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
     `worker-recovery:${exhaustedWorker.id}`,
   ]);
 
+  const promotedRecovery = {
+    ...activeCommitment(),
+    condition: {
+      kind: "blocked" as const,
+      reason: "Automatic Worker recovery exhausted its bounded attempts.",
+      nextAction: "The Owner must choose the next recovery strategy.",
+      ownerAttention: "recovery-exhausted" as const,
+      ownerAttentionCause: {
+        kind: "worker-recovery-exhausted" as const,
+        workerSessionId: exhaustedWorker.id,
+      },
+    },
+  };
+  const sameCause = projectSessionView(fakeState({
+    workers: [exhaustedWorker],
+    attempts: [workerAttempt(exhaustedWorker, { status: "blocked" })],
+    commitments: [promotedRecovery],
+  }));
+  assert.deepEqual(sameCause.exceptions.map((item) => item.id), [
+    `commitment-blocked:${promotedRecovery.id}`,
+  ]);
+
   const recoveryWorker = workerSession({
     id: "worker-2",
     currentExecutionAttemptId: "attempt-2",

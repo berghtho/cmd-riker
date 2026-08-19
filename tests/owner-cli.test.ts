@@ -6,10 +6,21 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
+import { startLocalModel } from "./support/local-model.ts";
 
 test("Owner CLI continues one canonical conversation in a new process", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 2) {
+      const serialized = JSON.stringify(requestBody);
+      assert.match(serialized, /Keep this conversation\./);
+      assert.match(serialized, /Pinned Pi turn 1\./);
+      assert.match(serialized, /Continue after restart\./);
+    }
+    return `Pinned Pi turn ${call}.`;
+  });
+  t.after(() => localModel.close());
   await writeFile(
     join(stateDirectory, "config.json"),
     JSON.stringify({
@@ -18,7 +29,7 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
         provider: "local-openai",
         model: "owner-model",
         api: "openai-completions",
-        baseUrl: "http://127.0.0.1:11434/v1",
+        baseUrl: localModel.baseUrl,
       },
       modelPolicyRevision: "owner-policy-1",
     }),
@@ -26,11 +37,11 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
 
   const first = await runCli(stateDirectory, "Keep this conversation.\n");
   assert.equal(first.code, 0, first.stderr);
-  assert.match(first.stdout, /Lead Agent: Deterministic turn 1: Keep this conversation\./);
+  assert.match(first.stdout, /Lead Agent: Pinned Pi turn 1\./);
 
   const second = await runCli(stateDirectory, "Continue after restart.\n");
   assert.equal(second.code, 0, second.stderr);
-  assert.match(second.stdout, /Lead Agent: Deterministic turn 2: Continue after restart\./);
+  assert.match(second.stdout, /Lead Agent: Pinned Pi turn 2\./);
 });
 
 test("Owner CLI reports missing configuration as a deterministic host diagnostic", async (t) => {
@@ -57,12 +68,12 @@ test("Owner CLI reports malformed configuration as a deterministic host diagnost
   assert.equal(result.code, 2);
   assert.equal(
     result.stderr,
-    "CMD_RIKER_CONFIG_INVALID: config.json must contain a valid secret-free Owner configuration.\n",
+    "CMD_RIKER_CONFIG_INVALID: config.json must contain a valid supported Owner configuration.\n",
   );
   assert.doesNotMatch(result.stdout + result.stderr, /Lead Agent:/);
 });
 
-test("Owner CLI rejects a model configuration that is not secret-free", async (t) => {
+test("Owner CLI rejects an unsupported remote Model integration", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-secret-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
   await writeFile(
@@ -84,12 +95,45 @@ test("Owner CLI rejects a model configuration that is not secret-free", async (t
   assert.equal(result.code, 2);
   assert.equal(
     result.stderr,
-    "CMD_RIKER_CONFIG_INVALID: config.json must contain a valid secret-free Owner configuration.\n",
+    "CMD_RIKER_CONFIG_INVALID: config.json must contain a valid supported Owner configuration.\n",
   );
   assert.doesNotMatch(result.stdout + result.stderr, /Lead Agent:/);
 });
 
-test("Owner CLI reports an unavailable configured Model without assistant prose", async (t) => {
+test("Owner CLI rejects Model URLs that could carry secrets", async (t) => {
+  for (const baseUrl of [
+    "http://token@127.0.0.1:11434/v1",
+    "http://127.0.0.1:11434/v1?api_key=secret",
+  ]) {
+    await t.test(baseUrl, async (t) => {
+      const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-secret-url-test-"));
+      t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+      await writeFile(
+        join(stateDirectory, "config.json"),
+        JSON.stringify({
+          targetProject: { path: "C:\\target-project" },
+          modelSelection: {
+            provider: "local-openai",
+            model: "owner-model",
+            api: "openai-completions",
+            baseUrl,
+          },
+          modelPolicyRevision: "owner-policy-1",
+        }),
+      );
+
+      const result = await runCli(stateDirectory, "");
+
+      assert.equal(result.code, 2);
+      assert.equal(
+        result.stderr,
+        "CMD_RIKER_CONFIG_INVALID: config.json must contain a valid supported Owner configuration.\n",
+      );
+    });
+  }
+});
+
+test("Owner CLI reports an unavailable configured Model without Lead Agent prose", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-model-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
   await writeFile(
@@ -106,7 +150,7 @@ test("Owner CLI reports an unavailable configured Model without assistant prose"
     }),
   );
 
-  const result = await runCli(stateDirectory, "Can you hear me?\n", "production");
+  const result = await runCli(stateDirectory, "Can you hear me?\n");
 
   assert.equal(result.code, 2);
   assert.equal(
@@ -116,20 +160,62 @@ test("Owner CLI reports an unavailable configured Model without assistant prose"
   assert.doesNotMatch(result.stdout + result.stderr, /Lead Agent:/);
 
   const state = openAuthoritativeState(stateDirectory);
-  assert.deepEqual(state.readOwnerConversation()?.messages, [
-    { sequence: 1, role: "owner", content: "Can you hear me?" },
-  ]);
+  const messages = state.readOwnerConversation()?.messages;
+  assert.equal(messages?.length, 1);
+  assert.deepEqual(messages?.[0], {
+    sequence: 1,
+    role: "owner",
+    content: "Can you hear me?",
+    turnId: messages?.[0]?.turnId,
+    modelSelection: {
+      provider: "local-openai",
+      model: "missing-local-model",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:1/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  assert.match(messages?.[0]?.turnId ?? "", /^[0-9a-f-]{36}$/);
   state.close();
+});
+
+test("Owner CLI cannot activate the deterministic test adapter", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-no-fake-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "local-openai",
+        model: "missing-local-model",
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:1/v1",
+      },
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+
+  const result = await runCli(stateDirectory, "Do not fabricate a response.\n", [
+    "--adapter",
+    "deterministic",
+  ]);
+
+  assert.equal(result.code, 2);
+  assert.equal(
+    result.stderr,
+    "CMD_RIKER_MODEL_UNAVAILABLE: The configured Model did not complete the turn.\n",
+  );
+  assert.doesNotMatch(result.stdout + result.stderr, /Deterministic turn|Lead Agent:/);
 });
 
 function runCli(
   stateDirectory: string,
   input: string,
-  adapter: "deterministic" | "production" = "deterministic",
+  extraArguments: readonly string[] = [],
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const args = ["src/cli.ts", "--state-dir", stateDirectory];
-    if (adapter === "deterministic") args.push("--adapter", "deterministic");
+    const args = ["src/cli.ts", "--state-dir", stateDirectory, ...extraArguments];
     const child = spawn(
       process.execPath,
       args,

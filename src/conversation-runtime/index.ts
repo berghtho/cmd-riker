@@ -2,7 +2,11 @@ import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 
-import type { ConversationMessage, ModelSelection } from "../authoritative-state/index.ts";
+import type { ConversationMessage } from "../authoritative-state/index.ts";
+import {
+  assertSupportedModelSelection,
+  type ModelSelection,
+} from "../model-selection.ts";
 
 export type PiTurnRequest = {
   conversation: readonly ConversationMessage[];
@@ -32,15 +36,17 @@ export class DeterministicTurnAdapter implements PiTurnAdapter {
 
 export class PiAgentTurnAdapter implements PiTurnAdapter {
   async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
-    assertSecretFreeLocalSelection(request.modelSelection);
+    assertSupportedModelSelection(request.modelSelection);
     const model = toPiModel(request.modelSelection);
     const agent = new Agent({
       initialState: {
         systemPrompt:
-          "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, and candid. " +
-          "Serve the Owner without theatrical role-play.",
+          "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
+          "occasionally witty, proactive, and loyal to the Owner's intent without becoming passive. " +
+          "Enjoy the work, challenge weak plans professionally, and serve the Owner without theatrical role-play.",
         model,
         messages: request.conversation.map(toPiMessage),
+        // Tools remain closed until their authority and durable effect paths exist.
         tools: [],
       },
       streamFn: (selectedModel, context, options) =>
@@ -64,24 +70,6 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       .join("");
     if (!content) throw new Error("Pi turn completed without response text.");
     return { content };
-  }
-}
-
-function assertSecretFreeLocalSelection(selection: ModelSelection): void {
-  let endpoint: URL;
-  try {
-    endpoint = new URL(selection.baseUrl);
-  } catch {
-    throw new Error("Model base URL is invalid.");
-  }
-  const loopback =
-    endpoint.hostname === "127.0.0.1" ||
-    endpoint.hostname === "localhost" ||
-    endpoint.hostname === "[::1]";
-  if (endpoint.protocol !== "http:" || !loopback) {
-    throw new Error(
-      "Model integration is unavailable: only keyless loopback HTTP endpoints are supported.",
-    );
   }
 }
 

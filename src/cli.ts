@@ -16,10 +16,13 @@ import {
   type OwnerConfiguration,
 } from "./authoritative-state/index.ts";
 import {
-  DeterministicTurnAdapter,
   PiAgentTurnAdapter,
   type PiTurnAdapter,
 } from "./conversation-runtime/index.ts";
+import {
+  assertSupportedModelSelection,
+  type ModelSelection,
+} from "./model-selection.ts";
 
 async function main(): Promise<void> {
   const stateDirectory = argumentValue("--state-dir");
@@ -53,10 +56,7 @@ async function main(): Promise<void> {
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
 
-    const adapter: PiTurnAdapter =
-      argumentValue("--adapter") === "deterministic"
-        ? new DeterministicTurnAdapter()
-        : new PiAgentTurnAdapter();
+    const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
     if (process.stdin.isTTY && process.stdout.isTTY) {
       await runInteractiveConversation(state, adapter, conversation.targetProject.path);
     } else {
@@ -151,7 +151,7 @@ async function completeOwnerTurn(
 ): Promise<string> {
   const conversation = state.readOwnerConversation();
   if (!conversation) throw new Error("Authoritative state is not configured.");
-  state.appendOwnerMessage(ownerInput);
+  const turnId = state.appendOwnerMessage(ownerInput);
   let response: { content: string };
   try {
     response = await adapter.completeTurn({
@@ -165,7 +165,7 @@ async function completeOwnerTurn(
       "The configured Model did not complete the turn.",
     );
   }
-  state.appendLeadAgentMessage(response.content);
+  state.appendLeadAgentMessage(turnId, response.content);
   return response.content;
 }
 
@@ -186,7 +186,7 @@ class HostDiagnostic extends Error {
 function invalidConfiguration(): HostDiagnostic {
   return new HostDiagnostic(
     "CMD_RIKER_CONFIG_INVALID",
-    "config.json must contain a valid secret-free Owner configuration.",
+    "config.json must contain a valid supported Owner configuration.",
   );
 }
 
@@ -212,26 +212,20 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   ) {
     throw invalidConfiguration();
   }
-  let endpoint: URL;
+  const selection: ModelSelection = {
+    provider: modelSelection.provider,
+    model: modelSelection.model,
+    api: modelSelection.api,
+    baseUrl: modelSelection.baseUrl,
+  };
   try {
-    endpoint = new URL(modelSelection.baseUrl);
+    assertSupportedModelSelection(selection);
   } catch {
-    throw invalidConfiguration();
-  }
-  if (
-    endpoint.protocol !== "http:" ||
-    !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)
-  ) {
     throw invalidConfiguration();
   }
   return {
     targetProject: { path: targetProject.path },
-    modelSelection: {
-      provider: modelSelection.provider,
-      model: modelSelection.model,
-      api: modelSelection.api,
-      baseUrl: modelSelection.baseUrl,
-    },
+    modelSelection: selection,
     modelPolicyRevision: value.modelPolicyRevision,
   };
 }

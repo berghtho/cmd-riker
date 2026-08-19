@@ -49,7 +49,7 @@ npm start -- --state-dir C:\path\to\cmd-riker-state
 Non-TTY stdin/stdout remains line-oriented for scripts. A real terminal uses the CMD-Riker-owned
 `pi-tui` interface.
 
-To make one deterministic production-path probe against the configured local model, run:
+To make one production-path probe against the configured local Model, run:
 
 ```powershell
 npm run live-smoke -- --state-dir C:\path\to\cmd-riker-state

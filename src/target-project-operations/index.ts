@@ -84,9 +84,56 @@ type EffectIntentBase = {
     validatedAt: string;
   };
   retryRule: string;
-  status: "pending" | "dispatching" | "succeeded" | "unknown" | "rejected";
+  status: "pending" | "dispatching" | "succeeded" | "unknown" | "rejected" | "reconciled";
   lease?: { claimedAt: string; expiresAt: string };
+  reconciliation?: EffectReconciliation;
 };
+
+export type ExternalEffectEvidence = {
+  source:
+    | "target-project-readback"
+    | "provider-readback"
+    | "compensation-result"
+    | "write-generation-and-effect-inventory-readback";
+  reference: string;
+  summary: string;
+  observedAt: string;
+};
+
+export type EffectReconciliation = {
+  disposition: "confirmed-applied" | "confirmed-not-applied" | "compensated";
+  evidence: ExternalEffectEvidence & {
+    source: "target-project-readback" | "provider-readback" | "compensation-result";
+  };
+  reconciledAt: string;
+  reconciledBy: "lead-agent";
+};
+
+export function assertExternalEffectEvidence(evidence: ExternalEffectEvidence): void {
+  if (
+    !evidence.reference.trim() ||
+    !evidence.summary.trim() ||
+    !Number.isFinite(Date.parse(evidence.observedAt))
+  ) {
+    throw new Error("Effect reconciliation requires attributed external evidence.");
+  }
+}
+
+export function assertEffectEvidenceSupportsDisposition(
+  disposition: EffectReconciliation["disposition"],
+  evidence: EffectReconciliation["evidence"],
+): void {
+  assertExternalEffectEvidence(evidence);
+  if (disposition === "compensated") {
+    if (evidence.source !== "compensation-result") {
+      throw new Error("A compensated effect requires attributed compensation evidence.");
+    }
+    return;
+  }
+  if (evidence.source === "compensation-result") {
+    throw new Error(`Compensation evidence does not prove disposition ${disposition}.`);
+  }
+}
 
 export type TargetProjectOperationEffectIntent = EffectIntentBase & {
   kind: "target-project-operation";

@@ -31,6 +31,7 @@ import {
   type LeadModelRequirements,
   type LeadModelPolicy,
 } from "./orchestration-core/index.ts";
+import { createTargetProjectOperations } from "./target-project-operations/index.ts";
 
 async function main(): Promise<void> {
   const stateDirectory = argumentValue("--state-dir");
@@ -212,6 +213,17 @@ async function completeOwnerTurn(
                 replacementCommitmentId,
               );
             }
+          },
+          executeOperation: async (commitmentId, operation) => {
+            const result = await createTargetProjectOperations(state).execute({
+              commitmentId,
+              operation: { kind: operation, inputs: {} },
+              checkout: conversation.targetProject.path,
+              workingDirectory: conversation.targetProject.path,
+              timeoutMs: 120_000,
+            });
+            orchestration.observeTargetProjectOperationResult(commitmentId, result);
+            return result;
           },
         },
       });

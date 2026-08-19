@@ -87,6 +87,30 @@ Verification evidence, Acceptance authority, and the concise conversation status
 Interrupted active work becomes reconciling with a recovery action; later Owner turns can resume,
 pause, cancel, or supersede it through the same conversation.
 
+For a typed Target Project test operation, install the Task CLI and declare the public Taskfile
+mapping in `cmd-riker.operations.json` at the checkout root:
+
+```json
+{
+  "version": 1,
+  "operations": {
+    "test": {
+      "task": "test",
+      "platforms": ["windows"],
+      "artifacts": ["test-results.json"]
+    }
+  }
+}
+```
+
+The `test` task must be public in a supported root `Taskfile.yml`/`Taskfile.yaml` variant. CMD Riker
+verifies the checkout, current platform, Task version, resolved Taskfile, and declared task before it
+atomically records the ready Operation Attempt and pending effect intent, claims a bounded dispatch
+lease, and invokes Task. One Commitment cannot have overlapping or unresolved effects. `artifacts`
+contains up to 32 checkout-relative file paths, each at most 16 MiB, whose SHA-256 changes are
+attributed to the operation result; use an empty array when the operation has no declared file
+artifact.
+
 ## Workflow skills
 
 CMD Riker ships its generic `design-council` skill and locks the complete

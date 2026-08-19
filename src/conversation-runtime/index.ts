@@ -27,6 +27,7 @@ import {
   assertSupportedModelSelection,
   type ModelSelection,
 } from "../model-selection.ts";
+import type { TargetProjectOperationResult } from "../target-project-operations/index.ts";
 
 export type PiTurnRequest = {
   conversation: readonly ConversationMessage[];
@@ -43,6 +44,7 @@ export type PiTurnRequest = {
       reason: string,
       replacementCommitmentId?: string,
     ): void;
+    executeOperation(commitmentId: string, operation: "test"): Promise<TargetProjectOperationResult>;
   };
 };
 
@@ -250,6 +252,8 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "explicitly accepts the named waiting Commitment. Use resume_commitment only for a blocked or paused " +
           "Commitment the Owner asks to continue. Use control_commitment only for the Owner's explicit pause, " +
           "cancel, or supersede instruction." +
+          " For a Target Project test outcome, record one Commitment with a target-project-operation " +
+          "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
           (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : ""),
         model: execution.model,
         messages: request.conversation.map(toPiMessage),
@@ -414,6 +418,11 @@ const commitmentCriterionSchema = Type.Union([
   Type.Object({
     kind: Type.Literal("owner-judgment"),
   }),
+  Type.Object({
+    kind: Type.Literal("target-project-operation"),
+    description: Type.String({ minLength: 1 }),
+    operation: Type.Literal("test"),
+  }),
 ]);
 
 function commitmentTools(
@@ -444,6 +453,37 @@ function commitmentTools(
             },
           ],
           details: { commitmentId: commitment.id, state: commitment.state },
+        };
+      },
+    },
+    {
+      name: "run_target_project_operation",
+      label: "Run Target Project Operation",
+      description:
+        "Run and verify one declared semantic Target Project operation for an active Commitment.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        operation: Type.Literal("test"),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, operation } = params as {
+          commitmentId: string;
+          operation: "test";
+        };
+        const result = await actions.executeOperation(commitmentId, operation);
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Operation attempt ${result.operationAttemptId} ended ${result.status}; ` +
+                `${result.affectedArtifacts.length} affected artifact(s); ` +
+                `${result.uncertainty ? result.uncertainty.reason : "no unresolved uncertainty"}.`,
+            },
+          ],
+          details: result,
         };
       },
     },

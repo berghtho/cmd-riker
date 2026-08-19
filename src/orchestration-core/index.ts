@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import type { ModelSelection } from "../model-selection.ts";
+import type {
+  EffectIntent,
+  TargetProjectOperationAttempt,
+  TargetProjectOperationResult,
+} from "../target-project-operations/index.ts";
 
 export type OwnerConfiguration = {
   targetProject: { path: string };
@@ -58,6 +63,12 @@ export type CommitmentCriterion =
       id: string;
       kind: "owner-judgment";
       description: string;
+    }
+  | {
+      id: string;
+      kind: "target-project-operation";
+      description: string;
+      operation: "test";
     };
 
 export type CommitmentState =
@@ -95,7 +106,8 @@ export type Commitment = {
       id: string;
       criterionId: string;
       description: string;
-      source: "lead-agent-response";
+      source: "lead-agent-response" | "target-project-operation-result";
+      operationAttemptId?: string;
     }>;
   };
   acceptance?:
@@ -122,6 +134,11 @@ export type CommitmentDraft = {
       }
     | {
         kind: "owner-judgment";
+      }
+    | {
+        kind: "target-project-operation";
+        description: string;
+        operation: "test";
       }
   >;
 };
@@ -152,6 +169,14 @@ export interface OrchestrationState {
   appendCommitmentSnapshots(snapshots: Commitment[]): void;
   appendLeadTurnAttemptSnapshots(snapshots: LeadTurnAttempt[]): void;
   readLeadTurnAttempt(attemptId: string): LeadTurnAttempt | undefined;
+  settleTargetProjectOperation(
+    attempt: TargetProjectOperationAttempt,
+    effectIntent: EffectIntent,
+  ): void;
+  readTargetProjectOperationAttempt(attemptId: string): TargetProjectOperationAttempt | undefined;
+  readTargetProjectOperationAttempts(): TargetProjectOperationAttempt[];
+  readEffectIntent(effectIntentId: string): EffectIntent | undefined;
+  readEffectIntents(): EffectIntent[];
   readLeadTurnAttempts(): LeadTurnAttempt[];
 }
 
@@ -172,6 +197,10 @@ export interface OrchestrationCore {
     replacementCommitmentId: string,
   ): void;
   observeLeadResponse(ownerTurnId: string, leadAgentResponse: string): void;
+  observeTargetProjectOperationResult(
+    commitmentId: string,
+    result: TargetProjectOperationResult,
+  ): void;
   observeLeadTurnFailure(ownerTurnId: string, reason: string): void;
   acceptCommitment(commitmentId: string, ownerTurnId: string): void;
   modelCandidateDecision(validation: ModelCandidateValidation): "use" | "skip";
@@ -216,7 +245,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         id: randomUUID(),
         outcome: draft.outcome,
         criteria: draft.criteria.map((criterion) =>
-          criterion.kind === "response-includes"
+          criterion.kind !== "owner-judgment"
             ? { ...criterion, id: randomUUID() }
             : {
                 ...criterion,
@@ -247,6 +276,66 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           ]);
         }
       }
+      for (const attempt of state.readTargetProjectOperationAttempts()) {
+        const effectIntent = state.readEffectIntent(attempt.effectIntentId);
+        if (attempt.status === "ready" && effectIntent?.status === "pending") {
+          const result: TargetProjectOperationResult = {
+            operationAttemptId: attempt.id,
+            effectIntentId: effectIntent.id,
+            commitmentId: attempt.commitmentId,
+            operation: attempt.operation,
+            status: "rejected",
+            discovery: attempt.discovery,
+            affectedArtifacts: [],
+            diagnostics: [
+              {
+                source: "task-cli",
+                stream: "host",
+                message: "Host restart occurred before Task dispatch.",
+              },
+            ],
+            uncertainty: null,
+            startedAt: attempt.startedAt,
+            completedAt: new Date().toISOString(),
+          };
+          state.settleTargetProjectOperation(
+            { ...attempt, status: "rejected", result },
+            { ...effectIntent, status: "rejected" },
+          );
+          recordTargetProjectOperationVerification(state, attempt.commitmentId, result, "blocked");
+          continue;
+        }
+        if (attempt.status !== "running") continue;
+        if (!effectIntent || effectIntent.status !== "dispatching") continue;
+        const completedAt = new Date().toISOString();
+        const result: TargetProjectOperationResult = {
+          operationAttemptId: attempt.id,
+          effectIntentId: effectIntent.id,
+          commitmentId: attempt.commitmentId,
+          operation: attempt.operation,
+          status: "unknown",
+          discovery: attempt.discovery,
+          affectedArtifacts: [],
+          diagnostics: [
+            {
+              source: "task-cli",
+              stream: "host",
+              message: "Host restart lost Task process continuity after dispatch.",
+            },
+          ],
+          uncertainty: {
+            reason: "Host restart lost continuity with the dispatched Target Project operation.",
+            nextAction: "Inspect declared artifacts and external effects before authorizing a new attempt.",
+          },
+          startedAt: attempt.startedAt,
+          completedAt,
+        };
+        state.settleTargetProjectOperation(
+          { ...attempt, status: "unknown", result },
+          { ...effectIntent, status: "unknown" },
+        );
+        recordTargetProjectOperationVerification(state, attempt.commitmentId, result, "reconciling");
+      }
       for (const commitment of state.readCommitments()) {
         if (commitment.state !== "active" || commitment.condition) continue;
         state.appendCommitmentSnapshots([
@@ -266,6 +355,14 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       const commitment = requireControlledCommitment(state, commitmentId, ownerTurnId);
       if (["accepted", "cancelled", "superseded"].includes(commitment.state) || !commitment.condition) {
         throw new Error(`Commitment ${commitmentId} is not resumable.`);
+      }
+      if (
+        state.readEffectIntents().some(
+          (effectIntent) =>
+            effectIntent.commitmentId === commitmentId && effectIntent.status === "unknown",
+        )
+      ) {
+        throw new Error(`Commitment ${commitmentId} has an uncertain effect that requires reconciliation.`);
       }
       const { condition: _condition, ...unblocked } = commitment;
       state.appendCommitmentSnapshots([
@@ -330,6 +427,10 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
 
     observeLeadResponse(ownerTurnId, leadAgentResponse) {
       observeLeadResponse(state, ownerTurnId, leadAgentResponse);
+    },
+
+    observeTargetProjectOperationResult(commitmentId, result) {
+      recordTargetProjectOperationVerification(state, commitmentId, result, "blocked");
     },
 
     observeLeadTurnFailure(ownerTurnId, reason) {
@@ -460,7 +561,7 @@ function observeLeadResponse(
     (commitment) =>
       commitment.activeOwnerTurnId === ownerTurnId &&
       commitment.state === "active" &&
-      commitment.condition?.kind !== "paused",
+      !commitment.condition,
   );
   for (const commitment of commitments) {
     const { condition: _condition, ...unconditioned } = commitment;
@@ -473,15 +574,19 @@ function observeLeadResponse(
           ? leadAgentResponse.includes(criterion.expectedText)
             ? `The Lead Agent response includes ${JSON.stringify(criterion.expectedText)}.`
             : `The Lead Agent response does not include ${JSON.stringify(criterion.expectedText)}.`
-          : leadAgentResponse.trim()
+          : criterion.kind === "owner-judgment" && leadAgentResponse.trim()
             ? "The Lead Agent response was presented for Owner judgment."
-            : "No Lead Agent response was presented for Owner judgment.",
+            : criterion.kind === "owner-judgment"
+              ? "No Lead Agent response was presented for Owner judgment."
+              : "No successful Target Project operation result was observed.",
       source: "lead-agent-response" as const,
     }));
     const passed = commitment.criteria.every((criterion) =>
       criterion.kind === "owner-judgment"
         ? Boolean(leadAgentResponse.trim())
-        : leadAgentResponse.includes(criterion.expectedText),
+        : criterion.kind === "response-includes"
+          ? leadAgentResponse.includes(criterion.expectedText)
+          : false,
     );
     const verification = {
       passed,
@@ -518,6 +623,90 @@ function observeLeadResponse(
   }
 }
 
+function recordTargetProjectOperationVerification(
+  state: OrchestrationState,
+  commitmentId: string,
+  result: TargetProjectOperationResult,
+  failureCondition: "blocked" | "reconciling",
+): void {
+  const commitment = state.readCommitment(commitmentId);
+  if (!commitment) throw new Error(`Unknown Commitment ${commitmentId}.`);
+  if (commitment.state !== "active" || commitment.condition) {
+    throw new Error(`Commitment ${commitmentId} cannot verify an operation result.`);
+  }
+  if (result.commitmentId !== commitmentId) {
+    throw new Error("Target Project operation result belongs to a different Commitment.");
+  }
+  const attempt = state.readTargetProjectOperationAttempt(result.operationAttemptId);
+  const effectIntent = state.readEffectIntent(result.effectIntentId);
+  const expectedEffectStatus = result.status === "succeeded"
+    ? "succeeded"
+    : result.status === "rejected" || result.status === "unavailable"
+      ? "rejected"
+      : "unknown";
+  if (
+    !attempt?.result ||
+    attempt.commitmentId !== commitmentId ||
+    attempt.effectIntentId !== result.effectIntentId ||
+    JSON.stringify(attempt.result) !== JSON.stringify(result) ||
+    effectIntent?.operationAttemptId !== attempt.id ||
+    effectIntent.commitmentId !== commitmentId ||
+    effectIntent.status !== expectedEffectStatus
+  ) {
+    throw new Error("Target Project operation result is not the current attributed durable fact.");
+  }
+  const operationCriteria = commitment.criteria.filter(
+    (criterion) => criterion.kind === "target-project-operation",
+  );
+  if (
+    operationCriteria.length !== commitment.criteria.length ||
+    operationCriteria.some((criterion) => criterion.operation !== result.operation)
+  ) {
+    throw new Error("Commitment criteria do not match the Target Project operation result.");
+  }
+  const verifying: Commitment = { ...commitment, state: "verifying" };
+  const passed = result.status === "succeeded" && result.uncertainty === null;
+  const verification = {
+    passed,
+    verifiedAt: new Date().toISOString(),
+    evidence: operationCriteria.map((criterion) => ({
+      id: randomUUID(),
+      criterionId: criterion.id,
+      description: passed
+        ? `Target Project operation ${result.operation} succeeded without unresolved uncertainty.`
+        : result.uncertainty
+          ? `Target Project operation ${result.operation} ended ${result.status} with unresolved uncertainty.`
+          : `Target Project operation ${result.operation} was ${result.status} before effect dispatch.`,
+      source: "target-project-operation-result" as const,
+      operationAttemptId: result.operationAttemptId,
+    })),
+  };
+  const settled: Commitment = passed
+    ? {
+        ...verifying,
+        state: "accepted",
+        verification,
+        acceptance: {
+          authority: "lead-agent",
+          basis: "objective-criteria",
+          acceptedAt: new Date().toISOString(),
+        },
+      }
+    : {
+        ...verifying,
+        state: "active",
+        verification,
+        condition: {
+          kind: failureCondition,
+          reason: failureCondition === "reconciling"
+            ? "Host restart left the Target Project operation effect uncertain."
+            : "The Target Project operation did not produce a certain successful result.",
+          nextAction: result.uncertainty?.nextAction ?? "Diagnose the failed operation before retrying.",
+        },
+      };
+  state.appendCommitmentSnapshots([verifying, settled]);
+}
+
 function validateCommitmentDraft(draft: CommitmentDraft): void {
   if (!draft.outcome.trim()) throw new Error("A Commitment outcome is required.");
   if (draft.criteria.length === 0) throw new Error("A Commitment requires criteria.");
@@ -530,6 +719,12 @@ function validateCommitmentDraft(draft: CommitmentDraft): void {
         throw new Error("An objective response criterion requires expected text.");
       }
     }
+  }
+  const hasOperationCriterion = draft.criteria.some(
+    (criterion) => criterion.kind === "target-project-operation",
+  );
+  if (hasOperationCriterion && draft.criteria.some((criterion) => criterion.kind !== "target-project-operation")) {
+    throw new Error("A Target Project operation Commitment cannot mix response criteria.");
   }
 }
 

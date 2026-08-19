@@ -12,6 +12,10 @@ import type {
   LeadTurnAttempt,
   OwnerConfiguration,
 } from "../orchestration-core/index.ts";
+import type {
+  EffectIntent,
+  TargetProjectOperationAttempt,
+} from "../target-project-operations/index.ts";
 
 export type { ModelSelection } from "../model-selection.ts";
 export type {
@@ -73,6 +77,22 @@ export interface AuthoritativeState {
   appendLeadTurnAttemptSnapshots(snapshots: LeadTurnAttempt[]): void;
   readLeadTurnAttempt(attemptId: string): LeadTurnAttempt | undefined;
   readLeadTurnAttempts(): LeadTurnAttempt[];
+  startTargetProjectOperation(
+    attempt: TargetProjectOperationAttempt,
+    effectIntent: EffectIntent,
+  ): void;
+  claimTargetProjectOperationDispatch(
+    attempt: TargetProjectOperationAttempt,
+    effectIntent: EffectIntent,
+  ): void;
+  settleTargetProjectOperation(
+    attempt: TargetProjectOperationAttempt,
+    effectIntent: EffectIntent,
+  ): void;
+  readTargetProjectOperationAttempt(attemptId: string): TargetProjectOperationAttempt | undefined;
+  readTargetProjectOperationAttempts(): TargetProjectOperationAttempt[];
+  readEffectIntent(effectIntentId: string): EffectIntent | undefined;
+  readEffectIntents(): EffectIntent[];
   readCommitmentHistory(commitmentId: string): Array<{
     sequence: number;
     commitment: Commitment;
@@ -102,7 +122,9 @@ type FactDraft =
       };
     }
   | { kind: "commitment.snapshot"; value: Commitment }
-  | { kind: "lead-turn-attempt.snapshot"; value: LeadTurnAttempt };
+  | { kind: "lead-turn-attempt.snapshot"; value: LeadTurnAttempt }
+  | { kind: "target-project-operation-attempt.snapshot"; value: TargetProjectOperationAttempt }
+  | { kind: "effect-intent.snapshot"; value: EffectIntent };
 
 type JournalRow = {
   sequence: number;
@@ -117,7 +139,9 @@ type TransitionKind =
   | "owner-conversation.owner-message-recorded"
   | "owner-conversation.lead-agent-message-recorded"
   | `commitment.${Commitment["state"]}`
-  | `lead-turn-attempt.${LeadTurnAttempt["status"]}`;
+  | `lead-turn-attempt.${LeadTurnAttempt["status"]}`
+  | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
+  | `effect-intent.${EffectIntent["status"]}`;
 
 export function openAuthoritativeState(stateDirectory: string): AuthoritativeState {
   mkdirSync(stateDirectory, { recursive: true });
@@ -305,6 +329,134 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
           .run(randomUUID(), `lead-turn-attempt.${snapshot.status}`, factId, recordedAt);
         predecessorId = factId;
       }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
+  const readTargetProjectOperationAttemptRow = (
+    attemptId: string,
+  ): { id: string; value: TargetProjectOperationAttempt } | undefined => {
+    const row = database
+      .prepare(`
+        SELECT id, value_json
+          FROM facts current
+         WHERE current.kind = 'target-project-operation-attempt.snapshot'
+           AND current.subject_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         LIMIT 1
+      `)
+      .get(`target-project-operation-attempt:${attemptId}`) as
+      | { id: string; value_json: string }
+      | undefined;
+    return row
+      ? { id: row.id, value: JSON.parse(row.value_json) as TargetProjectOperationAttempt }
+      : undefined;
+  };
+
+  const readEffectIntentRow = (
+    effectIntentId: string,
+  ): { id: string; value: EffectIntent } | undefined => {
+    const row = database
+      .prepare(`
+        SELECT id, value_json
+          FROM facts current
+         WHERE current.kind = 'effect-intent.snapshot'
+           AND current.subject_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         LIMIT 1
+      `)
+      .get(`effect-intent:${effectIntentId}`) as { id: string; value_json: string } | undefined;
+    return row
+      ? { id: row.id, value: JSON.parse(row.value_json) as EffectIntent }
+      : undefined;
+  };
+
+  const writeOperationAndEffect = (
+    attempt: TargetProjectOperationAttempt,
+    effectIntent: EffectIntent,
+    predecessors?: { attemptId: string; effectIntentId: string },
+    rejectConflictingCommitmentEffect = false,
+  ): void => {
+    if (
+      attempt.effectIntentId !== effectIntent.id ||
+      effectIntent.operationAttemptId !== attempt.id ||
+      attempt.commitmentId !== effectIntent.commitmentId
+    ) {
+      throw new Error("Operation Attempt and effect intent attribution must match.");
+    }
+    const recordedAt = new Date().toISOString();
+    const attemptFactId = randomUUID();
+    const effectFactId = randomUUID();
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      if (rejectConflictingCommitmentEffect) {
+        const conflict = database
+          .prepare(`
+            SELECT 1
+              FROM facts current
+             WHERE current.kind = 'effect-intent.snapshot'
+               AND json_extract(current.value_json, '$.commitmentId') = ?
+               AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
+               AND NOT EXISTS (
+                 SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+               )
+             LIMIT 1
+          `)
+          .get(effectIntent.commitmentId);
+        if (conflict) {
+          throw new Error("A conflicting Target Project effect is already open for this Commitment.");
+        }
+      }
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, 'target-project-operation-attempt.snapshot', ?, ?, ?)
+        `)
+        .run(
+          attemptFactId,
+          `target-project-operation-attempt:${attempt.id}`,
+          JSON.stringify(attempt),
+          predecessors?.attemptId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          `target-project-operation-attempt.${attempt.status}`,
+          attemptFactId,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
+        `)
+        .run(
+          effectFactId,
+          `effect-intent:${effectIntent.id}`,
+          JSON.stringify(effectIntent),
+          predecessors?.effectIntentId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(randomUUID(), `effect-intent.${effectIntent.status}`, effectFactId, recordedAt);
       database.exec("COMMIT");
     } catch (error) {
       database.exec("ROLLBACK");
@@ -529,6 +681,102 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return rows.map((row) => JSON.parse(row.value_json) as LeadTurnAttempt);
     },
 
+    startTargetProjectOperation(attempt, effectIntent) {
+      if (
+        readTargetProjectOperationAttemptRow(attempt.id) ||
+        readEffectIntentRow(effectIntent.id)
+      ) {
+        throw new Error("Operation Attempt and effect intent identities must be new.");
+      }
+      const dispatching = attempt.status === "ready" && effectIntent.status === "pending";
+      const rejected =
+        (attempt.status === "rejected" || attempt.status === "unavailable") &&
+        effectIntent.status === "rejected" &&
+        attempt.result?.status === attempt.status;
+      if (!dispatching && !rejected) {
+        throw new Error("New operations must atomically record dispatch or discovery rejection.");
+      }
+      writeOperationAndEffect(attempt, effectIntent, undefined, true);
+    },
+
+    claimTargetProjectOperationDispatch(attempt, effectIntent) {
+      const currentAttempt = readTargetProjectOperationAttemptRow(attempt.id);
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      if (!currentAttempt || !currentEffect) {
+        throw new Error("Cannot claim an unknown Operation Attempt or effect intent.");
+      }
+      if (currentAttempt.value.status !== "ready" || currentEffect.value.status !== "pending") {
+        throw new Error("Operation Attempt or effect intent is not ready for dispatch.");
+      }
+      if (attempt.status !== "running" || effectIntent.status !== "dispatching" || !effectIntent.lease) {
+        throw new Error("Dispatch claim requires a running attempt and a durable effect lease.");
+      }
+      writeOperationAndEffect(attempt, effectIntent, {
+        attemptId: currentAttempt.id,
+        effectIntentId: currentEffect.id,
+      });
+    },
+
+    settleTargetProjectOperation(attempt, effectIntent) {
+      const currentAttempt = readTargetProjectOperationAttemptRow(attempt.id);
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      if (!currentAttempt || !currentEffect) {
+        throw new Error("Cannot settle an unknown Operation Attempt or effect intent.");
+      }
+      const dispatched =
+        currentAttempt.value.status === "running" && currentEffect.value.status === "dispatching";
+      const undispatched =
+        currentAttempt.value.status === "ready" &&
+        currentEffect.value.status === "pending" &&
+        attempt.status === "rejected" &&
+        effectIntent.status === "rejected";
+      if (!dispatched && !undispatched) {
+        throw new Error("Operation Attempt or effect intent is already settled.");
+      }
+      writeOperationAndEffect(attempt, effectIntent, {
+        attemptId: currentAttempt.id,
+        effectIntentId: currentEffect.id,
+      });
+    },
+
+    readTargetProjectOperationAttempt(attemptId) {
+      return readTargetProjectOperationAttemptRow(attemptId)?.value;
+    },
+
+    readTargetProjectOperationAttempts() {
+      const rows = database
+        .prepare(`
+          SELECT current.value_json
+            FROM facts current
+           WHERE current.kind = 'target-project-operation-attempt.snapshot'
+             AND NOT EXISTS (
+               SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+             )
+           ORDER BY current.sequence
+        `)
+        .all() as Array<{ value_json: string }>;
+      return rows.map((row) => JSON.parse(row.value_json) as TargetProjectOperationAttempt);
+    },
+
+    readEffectIntent(effectIntentId) {
+      return readEffectIntentRow(effectIntentId)?.value;
+    },
+
+    readEffectIntents() {
+      const rows = database
+        .prepare(`
+          SELECT current.value_json
+            FROM facts current
+           WHERE current.kind = 'effect-intent.snapshot'
+             AND NOT EXISTS (
+               SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+             )
+           ORDER BY current.sequence
+        `)
+        .all() as Array<{ value_json: string }>;
+      return rows.map((row) => JSON.parse(row.value_json) as EffectIntent);
+    },
+
     readCommitmentHistory(commitmentId) {
       const rows = database
         .prepare(`
@@ -565,7 +813,9 @@ function ensureSchema(database: DatabaseSync): void {
         'owner-conversation.owner-message',
         'owner-conversation.lead-agent-message',
         'commitment.snapshot',
-        'lead-turn-attempt.snapshot'
+        'lead-turn-attempt.snapshot',
+        'target-project-operation-attempt.snapshot',
+        'effect-intent.snapshot'
       )),
       value_json TEXT NOT NULL CHECK (json_valid(value_json)),
       supersedes_fact_id TEXT REFERENCES facts(id),
@@ -592,7 +842,20 @@ function ensureSchema(database: DatabaseSync): void {
         'commitment.superseded',
         'lead-turn-attempt.started',
         'lead-turn-attempt.completed',
-        'lead-turn-attempt.failed'
+        'lead-turn-attempt.failed',
+        'target-project-operation-attempt.running',
+        'target-project-operation-attempt.ready',
+        'target-project-operation-attempt.succeeded',
+        'target-project-operation-attempt.failed',
+        'target-project-operation-attempt.timed-out',
+        'target-project-operation-attempt.unknown',
+        'target-project-operation-attempt.rejected',
+        'target-project-operation-attempt.unavailable',
+        'effect-intent.dispatching',
+        'effect-intent.pending',
+        'effect-intent.succeeded',
+        'effect-intent.unknown',
+        'effect-intent.rejected'
       )),
       fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id),
       recorded_at TEXT NOT NULL
@@ -603,7 +866,9 @@ function ensureSchema(database: DatabaseSync): void {
     .get() as { sql: string };
   if (
     row.sql.includes("'commitment.snapshot'") &&
-    row.sql.includes("'lead-turn-attempt.snapshot'")
+    row.sql.includes("'lead-turn-attempt.snapshot'") &&
+    row.sql.includes("'target-project-operation-attempt.snapshot'") &&
+    row.sql.includes("'effect-intent.snapshot'")
   ) {
     return;
   }
@@ -625,7 +890,9 @@ function ensureSchema(database: DatabaseSync): void {
           'owner-conversation.owner-message',
           'owner-conversation.lead-agent-message',
           'commitment.snapshot',
-          'lead-turn-attempt.snapshot'
+          'lead-turn-attempt.snapshot',
+          'target-project-operation-attempt.snapshot',
+          'effect-intent.snapshot'
         )),
         value_json TEXT NOT NULL CHECK (json_valid(value_json)),
         supersedes_fact_id TEXT REFERENCES facts(id),
@@ -650,7 +917,20 @@ function ensureSchema(database: DatabaseSync): void {
           'commitment.superseded',
           'lead-turn-attempt.started',
           'lead-turn-attempt.completed',
-          'lead-turn-attempt.failed'
+          'lead-turn-attempt.failed',
+          'target-project-operation-attempt.running',
+          'target-project-operation-attempt.ready',
+          'target-project-operation-attempt.succeeded',
+          'target-project-operation-attempt.failed',
+          'target-project-operation-attempt.timed-out',
+          'target-project-operation-attempt.unknown',
+          'target-project-operation-attempt.rejected',
+          'target-project-operation-attempt.unavailable',
+          'effect-intent.dispatching',
+          'effect-intent.pending',
+          'effect-intent.succeeded',
+          'effect-intent.unknown',
+          'effect-intent.rejected'
         )),
         fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id),
         recorded_at TEXT NOT NULL
@@ -702,6 +982,10 @@ function factSubject(input: FactDraft): string {
       return `commitment:${input.value.id}`;
     case "lead-turn-attempt.snapshot":
       return `lead-turn-attempt:${input.value.id}`;
+    case "target-project-operation-attempt.snapshot":
+      return `target-project-operation-attempt:${input.value.id}`;
+    case "effect-intent.snapshot":
+      return `effect-intent:${input.value.id}`;
   }
 }
 

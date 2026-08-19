@@ -44,6 +44,14 @@ export type PiTurnRequest = {
   commitments?: readonly Commitment[];
   commitmentActions?: {
     record(draft: CommitmentDraft): Commitment;
+    recordOwnerAttention(
+      commitmentId: string,
+      input: {
+        kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
+        reason: string;
+        nextAction: string;
+      },
+    ): void;
     accept(commitmentId: string): void;
     resume(commitmentId: string): void;
     control(
@@ -113,6 +121,11 @@ export type PiTurnRequest = {
       }>;
     }): void;
     reserveOwnerDecision?(questionId: string, reason: string): void;
+    assignRecoveryOwner?(
+      blockedWorkerSessionId: string,
+      recoveryWorkerSessionId: string,
+      reason: string,
+    ): void;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -621,6 +634,38 @@ function commitmentTools(
       },
     },
     {
+      name: "record_material_commitment_attention",
+      label: "Record Material Commitment Attention",
+      description:
+        "Record an Owner-facing Commitment blocker only for a reserved decision, exhausted recovery, trusted-base loss, or mission-critical impairment, with the actual fact and recovery condition.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        kind: Type.Union([
+          Type.Literal("owner-reserved-decision"),
+          Type.Literal("recovery-exhausted"),
+          Type.Literal("trusted-base-loss"),
+          Type.Literal("mission-critical-impairment"),
+        ]),
+        reason: Type.String({ minLength: 1 }),
+        nextAction: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, kind, reason, nextAction } = params as {
+          commitmentId: string;
+          kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
+          reason: string;
+          nextAction: string;
+        };
+        actions.recordOwnerAttention(commitmentId, { kind, reason, nextAction });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Material attention recorded for Commitment ${commitmentId}.` }],
+          details: { commitmentId, kind },
+        };
+      },
+    },
+    {
       name: "resume_commitment",
       label: "Resume Commitment",
       description: "Bind a blocked or paused Commitment to this Owner turn so its outcome can continue.",
@@ -1055,6 +1100,42 @@ function workerTools(
             text: `Worker question ${questionId} is reserved for an Owner decision in the Session View.`,
           }],
           details: { questionId },
+        };
+      },
+    });
+  }
+  if (actions.assignRecoveryOwner) {
+    tools.push({
+      name: "assign_worker_recovery_owner",
+      label: "Assign Worker Recovery Owner",
+      description:
+        "Assign a distinct active Worker Session as precise Recovery Ownership for one Worker whose bounded recovery is exhausted, clearing the old attention fact.",
+      parameters: Type.Object({
+        blockedWorkerSessionId: Type.String({ minLength: 1 }),
+        recoveryWorkerSessionId: Type.String({ minLength: 1 }),
+        reason: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const input = params as {
+          blockedWorkerSessionId: string;
+          recoveryWorkerSessionId: string;
+          reason: string;
+        };
+        actions.assignRecoveryOwner!(
+          input.blockedWorkerSessionId,
+          input.recoveryWorkerSessionId,
+          input.reason,
+        );
+        observer.onMutation();
+        return {
+          content: [{
+            type: "text",
+            text:
+              `Worker Session ${input.recoveryWorkerSessionId} now owns recovery for ` +
+              `${input.blockedWorkerSessionId}.`,
+          }],
+          details: input,
         };
       },
     });

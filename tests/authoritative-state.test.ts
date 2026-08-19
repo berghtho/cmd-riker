@@ -278,6 +278,15 @@ test("a failed Lead turn leaves its active Commitment blocked with a recovery ac
     reason: "Lead Model turn failed: unavailable.",
     nextAction: "Reconcile the failed Lead turn before continuing this Commitment.",
   });
+  orchestration.recordCommitmentOwnerAttention(commitment.id, {
+    kind: "mission-critical-impairment",
+    reason: "The failed Lead turn now blocks the mission-critical outcome.",
+    nextAction: "The Owner must choose whether to retry with a different Model.",
+  });
+  assert.equal(
+    state.readCommitment(commitment.id)?.condition?.ownerAttention,
+    "mission-critical-impairment",
+  );
   const recoveryTurnId = state.appendOwnerMessage("Resume that Commitment now.");
   orchestration.resumeCommitment(commitment.id, recoveryTurnId);
   orchestration.observeLeadResponse(recoveryTurnId, "Recovered result");

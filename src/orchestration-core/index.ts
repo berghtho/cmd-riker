@@ -280,7 +280,8 @@ type WorkerAssignmentBase = {
     commitmentId?: string;
     coordination?:
       | { role: "implementer"; repairOfReviewFindingIds?: string[] }
-      | { role: "reviewer"; reviewOfWorkerSessionId: string };
+      | { role: "reviewer"; reviewOfWorkerSessionId: string }
+      | { role: "recovery"; recoveryOfWorkerSessionId: string; reason: string };
 };
 
 export type ReviewFinding = {
@@ -661,6 +662,14 @@ export interface OrchestrationCore {
     validations: readonly ModelCandidateValidation[],
   ): void;
   recordCommitment(ownerTurnId: string, draft: CommitmentDraft): Commitment;
+  recordCommitmentOwnerAttention(
+    commitmentId: string,
+    input: {
+      kind: NonNullable<Commitment["condition"]>["ownerAttention"];
+      reason: string;
+      nextAction: string;
+    },
+  ): Commitment;
   reconcileInterruptedCommitments(): void;
   reconcileEffect(input: {
     effectIntentId: string;
@@ -773,6 +782,11 @@ export interface OrchestrationCore {
     questions: WorkerQuestion["questions"];
   }): WorkerQuestion;
   reserveWorkerQuestionForOwner(questionId: string, reason: string): WorkerQuestion;
+  assignWorkerRecoveryOwner(
+    blockedWorkerSessionId: string,
+    recoveryWorkerSessionId: string,
+    reason: string,
+  ): void;
   recordWorkerAnswer(
     questionId: string,
     ownerTurnId: string,
@@ -1255,6 +1269,28 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       const active = { ...ready, state: "active" as const };
       state.appendCommitmentSnapshots([committed, ready, active]);
       return active;
+    },
+
+    recordCommitmentOwnerAttention(commitmentId, input) {
+      if (!input.kind || !input.reason.trim() || !input.nextAction.trim()) {
+        throw new Error("Material Commitment attention requires a kind, reason, and recovery condition.");
+      }
+      const commitment = state.readCommitment(commitmentId);
+      if (!commitment) throw new Error(`Unknown Commitment ${commitmentId}.`);
+      if (["accepted", "cancelled", "superseded"].includes(commitment.state)) {
+        throw new Error(`Terminal Commitment ${commitmentId} cannot require Owner attention.`);
+      }
+      const material: Commitment = {
+        ...commitment,
+        condition: {
+          kind: "blocked",
+          reason: input.reason,
+          nextAction: input.nextAction,
+          ownerAttention: input.kind,
+        },
+      };
+      state.appendCommitmentSnapshots([material]);
+      return material;
     },
 
     reconcileInterruptedCommitments() {
@@ -2048,6 +2084,42 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       };
       state.appendWorkerQuestionSnapshots([reserved]);
       return reserved;
+    },
+
+    assignWorkerRecoveryOwner(blockedWorkerSessionId, recoveryWorkerSessionId, reason) {
+      if (!reason.trim()) throw new Error("Worker Recovery Ownership requires a reason.");
+      if (blockedWorkerSessionId === recoveryWorkerSessionId) {
+        throw new Error("Worker Recovery Ownership requires a distinct Worker Session.");
+      }
+      const blocked = requireWorkerSession(state, blockedWorkerSessionId);
+      const recovery = requireWorkerSession(state, recoveryWorkerSessionId);
+      if (!blocked.ownerAttention || blocked.ownerAttention.kind !== "recovery-exhausted") {
+        throw new Error(`Worker Session ${blocked.id} has no exhausted recovery to assign.`);
+      }
+      if (isTerminalWorkerState(recovery.state)) {
+        throw new Error(`Recovery Worker Session ${recovery.id} is terminal.`);
+      }
+      if (
+        blocked.assignment.targetProjectPath !== recovery.assignment.targetProjectPath ||
+        blocked.assignment.commitmentId !== recovery.assignment.commitmentId
+      ) {
+        throw new Error("Recovery Ownership must preserve Target Project and Commitment scope.");
+      }
+      const { ownerAttention: _ownerAttention, ...settledBlocked } = blocked;
+      state.appendWorkerSessionSnapshots([
+        {
+          ...recovery,
+          assignment: {
+            ...recovery.assignment,
+            coordination: {
+              role: "recovery",
+              recoveryOfWorkerSessionId: blocked.id,
+              reason,
+            },
+          },
+        },
+      ]);
+      state.appendWorkerSessionSnapshots([settledBlocked]);
     },
 
     recordWorkerAnswer(questionId, ownerTurnId, answers) {
@@ -3211,6 +3283,10 @@ function requireCurrentWorkerAttempt(
     throw new Error(`Unknown Worker execution attempt ${executionAttemptId}.`);
   }
   return attempt;
+}
+
+function isTerminalWorkerState(state: WorkerSession["state"]): boolean {
+  return ["completed", "blocked", "failed", "cancelled"].includes(state);
 }
 
 function recordWorkerContinuityLoss(

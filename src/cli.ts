@@ -520,6 +520,17 @@ async function completeOwnerTurn(
                 reserveOwnerDecision: (questionId: string, reason: string) => {
                   orchestration.reserveWorkerQuestionForOwner(questionId, reason);
                 },
+                assignRecoveryOwner: (
+                  blockedWorkerSessionId: string,
+                  recoveryWorkerSessionId: string,
+                  reason: string,
+                ) => {
+                  orchestration.assignWorkerRecoveryOwner(
+                    blockedWorkerSessionId,
+                    recoveryWorkerSessionId,
+                    reason,
+                  );
+                },
                 ...(workerCapabilities!.effectful
                   ? {
                       delegateEffectful: (input: {
@@ -564,6 +575,9 @@ async function completeOwnerTurn(
           : {}),
         commitmentActions: {
           record: (draft) => orchestration.recordCommitment(turnId, draft),
+          recordOwnerAttention: (commitmentId, input) => {
+            orchestration.recordCommitmentOwnerAttention(commitmentId, input);
+          },
           accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
           resume: (commitmentId) => orchestration.resumeCommitment(commitmentId, turnId),
           control: (commitmentId, action, reason, replacementCommitmentId) => {

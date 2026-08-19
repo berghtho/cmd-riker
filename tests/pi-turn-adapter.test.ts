@@ -197,8 +197,11 @@ test("production adapter exposes explicit authority controls and independent Rev
             commitmentIds: ["commitment-1"],
             effectClasses: ["merge"],
             targets: ["main"],
+            allowIrreversibleEffects: false,
+            allowExternallyBindingEffects: false,
             maximumIncrementalSpendUsd: 0,
             validUntil: "2026-08-20T10:00:00.000Z",
+            ownerInstructionQuote: "Record this Standing Order.",
           },
         },
       };

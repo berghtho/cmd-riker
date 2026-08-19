@@ -461,7 +461,11 @@ async function completeOwnerTurn(
         pendingHandoff?.state === "handoff-pending" &&
         pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
       ) {
-        orchestration.observeActingAuthorityHandoffDelivered(pendingHandoff.id, turnId);
+        orchestration.observeActingAuthorityHandoffDelivered(
+          pendingHandoff.id,
+          turnId,
+          response.content,
+        );
       }
       orchestration.observeLeadResponse(turnId, response.content);
       const notices = state

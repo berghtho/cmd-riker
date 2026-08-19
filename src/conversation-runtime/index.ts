@@ -61,11 +61,13 @@ export type PiTurnRequest = {
     beginActingAuthority(input: {
       commitmentIds: string[];
       standingOrderIds: string[];
+      ownerInstructionQuote: string;
     }): ActingAuthority;
     recordActingAuthorityEvent(
       actingAuthorityId: string,
-      input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect"> & {
+      input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect" | "decision"> & {
         effect?: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">;
+        decision?: Omit<NonNullable<ActingAuthorityEvent["decision"]>, "standingOrderId">;
       },
     ): ActingAuthorityEvent;
     prepareActingAuthorityHandoff(
@@ -321,7 +323,8 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       const standingOrderContext = (request.standingOrders ?? [])
         .map((order) =>
           `${order.id}: ${order.state} until ${order.validUntil}; Commitments ${order.commitmentIds.join(", ")}; ` +
-          `effects ${order.effectClasses.join(", ")}; targets ${order.targets.join(", ")}`
+          `effects ${order.effectClasses.join(", ")}; targets ${order.targets.join(", ")}; ` +
+          `irreversible ${order.allowIrreversibleEffects}; externally binding ${order.allowExternallyBindingEffects}`
         )
         .join("\n");
       const actingAuthorityContext = request.actingAuthority
@@ -677,8 +680,6 @@ const standingOrderEffectClassSchema = Type.Union([
   Type.Literal("update"),
   Type.Literal("restart"),
   Type.Literal("self-repair"),
-  Type.Literal("irreversible-effect"),
-  Type.Literal("externally-binding-effect"),
 ]);
 
 function authorityTools(
@@ -699,8 +700,11 @@ function authorityTools(
         commitmentIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
         effectClasses: Type.Array(standingOrderEffectClassSchema, { minItems: 1 }),
         targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        allowIrreversibleEffects: Type.Boolean(),
+        allowExternallyBindingEffects: Type.Boolean(),
         maximumIncrementalSpendUsd: Type.Number({ minimum: 0 }),
         validUntil: Type.String({ minLength: 1 }),
+        ownerInstructionQuote: Type.String({ minLength: 8 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -739,12 +743,14 @@ function authorityTools(
       parameters: Type.Object({
         commitmentIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
         standingOrderIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        ownerInstructionQuote: Type.String({ minLength: 8 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const acting = actions.beginActingAuthority(params as {
           commitmentIds: string[];
           standingOrderIds: string[];
+          ownerInstructionQuote: string;
         });
         observer.onMutation();
         return {
@@ -776,6 +782,14 @@ function authorityTools(
           reversible: Type.Boolean(),
           externallyBinding: Type.Boolean(),
           incrementalSpendUsd: Type.Number({ minimum: 0 }),
+          effectIntentId: Type.Optional(Type.String({ minLength: 1 })),
+        })),
+        decision: Type.Optional(Type.Object({
+          decisionClass: Type.Union([
+            Type.Literal("product-decision"),
+            Type.Literal("prioritization"),
+          ]),
+          target: Type.String({ minLength: 1 }),
         })),
       }),
       executionMode: "sequential",

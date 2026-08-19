@@ -404,9 +404,7 @@ export type StandingOrderEffectClass =
   | "deploy"
   | "update"
   | "restart"
-  | "self-repair"
-  | "irreversible-effect"
-  | "externally-binding-effect";
+  | "self-repair";
 
 export type StandingOrder = {
   id: string;
@@ -415,10 +413,13 @@ export type StandingOrder = {
   commitmentIds: string[];
   effectClasses: StandingOrderEffectClass[];
   targets: string[];
+  allowIrreversibleEffects: boolean;
+  allowExternallyBindingEffects: boolean;
   maximumIncrementalSpendUsd: number;
   validFrom: string;
   validUntil: string;
   createdByOwnerTurnId: string;
+  ownerInstructionQuote: string;
   state: "active" | "revoked";
   revocation?: {
     ownerTurnId: string;
@@ -434,8 +435,11 @@ export type StandingOrderDraft = Pick<
   | "commitmentIds"
   | "effectClasses"
   | "targets"
+  | "allowIrreversibleEffects"
+  | "allowExternallyBindingEffects"
   | "maximumIncrementalSpendUsd"
   | "validUntil"
+  | "ownerInstructionQuote"
 >;
 
 export type ActingAuthorityEvent = {
@@ -451,6 +455,12 @@ export type ActingAuthorityEvent = {
     reversible: boolean;
     externallyBinding: boolean;
     incrementalSpendUsd: number;
+    standingOrderId: string;
+    effectIntentId?: string;
+  };
+  decision?: {
+    decisionClass: "product-decision" | "prioritization";
+    target: string;
     standingOrderId: string;
   };
 };
@@ -472,6 +482,7 @@ export type ActingAuthority = {
   commitmentIds: string[];
   standingOrderIds: string[];
   startedByOwnerTurnId: string;
+  ownerInstructionQuote: string;
   startedAt: string;
   events: ActingAuthorityEvent[];
   handoff?: ActingAuthorityHandoff;
@@ -498,6 +509,8 @@ export type CoordinationMessage = {
 
 export interface OrchestrationState {
   readOwnerConversation(): OwnerConfiguration | undefined;
+  ownerMessage(ownerTurnId: string): string | undefined;
+  latestOwnerTurnId(): string | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
   ownerTurnSequence(turnId: string): number | undefined;
@@ -560,11 +573,13 @@ export interface OrchestrationCore {
   beginActingAuthority(ownerTurnId: string, input: {
     commitmentIds: string[];
     standingOrderIds: string[];
+    ownerInstructionQuote: string;
   }): ActingAuthority;
   recordActingAuthorityEvent(
     actingAuthorityId: string,
-    input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect"> & {
+    input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect" | "decision"> & {
       effect?: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">;
+      decision?: Omit<NonNullable<ActingAuthorityEvent["decision"]>, "standingOrderId">;
     },
   ): ActingAuthorityEvent;
   prepareActingAuthorityHandoff(
@@ -574,6 +589,7 @@ export interface OrchestrationCore {
   observeActingAuthorityHandoffDelivered(
     actingAuthorityId: string,
     ownerTurnId: string,
+    leadAgentResponse: string,
   ): void;
   coordinationMessagesView(): CoordinationMessage[];
   recordCoordinationMessage(input: Omit<CoordinationMessage, "id" | "recordedAt">): CoordinationMessage;
@@ -766,7 +782,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     },
 
     recordStandingOrder(ownerTurnId, draft) {
-      requireOwnerTurn(state, ownerTurnId);
+      requireExplicitCurrentOwnerInstruction(state, ownerTurnId, draft.ownerInstructionQuote);
       validateStandingOrderDraft(state, draft);
       const now = new Date().toISOString();
       const standingOrder: StandingOrder = {
@@ -781,7 +797,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     },
 
     revokeStandingOrder(standingOrderId, ownerTurnId, reason) {
-      requireOwnerTurn(state, ownerTurnId);
+      requireCurrentOwnerTurn(state, ownerTurnId);
       if (!reason.trim()) throw new Error("Standing Order revocation requires a reason.");
       const standingOrder = state.readStandingOrder(standingOrderId);
       if (!standingOrder) throw new Error(`Unknown Standing Order ${standingOrderId}.`);
@@ -800,7 +816,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     },
 
     beginActingAuthority(ownerTurnId, input) {
-      requireOwnerTurn(state, ownerTurnId);
+      requireExplicitCurrentOwnerInstruction(state, ownerTurnId, input.ownerInstructionQuote);
       if (input.commitmentIds.length === 0 || input.standingOrderIds.length === 0) {
         throw new Error("Acting Authority requires bounded Commitments and active Standing Orders.");
       }
@@ -835,6 +851,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         commitmentIds: [...new Set(input.commitmentIds)],
         standingOrderIds: [...new Set(input.standingOrderIds)],
         startedByOwnerTurnId: ownerTurnId,
+        ownerInstructionQuote: input.ownerInstructionQuote,
         startedAt: new Date().toISOString(),
         events: [],
       };
@@ -853,15 +870,44 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if ((input.kind === "effect") !== Boolean(input.effect)) {
         throw new Error("Only an Acting Authority effect event carries effect details.");
       }
+      if ((input.kind === "decision") !== Boolean(input.decision)) {
+        throw new Error("An Acting Authority decision requires bounded decision authority details.");
+      }
       let effect: ActingAuthorityEvent["effect"];
+      let decision: ActingAuthorityEvent["decision"];
+      if (input.decision) {
+        const standingOrder = applicableStandingOrder(
+          state,
+          actingAuthority,
+          input.commitmentId,
+          input.decision.decisionClass,
+          input.decision.target,
+          { reversible: true, externallyBinding: false, incrementalSpendUsd: 0 },
+        );
+        if (!standingOrder) {
+          throw new Error("The Acting Authority decision has no applicable active Standing Order.");
+        }
+        decision = { ...input.decision, standingOrderId: standingOrder.id };
+      }
       if (input.effect) {
         if (input.effect.incrementalSpendUsd < 0 || !Number.isFinite(input.effect.incrementalSpendUsd)) {
           throw new Error("Acting Authority effect cost must be finite and nonnegative.");
+        }
+        if (input.effect.effectIntentId) {
+          const effectIntent = state.readEffectIntent(input.effect.effectIntentId);
+          const applied = effectIntent?.status === "succeeded" ||
+            (effectIntent?.status === "reconciled" &&
+              effectIntent.reconciliation?.disposition !== "confirmed-not-applied");
+          if (!effectIntent || effectIntent.commitmentId !== input.commitmentId || !applied) {
+            throw new Error("An attributed Acting Authority effect requires a matching stabilized effect intent.");
+          }
         }
         const standingOrder = applicableStandingOrder(
           state,
           actingAuthority,
           input.commitmentId,
+          input.effect.effectClass,
+          input.effect.target,
           input.effect,
         );
         if (!standingOrder) {
@@ -877,6 +923,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         evidence: input.evidence,
         recordedAt: new Date().toISOString(),
         ...(effect ? { effect } : {}),
+        ...(decision ? { decision } : {}),
       };
       state.appendActingAuthoritySnapshots([{
         ...actingAuthority,
@@ -886,13 +933,29 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     },
 
     prepareActingAuthorityHandoff(actingAuthorityId, ownerTurnId) {
-      requireOwnerTurn(state, ownerTurnId);
+      requireCurrentOwnerTurn(state, ownerTurnId);
       const actingAuthority = state.readActingAuthority(actingAuthorityId);
       if (!actingAuthority) throw new Error(`Unknown Acting Authority ${actingAuthorityId}.`);
       if (actingAuthority.state === "ended") {
         throw new Error(`Acting Authority ${actingAuthorityId} already returned command.`);
       }
-      if (actingAuthority.handoff) return actingAuthority.handoff;
+      assertActingAuthorityEffectsSafeForHandoff(state, actingAuthority);
+      if (actingAuthority.handoff) {
+        if (actingAuthority.handoff.preparedForOwnerTurnId === ownerTurnId) {
+          return actingAuthority.handoff;
+        }
+        const { deliveredAt: _deliveredAt, ...undeliveredHandoff } = actingAuthority.handoff;
+        const refreshedHandoff: ActingAuthorityHandoff = {
+          ...undeliveredHandoff,
+          preparedForOwnerTurnId: ownerTurnId,
+          preparedAt: new Date().toISOString(),
+        };
+        state.appendActingAuthoritySnapshots([{
+          ...actingAuthority,
+          handoff: refreshedHandoff,
+        }]);
+        return refreshedHandoff;
+      }
       const summaries = (kind: ActingAuthorityEvent["kind"]): string[] =>
         actingAuthority.events.filter((event) => event.kind === kind).map((event) => event.summary);
       const handoff: ActingAuthorityHandoff = {
@@ -912,8 +975,14 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return handoff;
     },
 
-    observeActingAuthorityHandoffDelivered(actingAuthorityId, ownerTurnId) {
+    observeActingAuthorityHandoffDelivered(actingAuthorityId, ownerTurnId, leadAgentResponse) {
       requireOwnerTurn(state, ownerTurnId);
+      if (
+        state.latestOwnerTurnId() !== ownerTurnId ||
+        state.leadAgentResponse(ownerTurnId) !== leadAgentResponse
+      ) {
+        throw new Error("Acting Authority delivery requires the persisted response to the current Owner turn.");
+      }
       const actingAuthority = state.readActingAuthority(actingAuthorityId);
       if (!actingAuthority?.handoff || actingAuthority.state !== "handoff-pending") {
         throw new Error("Acting Authority has no pending handoff to deliver.");
@@ -921,6 +990,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (actingAuthority.handoff.preparedForOwnerTurnId !== ownerTurnId) {
         throw new Error("Acting Authority handoff belongs to a different prepared Owner turn.");
       }
+      assertHandoffPresented(actingAuthority.handoff, leadAgentResponse);
       state.appendActingAuthoritySnapshots([{
         ...actingAuthority,
         state: "ended",
@@ -1214,10 +1284,16 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       ) {
         throw new Error(`Commitment ${commitmentId} has an uncertain effect that requires reconciliation.`);
       }
-      const { condition: _condition, ...unblocked } = commitment;
+      const { condition: _condition, review, ...unblocked } = commitment;
+      let resumedReview = review;
+      if (review?.status === "changes-requested") {
+        const { reviewerWorkerSessionId: _reviewerWorkerSessionId, ...reviewWithoutReviewer } = review;
+        resumedReview = { ...reviewWithoutReviewer, status: "pending" };
+      }
       state.appendCommitmentSnapshots([
         {
           ...unblocked,
+          ...(resumedReview ? { review: resumedReview } : {}),
           ...(commitment.state === "active" ? { activeOwnerTurnId: ownerTurnId } : {}),
         },
       ]);
@@ -2490,6 +2566,9 @@ function validateCommitmentDraft(draft: CommitmentDraft): void {
   if (hasOperationCriterion && draft.criteria.some((criterion) => criterion.kind !== "target-project-operation")) {
     throw new Error("A Target Project operation Commitment cannot mix response criteria.");
   }
+  if (draft.review && !hasOperationCriterion) {
+    throw new Error("Independent Review currently requires a Target Project operation Commitment.");
+  }
   if (draft.review && draft.review.reasons.length === 0) {
     throw new Error("A required independent Review must name a concrete reason.");
   }
@@ -2608,6 +2687,13 @@ function recordCoordinationMessage(
   if (input.kind === "review-finding" && (!findingRelation || !input.reviewFindingId)) {
     throw new Error("A review finding requires the attributed reviewing assignment and finding.");
   }
+  if (
+    !["review-request", "review-finding"].includes(input.kind) &&
+    !reviewRelation &&
+    !findingRelation
+  ) {
+    throw new Error("A Coordination Message requires an existing direct assignment relationship.");
+  }
   const message: CoordinationMessage = {
     id: randomUUID(),
     ...input,
@@ -2620,6 +2706,26 @@ function recordCoordinationMessage(
 function requireOwnerTurn(state: OrchestrationState, ownerTurnId: string): void {
   if (state.ownerTurnSequence(ownerTurnId) === undefined) {
     throw new Error(`Unknown Owner turn ${ownerTurnId}.`);
+  }
+}
+
+function requireCurrentOwnerTurn(state: OrchestrationState, ownerTurnId: string): void {
+  requireOwnerTurn(state, ownerTurnId);
+  if (state.latestOwnerTurnId() !== ownerTurnId || state.leadAgentResponse(ownerTurnId) !== undefined) {
+    throw new Error("Authority changes require the current unanswered Owner turn.");
+  }
+}
+
+function requireExplicitCurrentOwnerInstruction(
+  state: OrchestrationState,
+  ownerTurnId: string,
+  ownerInstructionQuote: string,
+): void {
+  requireCurrentOwnerTurn(state, ownerTurnId);
+  const quote = ownerInstructionQuote.trim();
+  const ownerMessage = state.ownerMessage(ownerTurnId);
+  if (quote.length < 8 || !ownerMessage?.includes(quote)) {
+    throw new Error("Authority requires a concrete verbatim quote from the current Owner instruction.");
   }
 }
 
@@ -2667,7 +2773,13 @@ function applicableStandingOrder(
   state: OrchestrationState,
   actingAuthority: ActingAuthority,
   commitmentId: string,
-  effect: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">,
+  effectClass: StandingOrderEffectClass,
+  target: string,
+  bounds: {
+    reversible: boolean;
+    externallyBinding: boolean;
+    incrementalSpendUsd: number;
+  },
 ): StandingOrder | undefined {
   const now = Date.now();
   return actingAuthority.standingOrderIds
@@ -2676,12 +2788,55 @@ function applicableStandingOrder(
       order?.state === "active" &&
       Date.parse(order.validUntil) > now &&
       order.commitmentIds.includes(commitmentId) &&
-      order.effectClasses.includes(effect.effectClass) &&
-      order.targets.includes(effect.target) &&
-      effect.incrementalSpendUsd <= order.maximumIncrementalSpendUsd &&
-      (!effect.externallyBinding || order.effectClasses.includes("externally-binding-effect")) &&
-      (effect.reversible || order.effectClasses.includes("irreversible-effect"))
+      order.effectClasses.includes(effectClass) &&
+      order.targets.includes(target) &&
+      bounds.incrementalSpendUsd <= order.maximumIncrementalSpendUsd &&
+      (!bounds.externallyBinding || order.allowExternallyBindingEffects) &&
+      (bounds.reversible || order.allowIrreversibleEffects)
     );
+}
+
+function assertActingAuthorityEffectsSafeForHandoff(
+  state: OrchestrationState,
+  actingAuthority: ActingAuthority,
+): void {
+  const relevant = state.readEffectIntents().filter((effectIntent) =>
+    actingAuthority.commitmentIds.includes(effectIntent.commitmentId) &&
+    Date.parse(effectIntent.authorization.validatedAt) >= Date.parse(actingAuthority.startedAt)
+  );
+  const unsettled = relevant.filter((effectIntent) =>
+    ["pending", "dispatching", "unknown"].includes(effectIntent.status)
+  );
+  if (unsettled.length > 0) {
+    throw new Error("Acting Authority cannot return command with unsettled effect intents.");
+  }
+  const representedEffectIntentIds = new Set(
+    actingAuthority.events.flatMap((event) => event.effect?.effectIntentId ? [event.effect.effectIntentId] : []),
+  );
+  const unreportedApplied = relevant.filter((effectIntent) => {
+    const applied = effectIntent.status === "succeeded" ||
+      (effectIntent.status === "reconciled" &&
+        effectIntent.reconciliation?.disposition !== "confirmed-not-applied");
+    return applied && !representedEffectIntentIds.has(effectIntent.id);
+  });
+  if (unreportedApplied.length > 0) {
+    throw new Error("Acting Authority cannot return command before applied effects are represented in the handoff.");
+  }
+}
+
+function assertHandoffPresented(
+  handoff: ActingAuthorityHandoff,
+  leadAgentResponse: string,
+): void {
+  const categories = ["decisions", "effects", "exceptions", "risks", "uncertainty"] as const;
+  const normalizedResponse = leadAgentResponse.toLowerCase();
+  const allCategoriesPresented = categories.every((category) => normalizedResponse.includes(category));
+  const allSummariesPresented = categories.every((category) =>
+    handoff[category].every((summary) => leadAgentResponse.includes(summary))
+  );
+  if (!allCategoriesPresented || !allSummariesPresented) {
+    throw new Error("Acting Authority ends only after the Lead response presents the complete handoff.");
+  }
 }
 
 function requireControlledCommitment(

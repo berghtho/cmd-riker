@@ -153,6 +153,8 @@ export interface AuthoritativeState {
   initialize(configuration: OwnerConfiguration): void;
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
   readOwnerConversation(): OwnerConversation | undefined;
+  ownerMessage(ownerTurnId: string): string | undefined;
+  latestOwnerTurnId(): string | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
   appendOwnerMessage(content: string): string;
   appendLeadAgentMessage(
@@ -513,7 +515,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     }
   };
 
-  const readCurrentWorkerSnapshot = <T>(
+  const readCurrentSnapshot = <T>(
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
@@ -538,7 +540,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     return row ? { id: row.id, value: JSON.parse(row.value_json) as T } : undefined;
   };
 
-  const readCurrentWorkerSnapshots = <T>(
+  const readCurrentSnapshots = <T>(
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
@@ -595,7 +597,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         if (!predecessorBySubject.has(subjectId)) {
           predecessorBySubject.set(
             subjectId,
-            readCurrentWorkerSnapshot(entry.kind, subjectId)?.id,
+            readCurrentSnapshot(entry.kind, subjectId)?.id,
           );
         }
         const factId = randomUUID();
@@ -634,7 +636,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     }
   };
 
-  const appendWorkerSnapshots = <T extends { id: string; state?: string; status?: string }>(
+  const appendSnapshots = <T extends { id: string; state?: string; status?: string }>(
     kind:
       | "worker-session.snapshot"
       | "worker-execution-attempt.snapshot"
@@ -964,6 +966,32 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return row?.sequence;
     },
 
+    ownerMessage(ownerTurnId) {
+      const row = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'owner-conversation.owner-message'
+             AND json_extract(value_json, '$.turnId') = ?
+           LIMIT 1
+        `)
+        .get(ownerTurnId) as { value_json: string } | undefined;
+      return row ? (JSON.parse(row.value_json) as { content: string }).content : undefined;
+    },
+
+    latestOwnerTurnId() {
+      const row = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'owner-conversation.owner-message'
+           ORDER BY sequence DESC
+           LIMIT 1
+        `)
+        .get() as { value_json: string } | undefined;
+      return row ? (JSON.parse(row.value_json) as { turnId: string }).turnId : undefined;
+    },
+
     leadAgentResponse(ownerTurnId) {
       const row = database
         .prepare(`
@@ -1048,7 +1076,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         throw new Error("An effectful Worker launch cannot omit its effect intent.");
       }
       const recordedAt = new Date().toISOString();
-      let predecessorId = readCurrentWorkerSnapshot<WorkerSession>(
+      let predecessorId = readCurrentSnapshot<WorkerSession>(
         "worker-session.snapshot",
         `worker-session:${workerSession.id}`,
       )?.id;
@@ -1276,7 +1304,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     appendStandingOrderSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "standing-order.snapshot",
         "standing-order",
         "standing-order",
@@ -1285,18 +1313,18 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readStandingOrder(standingOrderId) {
-      return readCurrentWorkerSnapshot<StandingOrder>(
+      return readCurrentSnapshot<StandingOrder>(
         "standing-order.snapshot",
         `standing-order:${standingOrderId}`,
       )?.value;
     },
 
     readStandingOrders() {
-      return readCurrentWorkerSnapshots<StandingOrder>("standing-order.snapshot");
+      return readCurrentSnapshots<StandingOrder>("standing-order.snapshot");
     },
 
     appendActingAuthoritySnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "acting-authority.snapshot",
         "acting-authority",
         "acting-authority",
@@ -1305,14 +1333,14 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readActingAuthority(actingAuthorityId) {
-      return readCurrentWorkerSnapshot<ActingAuthority>(
+      return readCurrentSnapshot<ActingAuthority>(
         "acting-authority.snapshot",
         `acting-authority:${actingAuthorityId}`,
       )?.value;
     },
 
     readActingAuthorities() {
-      return readCurrentWorkerSnapshots<ActingAuthority>("acting-authority.snapshot");
+      return readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot");
     },
 
     appendCoordinationMessage(message) {
@@ -1335,7 +1363,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     appendWorkerSessionSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "worker-session.snapshot",
         "worker-session",
         "worker-session",
@@ -1344,18 +1372,18 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readWorkerSession(workerSessionId) {
-      return readCurrentWorkerSnapshot<WorkerSession>(
+      return readCurrentSnapshot<WorkerSession>(
         "worker-session.snapshot",
         `worker-session:${workerSessionId}`,
       )?.value;
     },
 
     readWorkerSessions() {
-      return readCurrentWorkerSnapshots<WorkerSession>("worker-session.snapshot");
+      return readCurrentSnapshots<WorkerSession>("worker-session.snapshot");
     },
 
     appendWorkerExecutionAttemptSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "worker-execution-attempt.snapshot",
         "worker-execution-attempt",
         "worker-execution-attempt",
@@ -1364,20 +1392,20 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readWorkerExecutionAttempt(attemptId) {
-      return readCurrentWorkerSnapshot<WorkerExecutionAttempt>(
+      return readCurrentSnapshot<WorkerExecutionAttempt>(
         "worker-execution-attempt.snapshot",
         `worker-execution-attempt:${attemptId}`,
       )?.value;
     },
 
     readWorkerExecutionAttempts() {
-      return readCurrentWorkerSnapshots<WorkerExecutionAttempt>(
+      return readCurrentSnapshots<WorkerExecutionAttempt>(
         "worker-execution-attempt.snapshot",
       );
     },
 
     appendWorkerQuestionSnapshots(snapshots) {
-      appendWorkerSnapshots(
+      appendSnapshots(
         "worker-question.snapshot",
         "worker-question",
         "worker-question",
@@ -1386,14 +1414,14 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     readWorkerQuestion(questionId) {
-      return readCurrentWorkerSnapshot<WorkerQuestion>(
+      return readCurrentSnapshot<WorkerQuestion>(
         "worker-question.snapshot",
         `worker-question:${questionId}`,
       )?.value;
     },
 
     readWorkerQuestions() {
-      return readCurrentWorkerSnapshots<WorkerQuestion>("worker-question.snapshot");
+      return readCurrentSnapshots<WorkerQuestion>("worker-question.snapshot");
     },
 
     startTargetProjectOperation(attempt, effectIntent) {

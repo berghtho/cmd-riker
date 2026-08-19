@@ -13,25 +13,46 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
   let state = openAuthoritativeState(stateDirectory);
   state.initialize(ownerConfiguration());
   const orchestration = createOrchestrationCore(state);
-  const ownerTurnId = state.appendOwnerMessage("While I am away, merge this bounded Commitment if it verifies.");
+  const ownerTurnId = state.appendOwnerMessage(
+    "Begin Acting Authority. While I am away, merge this bounded Commitment if it verifies.",
+  );
   const commitment = orchestration.recordCommitment(ownerTurnId, {
     outcome: "The bounded change is integrated.",
     criteria: [{ kind: "response-includes", description: "Integration is reported.", expectedText: "integrated" }],
   });
 
   assert.equal(orchestration.actingAuthorityView(), undefined);
+  assert.throws(
+    () => orchestration.recordStandingOrder(ownerTurnId, {
+      title: "Invented authority",
+      instruction: "This was not requested.",
+      commitmentIds: [commitment.id],
+      effectClasses: ["merge"],
+      targets: ["main"],
+      allowIrreversibleEffects: false,
+      allowExternallyBindingEffects: false,
+      maximumIncrementalSpendUsd: 0,
+      validUntil: new Date(Date.now() + 60_000).toISOString(),
+      ownerInstructionQuote: "Silence granted authority",
+    }),
+    /verbatim quote/i,
+  );
   const standingOrder = orchestration.recordStandingOrder(ownerTurnId, {
     title: "Integrate the verified change",
     instruction: "Merge the verified Commitment into main while I am unavailable.",
     commitmentIds: [commitment.id],
-    effectClasses: ["merge"],
+    effectClasses: ["merge", "product-decision"],
     targets: ["main"],
+    allowIrreversibleEffects: false,
+    allowExternallyBindingEffects: false,
     maximumIncrementalSpendUsd: 0,
     validUntil: new Date(Date.now() + 60_000).toISOString(),
+    ownerInstructionQuote: "merge this bounded Commitment if it verifies",
   });
   const acting = orchestration.beginActingAuthority(ownerTurnId, {
     commitmentIds: [commitment.id],
     standingOrderIds: [standingOrder.id],
+    ownerInstructionQuote: "Begin Acting Authority",
   });
   assert.equal(acting.state, "active");
 
@@ -40,6 +61,7 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
     commitmentId: commitment.id,
     summary: "Proceed with the verified integration path.",
     evidence: ["The declared Verification passed."],
+    decision: { decisionClass: "product-decision", target: "main" },
   });
   orchestration.recordActingAuthorityEvent(acting.id, {
     kind: "effect",
@@ -61,8 +83,8 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
       summary: "Publish an irreversible external release.",
       evidence: ["No applicable Standing Order exists."],
       effect: {
-        effectClass: "externally-binding-effect",
-        target: "public-release",
+        effectClass: "merge",
+        target: "main",
         reversible: false,
         externallyBinding: true,
         incrementalSpendUsd: 0,
@@ -96,11 +118,33 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
   assert.equal(handoff.risks.length, 1);
   assert.equal(handoff.uncertainty.length, 1);
   assert.equal(reopened.actingAuthorityView()?.state, "handoff-pending");
+  const retryTurnId = state.appendOwnerMessage("The first return response failed. Return command now.");
+  const recoveredHandoff = reopened.prepareActingAuthorityHandoff(acting.id, retryTurnId);
+  assert.equal(handoff.preparedForOwnerTurnId, returnTurnId);
+  assert.equal(recoveredHandoff.preparedForOwnerTurnId, retryTurnId);
+  assert.deepEqual(recoveredHandoff.decisions, handoff.decisions);
   assert.throws(
-    () => reopened.observeActingAuthorityHandoffDelivered(acting.id, ownerTurnId),
-    /prepared Owner turn/i,
+    () => reopened.observeActingAuthorityHandoffDelivered(
+      acting.id,
+      returnTurnId,
+      JSON.stringify(handoff),
+    ),
+    /persisted response|prepared Owner turn/i,
   );
-  reopened.observeActingAuthorityHandoffDelivered(acting.id, returnTurnId);
+  state.appendLeadAgentMessage(retryTurnId, "Command returned.");
+  assert.throws(
+    () => reopened.observeActingAuthorityHandoffDelivered(acting.id, retryTurnId, "Command returned."),
+    /complete handoff/i,
+  );
+  const successfulReturnTurnId = state.appendOwnerMessage("Return command with the complete handoff.");
+  const finalHandoff = reopened.prepareActingAuthorityHandoff(acting.id, successfulReturnTurnId);
+  const deliveredResponse = `Acting Authority handoff: ${JSON.stringify(finalHandoff)}`;
+  state.appendLeadAgentMessage(successfulReturnTurnId, deliveredResponse);
+  reopened.observeActingAuthorityHandoffDelivered(
+    acting.id,
+    successfulReturnTurnId,
+    deliveredResponse,
+  );
   assert.equal(reopened.actingAuthorityView()?.state, "ended");
 
   const revokeTurnId = state.appendOwnerMessage("Revoke the old Standing Order.");
@@ -110,6 +154,7 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
     () => reopened.beginActingAuthority(revokeTurnId, {
       commitmentIds: [commitment.id],
       standingOrderIds: [standingOrder.id],
+      ownerInstructionQuote: "Revoke the old Standing Order",
     }),
     /active Standing Order/i,
   );

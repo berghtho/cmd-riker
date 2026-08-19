@@ -168,6 +168,43 @@ test("an implementing Worker hands one bounded assignment to an independent revi
   );
   assert.equal(orchestration.workerSessionsView().length, workerCount);
 
+  const repairTurn = state.appendOwnerMessage("Repair a must-fix Review finding.");
+  const repairable = orchestration.recordCommitment(repairTurn, {
+    outcome: "The repaired module passes independent Review.",
+    criteria: [{
+      kind: "target-project-operation",
+      description: "The declared test operation succeeds.",
+      operation: "test",
+    }],
+    review: { required: true, reasons: ["public-module"] },
+  });
+  state.appendCommitmentSnapshots([{
+    ...repairable,
+    condition: {
+      kind: "blocked",
+      reason: "Independent Review found a must-fix issue.",
+      nextAction: "Repair and request another independent Review.",
+    },
+    review: {
+      ...repairable.review!,
+      status: "changes-requested",
+      reviewerWorkerSessionId: review.workerSession.id,
+      findings: [{
+        id: "must-fix-finding",
+        basis: "criterion",
+        disposition: "must-fix",
+        summary: "The public contract is incomplete.",
+        evidence: "The required export is absent.",
+      }],
+    },
+  }]);
+  const resumeTurn = state.appendOwnerMessage("Resume after repairing the public contract.");
+  orchestration.resumeCommitment(repairable.id, resumeTurn);
+  assert.equal(state.readCommitment(repairable.id)?.review?.status, "pending");
+  assert.equal(state.readCommitment(repairable.id)?.review?.reviewerWorkerSessionId, undefined);
+  assert.equal(state.readCommitment(repairable.id)?.review?.findings.length, 1);
+  assert.equal(state.readCommitment(repairable.id)?.condition, undefined);
+
   state.close();
   state = openAuthoritativeState(stateDirectory);
   assert.equal(state.readCoordinationMessages().length, 2);

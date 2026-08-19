@@ -31,6 +31,12 @@ import {
   type LeadModelRequirements,
   type LeadModelPolicy,
 } from "./orchestration-core/index.ts";
+import {
+  createCodexWorkerHarness,
+  createWorkerSupervisor,
+  resolveCodexRuntime,
+  type WorkerSupervisor,
+} from "./worker-supervisor/index.ts";
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
 
 async function main(): Promise<void> {
@@ -70,11 +76,23 @@ async function main(): Promise<void> {
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
     createOrchestrationCore(state).reconcileInterruptedCommitments();
     if (!policyValidated) await validatePolicy(adapter, conversation);
+    const workerSupervisor = await availableWorkerSupervisor(state, conversation);
+    if (workerSupervisor) await workerSupervisor.recover();
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
-      await runInteractiveConversation(state, adapter, conversation.targetProject.path);
+      await runInteractiveConversation(
+        state,
+        adapter,
+        conversation.targetProject.path,
+        workerSupervisor,
+      );
     } else {
-      await runScriptableConversation(state, adapter, conversation.targetProject.path);
+      await runScriptableConversation(
+        state,
+        adapter,
+        conversation.targetProject.path,
+        workerSupervisor,
+      );
     }
   } finally {
     state.close();
@@ -85,12 +103,13 @@ async function runScriptableConversation(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   targetProjectPath: string,
+  workerSupervisor: WorkerSupervisor | undefined,
 ): Promise<void> {
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInput of lines) {
     if (!ownerInput.trim()) continue;
-    const content = await completeOwnerTurn(state, adapter, ownerInput);
+    const content = await completeOwnerTurn(state, adapter, ownerInput, workerSupervisor);
     process.stdout.write(`Lead Agent: ${content}\n`);
   }
 }
@@ -99,6 +118,7 @@ function runInteractiveConversation(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   targetProjectPath: string,
+  workerSupervisor: WorkerSupervisor | undefined,
 ): Promise<void> {
   const terminal = new ProcessTerminal();
   const tui = new TuiMainScreen(terminal);
@@ -141,7 +161,7 @@ function runInteractiveConversation(
       transcriptLines.push(`Owner: ${ownerInput}`, "Lead Agent: thinking...");
       transcript.setText(transcriptLines.join("\n\n"));
       tui.requestRender();
-      void completeOwnerTurn(state, adapter, ownerInput)
+      void completeOwnerTurn(state, adapter, ownerInput, workerSupervisor)
         .then((content) => {
           transcriptLines[transcriptLines.length - 1] = `Lead Agent: ${content}`;
           transcript.setText(transcriptLines.join("\n\n"));
@@ -163,6 +183,7 @@ async function completeOwnerTurn(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   ownerInput: string,
+  workerSupervisor?: WorkerSupervisor,
 ): Promise<string> {
   const conversation = state.readOwnerConversation();
   if (!conversation) throw new Error("Authoritative state is not configured.");
@@ -194,6 +215,29 @@ async function completeOwnerTurn(
         ownerInput,
         modelSelection,
         commitments: state.readCommitments(),
+        workers: orchestration.workerSessionsView(),
+        workerQuestions: orchestration.workerQuestionsView(),
+        ...(workerSupervisor
+          ? {
+              workerActions: {
+                delegate: (input: {
+                  objective: string;
+                  prompt: string;
+                  commitmentId?: string;
+                }) =>
+                  workerSupervisor.delegate({
+                    ...input,
+                    targetProjectPath: conversation.targetProject.path,
+                    model: conversation.workerModelPolicy!.selection.model,
+                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                  }),
+                answer: (questionId: string, answers: Record<string, string[]>) =>
+                  workerSupervisor.answer(questionId, turnId, answers),
+                cancel: (workerSessionId: string, reason: string) =>
+                  workerSupervisor.cancel(workerSessionId, turnId, reason),
+              },
+            }
+          : {}),
         commitmentActions: {
           record: (draft) => orchestration.recordCommitment(turnId, draft),
           accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
@@ -269,6 +313,41 @@ async function completeOwnerTurn(
   );
 }
 
+async function availableWorkerSupervisor(
+  state: AuthoritativeState,
+  configuration: OwnerConfiguration,
+): Promise<WorkerSupervisor | undefined> {
+  if (!configuration.workerModelPolicy) return undefined;
+  const orchestration = createOrchestrationCore(state);
+  try {
+    const runtime = await resolveCodexRuntime();
+    if (orchestration.observeCodexCapabilityAvailable() === "cleared") {
+      process.stderr.write(
+        "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
+      );
+    }
+    return createWorkerSupervisor(state, createCodexWorkerHarness(runtime));
+  } catch (error) {
+    orchestration.reconcileInterruptedWorkers(
+      "The Codex capability could not be proven after host restart.",
+    );
+    const detail = error instanceof Error ? error.message : "capability probe failed";
+    const notice = orchestration.observeCodexCapabilityUnavailable(
+      detail,
+      configuration.targetProject.path,
+    );
+    if (notice === "recorded") {
+      process.stderr.write(
+        "CMD_RIKER_CODEX_UNAVAILABLE: " +
+          `Codex 0.147.0 with expected ChatGPT identity for Target Project ` +
+          `${configuration.targetProject.path} is unavailable: ` +
+          `${detail}\n`,
+      );
+    }
+    return undefined;
+  }
+}
+
 function commitmentFingerprint(commitment: {
   state: string;
   condition?: { kind: string };
@@ -338,6 +417,10 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     [...legacyKeys, "modelFallbacks"],
     [...legacyKeys, "modelRequirements"],
     [...legacyKeys, "modelFallbacks", "modelRequirements"],
+    [...legacyKeys, "workerModelPolicy"],
+    [...legacyKeys, "modelFallbacks", "workerModelPolicy"],
+    [...legacyKeys, "modelRequirements", "workerModelPolicy"],
+    [...legacyKeys, "modelFallbacks", "modelRequirements", "workerModelPolicy"],
   ];
   if (!acceptedKeySets.some((keys) => isRecordWithKeys(value, keys))) {
     throw invalidConfiguration();
@@ -361,6 +444,9 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   const requirements = configuration.modelRequirements !== undefined
     ? parseModelRequirements(configuration.modelRequirements)
     : undefined;
+  const workerModelPolicy = configuration.workerModelPolicy !== undefined
+    ? parseWorkerModelPolicy(configuration.workerModelPolicy)
+    : undefined;
   try {
     assertSupportedModelSelection(selection);
     for (const fallback of parsedFallbacks ?? []) assertSupportedModelSelection(fallback);
@@ -373,6 +459,29 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     ...(parsedFallbacks ? { modelFallbacks: parsedFallbacks } : {}),
     ...(requirements ? { modelRequirements: requirements } : {}),
     modelPolicyRevision: configuration.modelPolicyRevision,
+    ...(workerModelPolicy ? { workerModelPolicy } : {}),
+  };
+}
+
+function parseWorkerModelPolicy(value: unknown): NonNullable<OwnerConfiguration["workerModelPolicy"]> {
+  if (!isRecordWithKeys(value, ["revision", "selection"])) throw invalidConfiguration();
+  if (
+    typeof value.revision !== "string" ||
+    !value.revision.trim() ||
+    !isRecordWithKeys(value.selection, ["provider", "model", "nativeHarness"]) ||
+    value.selection.provider !== "openai" ||
+    value.selection.model !== "gpt-5.6-sol" ||
+    value.selection.nativeHarness !== "codex"
+  ) {
+    throw invalidConfiguration();
+  }
+  return {
+    revision: value.revision,
+    selection: {
+      provider: value.selection.provider,
+      model: value.selection.model,
+      nativeHarness: value.selection.nativeHarness,
+    },
   };
 }
 

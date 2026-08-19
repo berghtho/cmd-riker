@@ -297,6 +297,14 @@ test("Owner CLI accepts an existing Pi OpenAI Codex login configuration", async 
         api: "openai-codex-responses",
       },
       modelPolicyRevision: "owner-policy-1",
+      workerModelPolicy: {
+        revision: "worker-policy-1",
+        selection: {
+          provider: "openai",
+          model: "gpt-5.6-sol",
+          nativeHarness: "codex",
+        },
+      },
     }),
   );
 
@@ -308,6 +316,14 @@ test("Owner CLI accepts an existing Pi OpenAI Codex login configuration", async 
     provider: "openai-codex",
     model: "gpt-5.4-mini",
     api: "openai-codex-responses",
+  });
+  assert.deepEqual(state.readOwnerConversation()?.workerModelPolicy, {
+    revision: "worker-policy-1",
+    selection: {
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      nativeHarness: "codex",
+    },
   });
   state.close();
 });

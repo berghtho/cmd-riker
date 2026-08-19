@@ -310,11 +310,6 @@ export function projectSessionView(
     });
   }
 
-  const materialCommitmentIds = new Set(
-    [...commitments.values()]
-      .filter((commitment) => Boolean(commitment.condition?.ownerAttention))
-      .map((commitment) => commitment.id),
-  );
   for (const worker of workers) {
     if (worker.state === "cancellation-requested") {
       const scopedUnknownEffects = worker.assignment.commitmentId
@@ -363,7 +358,6 @@ export function projectSessionView(
     if (
       !worker.ownerAttention ||
       recoveryOwnedWorkerIds.has(worker.id) ||
-      (worker.assignment.commitmentId && materialCommitmentIds.has(worker.assignment.commitmentId)) ||
       (linkedCommitment && isTerminalCommitment(linkedCommitment))
     ) {
       continue;

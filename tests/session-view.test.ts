@@ -273,6 +273,25 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
   }));
   assert.deepEqual(exhaustedSnapshot.exceptions.map((item) => item.id), ["worker-recovery:worker-1"]);
 
+  const independentlyBlockedCommitment = {
+    ...activeCommitment(),
+    condition: {
+      kind: "blocked" as const,
+      reason: "Trusted project evidence is unavailable.",
+      nextAction: "Restore the trusted evidence source.",
+      ownerAttention: "trusted-base-loss" as const,
+    },
+  };
+  const independentCauses = projectSessionView(fakeState({
+    workers: [exhaustedWorker],
+    attempts: [workerAttempt(exhaustedWorker, { status: "blocked" })],
+    commitments: [independentlyBlockedCommitment],
+  }));
+  assert.deepEqual(independentCauses.exceptions.map((item) => item.id), [
+    `commitment-blocked:${independentlyBlockedCommitment.id}`,
+    `worker-recovery:${exhaustedWorker.id}`,
+  ]);
+
   const recoveryWorker = workerSession({
     id: "worker-2",
     currentExecutionAttemptId: "attempt-2",

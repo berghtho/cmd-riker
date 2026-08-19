@@ -53,6 +53,7 @@ import {
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
 import {
   parseSessionViewControl,
+  parseSessionViewInspection,
   projectSessionView,
   renderSessionView,
   type SessionViewSnapshot,
@@ -352,6 +353,19 @@ async function completeOwnerInteraction(
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisor);
+  const inspection = parseSessionViewInspection(snapshot, ownerInput);
+  if (inspection) {
+    const detailedSnapshot = sessionViewSnapshot(
+      state,
+      workerSupervisor,
+      "available",
+      true,
+    );
+    return {
+      source: "Session View",
+      content: renderSessionView(detailedSnapshot, inspection.id),
+    };
+  }
   const action = parseSessionViewControl(snapshot, ownerInput);
   if (!action) {
     return {
@@ -397,10 +411,12 @@ function sessionViewSnapshot(
   state: AuthoritativeState,
   workerSupervisor?: WorkerSupervisor,
   leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
+  includeHealthAssessments = false,
 ): SessionViewSnapshot {
   return projectSessionView(state, {
     leadAvailability,
     cancellationAvailable: Boolean(workerSupervisor),
+    includeHealthAssessments,
   });
 }
 

@@ -181,28 +181,12 @@ async function main(): Promise<void> {
   try {
     let policyValidated = false;
     let conversation = state.readOwnerConversation();
-    if (!conversation) {
-      let configurationText: string;
-      try {
-        configurationText = await readFile(join(stateDirectory, "config.json"), "utf8");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new HostDiagnostic(
-            "CMD_RIKER_CONFIG_MISSING",
-            "Uninitialized state requires config.json in the state directory.",
-          );
-        }
-        throw error;
+    const configuration = await readStartupConfiguration(stateDirectory, !conversation);
+    if (configuration) {
+      if (!conversation) {
+        await validatePolicy(adapter, configuration);
+        policyValidated = true;
       }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(configurationText);
-      } catch {
-        throw invalidConfiguration();
-      }
-      const configuration = parseConfiguration(parsed);
-      await validatePolicy(adapter, configuration);
-      policyValidated = true;
       state.initialize(configuration);
       conversation = state.readOwnerConversation();
     }
@@ -830,6 +814,31 @@ async function readJsonFile(path: string): Promise<unknown> {
 
 async function readConfiguration(stateDirectory: string): Promise<OwnerConfiguration> {
   return parseConfiguration(await readJsonFile(join(stateDirectory, "config.json")));
+}
+
+async function readStartupConfiguration(
+  stateDirectory: string,
+  required: boolean,
+): Promise<OwnerConfiguration | undefined> {
+  let configurationText: string;
+  try {
+    configurationText = await readFile(join(stateDirectory, "config.json"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (!required) return undefined;
+      throw new HostDiagnostic(
+        "CMD_RIKER_CONFIG_MISSING",
+        "Uninitialized state requires config.json in the state directory.",
+      );
+    }
+    throw error;
+  }
+  try {
+    return parseConfiguration(JSON.parse(configurationText) as unknown);
+  } catch (error) {
+    if (error instanceof HostDiagnostic) throw error;
+    throw invalidConfiguration();
+  }
 }
 
 function recoveryFailure(error: unknown): HostDiagnostic {

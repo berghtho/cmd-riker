@@ -214,10 +214,10 @@ export function createForgeOperations(
 }
 
 export class ForgeAdapterError extends Error {
-  readonly kind: "unavailable" | "authentication" | "identity" | "target" | "capability" | "interactive";
+  readonly kind: "unavailable" | "authentication" | "identity" | "target" | "capability" | "interactive" | "timeout";
 
   constructor(
-    kind: "unavailable" | "authentication" | "identity" | "target" | "capability" | "interactive",
+    kind: "unavailable" | "authentication" | "identity" | "target" | "capability" | "interactive" | "timeout",
     message: string,
   ) {
     super(message);
@@ -532,6 +532,12 @@ async function executeGitHubMutation(
     retryRule: "Read back the exact remote comment identity before any retry.",
     status: "pending",
   };
+  let dispatchTimeout: number;
+  try {
+    dispatchTimeout = remainingTimeout(deadline);
+  } catch {
+    return recordUndispatchedGitHubTimeout(state, attempt);
+  }
   state.startForgeMutation(attempt, effectIntent);
   const claimedAt = new Date().toISOString();
   const runningAttempt: ForgeOperationAttempt = { ...attempt, status: "running" };
@@ -551,7 +557,7 @@ async function executeGitHubMutation(
       repository: request.operation.repository,
       issueNumber: request.operation.issueNumber,
       body: request.operation.body,
-      timeoutMs: remainingTimeout(deadline),
+      timeoutMs: dispatchTimeout,
     });
   } catch {
     return settleUnknownGitHubMutation(
@@ -694,13 +700,15 @@ function recordPreflightFailure(
   },
 ): ForgeOperationResult {
   const failure = classifyPreflightError(input.provider, input.error);
-  const action = recordOwnerAction(state, {
-    provider: input.provider,
-    detail: failure.detail,
-    nextAction: failure.nextAction,
-    expectedAccount: input.expectedAccount,
-    target: targetLabel(input.target),
-  });
+  const action = failure.ownerActionRequired
+    ? recordOwnerAction(state, {
+        provider: input.provider,
+        detail: failure.detail,
+        nextAction: failure.nextAction,
+        expectedAccount: input.expectedAccount,
+        target: targetLabel(input.target),
+      })
+    : undefined;
   const result: ForgeOperationResult = {
     operationAttemptId: input.operationAttemptId,
     commitmentId: input.commitmentId,
@@ -710,7 +718,7 @@ function recordPreflightFailure(
     evidence: [],
     diagnostics: [{ source: input.provider === "github" ? "gh-cli" : "az-cli", message: failure.detail }],
     uncertainty: null,
-    ownerAction: action,
+    ...(action ? { ownerAction: action } : {}),
     startedAt: input.startedAt,
     completedAt: new Date().toISOString(),
   };
@@ -757,6 +765,32 @@ function settleUnknownGitHubMutation(
     { ...attempt, status: "unknown", result },
     { ...effectIntent, status: "unknown" },
   );
+  return result;
+}
+
+function recordUndispatchedGitHubTimeout(
+  state: ForgeOperationState,
+  attempt: ForgeOperationAttempt,
+): ForgeOperationResult {
+  const { effectIntentId: _discardedEffectIntentId, ...unattributedAttempt } = attempt;
+  const result: ForgeOperationResult = {
+    operationAttemptId: attempt.id,
+    commitmentId: attempt.commitmentId,
+    operation: attempt.operation,
+    provider: "github",
+    status: "timed-out",
+    ...(attempt.capability ? { capability: attempt.capability } : {}),
+    evidence: [],
+    diagnostics: [{ source: "gh-cli", message: "The operation deadline expired before mutation dispatch." }],
+    uncertainty: null,
+    startedAt: attempt.startedAt,
+    completedAt: new Date().toISOString(),
+  };
+  state.appendForgeOperationAttemptSnapshots([{
+    ...unattributedAttempt,
+    status: "timed-out",
+    result,
+  }]);
   return result;
 }
 
@@ -817,7 +851,12 @@ function clearOwnerActions(
 function classifyPreflightError(
   provider: ForgeProvider,
   error: unknown,
-): { status: "rejected" | "unavailable"; detail: string; nextAction: string } {
+): {
+  status: "rejected" | "unavailable" | "timed-out";
+  detail: string;
+  nextAction: string;
+  ownerActionRequired: boolean;
+} {
   const kind = error instanceof ForgeAdapterError ? error.kind : "unavailable";
   const detail = error instanceof ForgeAdapterError
     ? error.message
@@ -829,13 +868,18 @@ function classifyPreflightError(
       ? `Authenticate ${executable} outside CMD Riker for the intended account, then retry.`
       : kind === "interactive"
         ? `Complete the required ${executable} interaction outside CMD Riker, then retry.`
+        : kind === "timeout"
+          ? `Retry the inspection with a fresh bounded attempt; no provider effect was dispatched.`
         : `Correct the intended ${provider} account, target, or capability outside CMD Riker, then retry.`;
   return {
-    status: kind === "unavailable" || kind === "authentication" || kind === "interactive"
-      ? "unavailable"
-      : "rejected",
+    status: kind === "timeout"
+      ? "timed-out"
+      : kind === "unavailable" || kind === "authentication" || kind === "interactive"
+        ? "unavailable"
+        : "rejected",
     detail,
     nextAction,
+    ownerActionRequired: kind !== "timeout",
   };
 }
 
@@ -902,7 +946,7 @@ function sha256(value: string): string {
 function remainingTimeout(deadline: number): number {
   const remaining = deadline - Date.now();
   if (remaining < 1) {
-    throw new ForgeAdapterError("interactive", "The Forge operation exceeded its non-interactive deadline.");
+    throw new ForgeAdapterError("timeout", "The Forge operation exceeded its deadline before dispatch.");
   }
   return remaining;
 }
@@ -948,7 +992,7 @@ async function runCli(
       if (settled) return;
       settled = true;
       child.kill();
-      reject(new ForgeAdapterError("interactive", `${provider === "github" ? "GitHub" : "Azure"} CLI exceeded its non-interactive deadline.`));
+      reject(new ForgeAdapterError("timeout", `${provider === "github" ? "GitHub" : "Azure"} CLI exceeded its operation deadline.`));
     }, timeoutMs);
     child.once("error", () => {
       if (settled) return;

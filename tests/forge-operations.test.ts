@@ -137,6 +137,66 @@ test("public GitHub mutation stops without an exact Standing Order grant", async
   assert.equal(dispatched, false);
 });
 
+test("deadline expiry before GitHub dispatch is a known no-effect timeout", async (t) => {
+  const { state, commitment, githubAuthorization } = await configuredState(t, "pre-dispatch-timeout");
+  let dispatched = false;
+  const github: GitHubCli = {
+    inspect: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return githubCapability();
+    },
+    createIssueComment: async () => {
+      dispatched = true;
+      return { id: "comment-42", url: "https://github.test/comment-42" };
+    },
+    readIssueComment: async () => assert.fail("read-back must not run"),
+  };
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-comment",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      body: "Deadline proof.",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 5,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
+  });
+
+  assert.equal(result.status, "timed-out");
+  assert.equal(result.uncertainty, null);
+  assert.equal(dispatched, false);
+  assert.equal(result.effectIntentId, undefined);
+  assert.equal(state.readEffectIntents().length, 0);
+});
+
+test("provider preflight timeout does not masquerade as an Owner authentication action", async (t) => {
+  const { state, commitment } = await configuredState(
+    t,
+    "azure-timeout",
+    "azure-subscription-inspection",
+  );
+  const azure: AzureCli = {
+    inspectSubscription: async () => {
+      throw new ForgeAdapterError("timeout", "Azure CLI exceeded its operation deadline.");
+    },
+  };
+  const result = await createForgeOperations(state, { azure }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "azure-subscription-inspection",
+      subscriptionId: "00000000-0000-0000-0000-000000000036",
+      expectedAccount: "owner@example.test",
+    },
+    timeoutMs: 1_000,
+  });
+
+  assert.equal(result.status, "timed-out");
+  assert.equal(result.ownerAction, undefined);
+  assert.equal(state.readForgeOwnerActionNotices().length, 0);
+});
+
 test("native CLI environment excludes ambient secret-bearing variables", () => {
   assert.deepEqual(nativeCliEnvironment({
     PATH: "C:\\tools",

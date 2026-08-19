@@ -305,6 +305,103 @@ test("production adapter delegates effectful work only through the bounded assig
   assert.equal(result.content, "The bounded implementation Worker Session is running.");
 });
 
+test("production adapter exposes typed Forge operations without provider commands", async (t) => {
+  let executed: unknown;
+  let firstRequest = "";
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      firstRequest = JSON.stringify(requestBody);
+      return {
+        toolCall: {
+          id: "github-comment-call-1",
+          name: "comment_on_github_issue",
+          arguments: {
+            commitmentId: "commitment-1",
+            issueNumber: 36,
+            body: "Typed Forge proof.",
+            actingAuthorityEffect: {
+              actingAuthorityId: "acting-1",
+              commitmentId: "commitment-1",
+              effectClass: "update",
+              target: "berghtho/cmd-riker#36",
+              reversible: true,
+              externallyBinding: true,
+              incrementalSpendUsd: 0,
+            },
+          },
+        },
+      };
+    }
+    return "The typed GitHub operation is recorded.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Record the GitHub proof.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    forgeActions: {
+      async commentOnGitHubIssue(input) {
+        executed = input;
+        return {
+          operationAttemptId: "forge-attempt-1",
+          effectIntentId: "forge-effect-1",
+          commitmentId: input.commitmentId,
+          operation: "github-issue-comment",
+          provider: "github",
+          status: "succeeded",
+          evidence: [{
+            source: "provider-readback",
+            reference: "https://github.test/comment-1",
+            summary: "The comment matched its attributed read-back.",
+            observedAt: "2026-08-19T20:00:00.000Z",
+          }],
+          diagnostics: [],
+          uncertainty: null,
+          startedAt: "2026-08-19T20:00:00.000Z",
+          completedAt: "2026-08-19T20:00:01.000Z",
+        };
+      },
+      async inspectAzureSubscription() {
+        throw new Error("not expected");
+      },
+    },
+  });
+
+  assert.deepEqual(executed, {
+    commitmentId: "commitment-1",
+    issueNumber: 36,
+    body: "Typed Forge proof.",
+  });
+  assert.match(firstRequest, /comment_on_github_issue/);
+  assert.match(firstRequest, /inspect_azure_subscription/);
+  assert.doesNotMatch(firstRequest, /gh api|az account/);
+  assert.equal(result.content, "The typed GitHub operation is recorded.");
+});
+
+test("production adapter exposes only configured Forge provider tools", async (t) => {
+  let request = "";
+  const localModel = await startLocalModel((_call, requestBody) => {
+    request = JSON.stringify(requestBody);
+    return "Azure inspection is available.";
+  });
+  t.after(() => localModel.close());
+
+  await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Inspect configured provider tools.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    forgeActions: {
+      async inspectAzureSubscription() {
+        throw new Error("not expected");
+      },
+    },
+  });
+
+  assert.match(request, /inspect_azure_subscription/);
+  assert.doesNotMatch(request, /comment_on_github_issue/);
+});
+
 function modelSelection(baseUrl: string): ModelSelection {
   return {
     provider: "local-openai",

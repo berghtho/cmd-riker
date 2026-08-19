@@ -25,6 +25,13 @@ An uninitialized state directory requires a secret-free `config.json`:
 ```json
 {
   "targetProject": { "path": "C:\\path\\to\\target-project" },
+  "forgeAuthorities": {
+    "github": { "account": "owner-login", "repository": "owner/repository" },
+    "azure": {
+      "account": "owner@example.com",
+      "subscriptionId": "00000000-0000-0000-0000-000000000000"
+    }
+  },
   "modelSelection": {
     "provider": "openai-codex",
     "model": "gpt-5.4-mini",
@@ -82,6 +89,13 @@ The Lead Model policy tries the configured default and then each fallback in ord
 must independently pass the configured capability, context, data-handling, cost, authentication,
 identity, and availability gates; an unknown or failed gate makes only that candidate ineligible. A
 fallback is attributed on the completed Lead turn together with the active policy revision.
+
+The Lead Agent also exposes two typed, non-interactive Forge operations: one GitHub issue-comment
+mutation through `gh`, and one Azure subscription inspection through `az`. Each adapter proves its
+executable, authenticated identity, intended target, and required capability before use. GitHub
+records durable effect intent before dispatch and succeeds only after an exact provider read-back;
+Azure remains read-only. CMD Riker never accepts or persists credential values. A missing CLI,
+authentication, or required interaction produces one deduplicated Owner action in the Session View.
 
 The Lead Agent can visibly accept bounded conversational work as a durable Commitment. CMD Riker
 records its `Committed -> Ready -> Active -> Verifying` history, verifies declared response

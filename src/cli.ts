@@ -51,6 +51,7 @@ import {
   type WorkerSupervisor,
 } from "./worker-supervisor/index.ts";
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
+import { createForgeOperations } from "./forge-operations/index.ts";
 import {
   parseSessionViewControl,
   parseSessionViewInspection,
@@ -180,29 +181,25 @@ async function main(): Promise<void> {
   try {
     let policyValidated = false;
     let conversation = state.readOwnerConversation();
-    if (!conversation) {
-      let configurationText: string;
-      try {
-        configurationText = await readFile(join(stateDirectory, "config.json"), "utf8");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new HostDiagnostic(
-            "CMD_RIKER_CONFIG_MISSING",
-            "Uninitialized state requires config.json in the state directory.",
-          );
-        }
-        throw error;
+    const configuration = await readStartupConfiguration(stateDirectory, !conversation);
+    if (configuration) {
+      if (!conversation) {
+        await validatePolicy(adapter, configuration);
+        policyValidated = true;
+        state.initialize(configuration);
+      } else {
+        const {
+          messages: _messages,
+          forgeAuthorities: _durableForgeAuthorities,
+          ...durableConfiguration
+        } = conversation;
+        state.initialize({
+          ...durableConfiguration,
+          ...(configuration.forgeAuthorities
+            ? { forgeAuthorities: configuration.forgeAuthorities }
+            : {}),
+        });
       }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(configurationText);
-      } catch {
-        throw invalidConfiguration();
-      }
-      const configuration = parseConfiguration(parsed);
-      await validatePolicy(adapter, configuration);
-      policyValidated = true;
-      state.initialize(configuration);
       conversation = state.readOwnerConversation();
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
@@ -611,6 +608,44 @@ async function completeOwnerTurn(
             return result;
           },
         },
+        forgeActions: {
+          ...(conversation.forgeAuthorities?.github ? { commentOnGitHubIssue: async (input, actingAuthorityEffect) => {
+            const authority = conversation.forgeAuthorities!.github!;
+            const authorization = orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect);
+            const result = await createForgeOperations(state).execute({
+              commitmentId: input.commitmentId,
+              operation: {
+                kind: "github-issue-comment",
+                repository: authority.repository,
+                issueNumber: input.issueNumber,
+                body: input.body,
+                expectedAccount: authority.account,
+              },
+              timeoutMs: 30_000,
+              actingAuthorityEffectAuthorization: {
+                actingAuthorityId: authorization.actingAuthorityId,
+                authorizationId: authorization.id,
+                standingOrderId: authorization.standingOrderId,
+              },
+            });
+            orchestration.observeForgeOperationResult(input.commitmentId, result);
+            return result;
+          } } : {}),
+          ...(conversation.forgeAuthorities?.azure ? { inspectAzureSubscription: async (commitmentId) => {
+            const authority = conversation.forgeAuthorities!.azure!;
+            const result = await createForgeOperations(state).execute({
+              commitmentId,
+              operation: {
+                kind: "azure-subscription-inspection",
+                subscriptionId: authority.subscriptionId,
+                expectedAccount: authority.account,
+              },
+              timeoutMs: 30_000,
+            });
+            orchestration.observeForgeOperationResult(commitmentId, result);
+            return result;
+          } } : {}),
+        },
       });
       state.appendLeadAgentMessage(turnId, response.content, {
         modelSelection,
@@ -793,6 +828,31 @@ async function readConfiguration(stateDirectory: string): Promise<OwnerConfigura
   return parseConfiguration(await readJsonFile(join(stateDirectory, "config.json")));
 }
 
+async function readStartupConfiguration(
+  stateDirectory: string,
+  required: boolean,
+): Promise<OwnerConfiguration | undefined> {
+  let configurationText: string;
+  try {
+    configurationText = await readFile(join(stateDirectory, "config.json"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (!required) return undefined;
+      throw new HostDiagnostic(
+        "CMD_RIKER_CONFIG_MISSING",
+        "Uninitialized state requires config.json in the state directory.",
+      );
+    }
+    throw error;
+  }
+  try {
+    return parseConfiguration(JSON.parse(configurationText) as unknown);
+  } catch (error) {
+    if (error instanceof HostDiagnostic) throw error;
+    throw invalidConfiguration();
+  }
+}
+
 function recoveryFailure(error: unknown): HostDiagnostic {
   if (error instanceof HostDiagnostic) return error;
   return new HostDiagnostic(
@@ -810,7 +870,7 @@ function invalidConfiguration(): HostDiagnostic {
 
 function parseConfiguration(value: unknown): OwnerConfiguration {
   const legacyKeys = ["targetProject", "modelSelection", "modelPolicyRevision"];
-  const acceptedKeySets = [
+  const baseKeySets = [
     legacyKeys,
     [...legacyKeys, "modelFallbacks"],
     [...legacyKeys, "modelRequirements"],
@@ -820,6 +880,7 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     [...legacyKeys, "modelRequirements", "workerModelPolicy"],
     [...legacyKeys, "modelFallbacks", "modelRequirements", "workerModelPolicy"],
   ];
+  const acceptedKeySets = baseKeySets.flatMap((keys) => [keys, [...keys, "forgeAuthorities"]]);
   if (!acceptedKeySets.some((keys) => isRecordWithKeys(value, keys))) {
     throw invalidConfiguration();
   }
@@ -845,6 +906,9 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   const workerModelPolicy = configuration.workerModelPolicy !== undefined
     ? parseWorkerModelPolicy(configuration.workerModelPolicy)
     : undefined;
+  const forgeAuthorities = configuration.forgeAuthorities !== undefined
+    ? parseForgeAuthorities(configuration.forgeAuthorities)
+    : undefined;
   try {
     assertSupportedModelSelection(selection);
     for (const fallback of parsedFallbacks ?? []) assertSupportedModelSelection(fallback);
@@ -853,11 +917,41 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   }
   return {
     targetProject: { path: targetProject.path },
+    ...(forgeAuthorities ? { forgeAuthorities } : {}),
     modelSelection: selection,
     ...(parsedFallbacks ? { modelFallbacks: parsedFallbacks } : {}),
     ...(requirements ? { modelRequirements: requirements } : {}),
     modelPolicyRevision: configuration.modelPolicyRevision,
     ...(workerModelPolicy ? { workerModelPolicy } : {}),
+  };
+}
+
+function parseForgeAuthorities(value: unknown): NonNullable<OwnerConfiguration["forgeAuthorities"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw invalidConfiguration();
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => key !== "github" && key !== "azure")) {
+    throw invalidConfiguration();
+  }
+  const github = record.github;
+  const azure = record.azure;
+  if (github !== undefined && (
+    !isRecordWithKeys(github, ["account", "repository"]) ||
+    typeof github.account !== "string" ||
+    typeof github.repository !== "string" ||
+    !github.account.trim() ||
+    !/^[^/\s]+\/[^/\s]+$/.test(github.repository)
+  )) throw invalidConfiguration();
+  if (azure !== undefined && (
+    !isRecordWithKeys(azure, ["account", "subscriptionId"]) ||
+    typeof azure.account !== "string" ||
+    typeof azure.subscriptionId !== "string" ||
+    !azure.account.trim() ||
+    !/^[0-9a-f-]{36}$/i.test(azure.subscriptionId)
+  )) throw invalidConfiguration();
+  if (github === undefined && azure === undefined) throw invalidConfiguration();
+  return {
+    ...(github ? { github: { account: github.account as string, repository: github.repository as string } } : {}),
+    ...(azure ? { azure: { account: azure.account as string, subscriptionId: azure.subscriptionId as string } } : {}),
   };
 }
 

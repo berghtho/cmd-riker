@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import type { ModelSelection } from "../model-selection.ts";
+import type { ForgeOperationAttempt, ForgeOperationResult } from "../forge-operations/index.ts";
 import { assertEffectEvidenceSupportsDisposition } from "../target-project-operations/index.ts";
 import type {
   EffectIntent,
   EffectReconciliation,
   TargetProjectOperationEffectIntent,
+  ForgeOperationEffectIntent,
   TargetProjectOperationAttempt,
   TargetProjectOperationRequest,
   TargetProjectOperationResult,
@@ -14,6 +16,10 @@ import type {
 
 export type OwnerConfiguration = {
   targetProject: { path: string };
+  forgeAuthorities?: {
+    github?: { account: string; repository: string };
+    azure?: { account: string; subscriptionId: string };
+  };
   modelSelection: ModelSelection;
   modelFallbacks?: ModelSelection[];
   modelRequirements?: LeadModelRequirements;
@@ -78,6 +84,12 @@ export type CommitmentCriterion =
       kind: "target-project-operation";
       description: string;
       operation: "test";
+    }
+  | {
+      id: string;
+      kind: "forge-operation";
+      description: string;
+      operation: ForgeOperationResult["operation"];
     };
 
 export type CommitmentState =
@@ -132,7 +144,7 @@ export type Commitment = {
       id: string;
       criterionId: string;
       description: string;
-      source: "lead-agent-response" | "target-project-operation-result";
+      source: "lead-agent-response" | "target-project-operation-result" | "forge-operation-result";
       operationAttemptId?: string;
     }>;
   };
@@ -177,6 +189,11 @@ export type CommitmentDraft = {
         kind: "target-project-operation";
         description: string;
         operation: "test";
+      }
+    | {
+        kind: "forge-operation";
+        description: string;
+        operation: ForgeOperationResult["operation"];
       }
   >;
 };
@@ -598,6 +615,12 @@ export interface OrchestrationState {
   appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
   appendCoordinationMessage(message: CoordinationMessage): void;
   readCoordinationMessages(): CoordinationMessage[];
+  settleForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  readForgeOperationAttempt(attemptId: string): ForgeOperationAttempt | undefined;
+  readForgeOperationAttempts(): ForgeOperationAttempt[];
   settleTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -695,6 +718,7 @@ export interface OrchestrationCore {
     commitmentId: string,
     result: TargetProjectOperationResult,
   ): void;
+  observeForgeOperationResult(commitmentId: string, result: ForgeOperationResult): void;
   observeWorkerVerificationResult(
     workerSessionId: string,
     executionAttemptId: string,
@@ -1229,6 +1253,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       assertValidatedLeadModelPolicy(policy, validations);
       state.replaceOwnerConfiguration({
         targetProject: existing.targetProject,
+        ...(existing.forgeAuthorities ? { forgeAuthorities: existing.forgeAuthorities } : {}),
         modelSelection: policy.default,
         modelFallbacks: policy.fallbacks,
         modelRequirements: policy.requirements,
@@ -1320,6 +1345,54 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
             { ...attempt, status: "failed", failureKind: "continuity-lost" },
           ]);
         }
+      }
+      for (const attempt of state.readForgeOperationAttempts()) {
+        if (!attempt.effectIntentId) continue;
+        const effectIntent = state.readEffectIntent(attempt.effectIntentId);
+        if (effectIntent?.kind !== "forge-operation") continue;
+        if (attempt.status === "ready" && effectIntent.status === "pending") {
+          const result: ForgeOperationResult = {
+            operationAttemptId: attempt.id,
+            effectIntentId: effectIntent.id,
+            commitmentId: attempt.commitmentId,
+            operation: attempt.operation,
+            provider: attempt.provider,
+            status: "rejected",
+            evidence: [],
+            diagnostics: [{ source: "host", message: "Host restart occurred before Forge dispatch." }],
+            uncertainty: null,
+            startedAt: attempt.startedAt,
+            completedAt: new Date().toISOString(),
+          };
+          state.settleForgeMutation(
+            { ...attempt, status: "rejected", result },
+            { ...effectIntent, status: "rejected" },
+          );
+          recordForgeOperationVerification(state, attempt.commitmentId, result, "blocked");
+          continue;
+        }
+        if (attempt.status !== "running" || effectIntent.status !== "dispatching") continue;
+        const result: ForgeOperationResult = {
+          operationAttemptId: attempt.id,
+          effectIntentId: effectIntent.id,
+          commitmentId: attempt.commitmentId,
+          operation: attempt.operation,
+          provider: attempt.provider,
+          status: "unknown",
+          evidence: [],
+          diagnostics: [{ source: "host", message: "Host restart lost Forge process continuity after dispatch." }],
+          uncertainty: {
+            reason: "Host restart lost continuity with the dispatched Forge mutation.",
+            nextAction: "Inspect the provider target for the exact intended effect before any retry.",
+          },
+          startedAt: attempt.startedAt,
+          completedAt: new Date().toISOString(),
+        };
+        state.settleForgeMutation(
+          { ...attempt, status: "unknown", result },
+          { ...effectIntent, status: "unknown" },
+        );
+        recordForgeOperationVerification(state, attempt.commitmentId, result, "reconciling");
       }
       for (const attempt of state.readTargetProjectOperationAttempts()) {
         const effectIntent = state.readEffectIntent(attempt.effectIntentId);
@@ -1509,6 +1582,15 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
 
     observeTargetProjectOperationResult(commitmentId, result) {
       recordTargetProjectOperationVerification(state, commitmentId, result, "blocked");
+    },
+
+    observeForgeOperationResult(commitmentId, result) {
+      recordForgeOperationVerification(
+        state,
+        commitmentId,
+        result,
+        result.status === "unknown" ? "reconciling" : "blocked",
+      );
     },
 
     observeWorkerVerificationResult(workerSessionId, executionAttemptId, result) {
@@ -2842,6 +2924,97 @@ function buildTargetProjectOperationVerification(
   return [verifying, settled];
 }
 
+function recordForgeOperationVerification(
+  state: OrchestrationState,
+  commitmentId: string,
+  result: ForgeOperationResult,
+  failureCondition: "blocked" | "reconciling",
+): void {
+  const commitment = state.readCommitment(commitmentId);
+  if (!commitment) throw new Error(`Unknown Commitment ${commitmentId}.`);
+  if (commitment.state !== "active" || commitment.condition) {
+    throw new Error(`Commitment ${commitmentId} cannot verify a Forge operation result.`);
+  }
+  if (result.commitmentId !== commitmentId) {
+    throw new Error("Forge operation result belongs to a different Commitment.");
+  }
+  const attempt = state.readForgeOperationAttempt(result.operationAttemptId);
+  const effectIntent = result.effectIntentId
+    ? state.readEffectIntent(result.effectIntentId)
+    : undefined;
+  const expectedEffectStatus = result.status === "succeeded"
+    ? "succeeded"
+    : result.status === "rejected" || result.status === "unavailable"
+      ? "rejected"
+      : "unknown";
+  const effectIsAttributed = result.effectIntentId
+    ? attempt?.effectIntentId === result.effectIntentId &&
+      effectIntent?.kind === "forge-operation" &&
+      effectIntent.forgeOperationAttemptId === attempt.id &&
+      effectIntent.commitmentId === commitmentId &&
+      effectIntent.status === expectedEffectStatus
+    : attempt?.effectIntentId === undefined && effectIntent === undefined;
+  if (
+    !attempt?.result ||
+    attempt.commitmentId !== commitmentId ||
+    attempt.operation !== result.operation ||
+    JSON.stringify(attempt.result) !== JSON.stringify(result) ||
+    !effectIsAttributed
+  ) {
+    throw new Error("Forge operation result is not the current attributed durable fact.");
+  }
+  const criteria = commitment.criteria.filter((criterion) => criterion.kind === "forge-operation");
+  if (
+    criteria.length !== commitment.criteria.length ||
+    criteria.some((criterion) => criterion.operation !== result.operation)
+  ) {
+    throw new Error("Commitment criteria do not match the Forge operation result.");
+  }
+  const passed = result.status === "succeeded" && result.uncertainty === null;
+  const verifying: Commitment = { ...commitment, state: "verifying" };
+  const verification = {
+    passed,
+    verifiedAt: new Date().toISOString(),
+    evidence: criteria.map((criterion) => ({
+      id: randomUUID(),
+      criterionId: criterion.id,
+      description: passed
+        ? `Forge operation ${result.operation} succeeded with attributed evidence.`
+        : result.uncertainty
+          ? `Forge operation ${result.operation} ended ${result.status} with unresolved uncertainty.`
+          : `Forge operation ${result.operation} was ${result.status} before a verified effect.`,
+      source: "forge-operation-result" as const,
+      operationAttemptId: result.operationAttemptId,
+    })),
+  };
+  const settled: Commitment = passed
+    ? {
+        ...verifying,
+        state: "accepted",
+        verification,
+        acceptance: {
+          authority: "lead-agent",
+          basis: "objective-criteria",
+          acceptedAt: new Date().toISOString(),
+        },
+      }
+    : {
+        ...verifying,
+        state: "active",
+        verification,
+        condition: {
+          kind: failureCondition,
+          reason: failureCondition === "reconciling"
+            ? "The Forge mutation effect is uncertain."
+            : "The Forge operation did not produce a certain successful result.",
+          nextAction: result.uncertainty?.nextAction ??
+            result.ownerAction?.nextAction ??
+            "Diagnose the Forge operation before retrying.",
+        },
+      };
+  state.appendCommitmentSnapshots([verifying, settled]);
+}
+
 function samePath(left: string, right: string): boolean {
   const normalizedLeft = resolve(left);
   const normalizedRight = resolve(right);
@@ -2881,6 +3054,10 @@ function validateCommitmentDraft(draft: CommitmentDraft): void {
   }
   if (draft.review && !hasOperationCriterion) {
     throw new Error("Independent Review currently requires a Target Project operation Commitment.");
+  }
+  const hasForgeCriterion = draft.criteria.some((criterion) => criterion.kind === "forge-operation");
+  if (hasForgeCriterion && draft.criteria.some((criterion) => criterion.kind !== "forge-operation")) {
+    throw new Error("A Forge operation Commitment cannot mix response criteria.");
   }
   if (draft.review && draft.review.reasons.length === 0) {
     throw new Error("A required independent Review must name a concrete reason.");

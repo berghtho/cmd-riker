@@ -37,8 +37,13 @@ import {
   assertExternalEffectEvidence,
 } from "../target-project-operations/index.ts";
 import type {
+  ForgeOperationAttempt,
+  ForgeOwnerActionNotice,
+} from "../forge-operations/index.ts";
+import type {
   EffectIntent,
   ExternalEffectEvidence,
+  ForgeOperationEffectIntent,
   TargetProjectOperationEffectIntent,
   TargetProjectOperationAttempt,
   WorkerAssignmentEffectIntent,
@@ -209,6 +214,24 @@ export interface AuthoritativeState {
   appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
   appendCoordinationMessage(message: CoordinationMessage): void;
   readCoordinationMessages(): CoordinationMessage[];
+  appendForgeOperationAttemptSnapshots(snapshots: ForgeOperationAttempt[]): void;
+  readForgeOperationAttempt(attemptId: string): ForgeOperationAttempt | undefined;
+  readForgeOperationAttempts(): ForgeOperationAttempt[];
+  startForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  claimForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  settleForgeMutation(
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+  ): void;
+  readForgeOwnerActionNotice(id: ForgeOwnerActionNotice["id"]): ForgeOwnerActionNotice | undefined;
+  readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
+  appendForgeOwnerActionNotice(notice: ForgeOwnerActionNotice): void;
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -264,6 +287,8 @@ type FactDraft =
   | { kind: "standing-order.snapshot"; value: StandingOrder }
   | { kind: "acting-authority.snapshot"; value: ActingAuthority }
   | { kind: "coordination-message.recorded"; value: CoordinationMessage }
+  | { kind: "forge-operation-attempt.snapshot"; value: ForgeOperationAttempt }
+  | { kind: "forge-owner-action-notice.snapshot"; value: ForgeOwnerActionNotice }
   | { kind: "target-project-operation-attempt.snapshot"; value: TargetProjectOperationAttempt }
   | { kind: "effect-intent.snapshot"; value: EffectIntent };
 
@@ -277,6 +302,7 @@ type JournalRow = {
 type TransitionKind =
   | "owner.configuration-recorded"
   | "owner.model-policy-activated"
+  | "owner.forge-authorities-reconfigured"
   | "owner-conversation.owner-message-recorded"
   | "owner-conversation.lead-agent-message-recorded"
   | `commitment.${Commitment["state"]}`
@@ -288,6 +314,8 @@ type TransitionKind =
   | `standing-order.${StandingOrder["state"]}`
   | `acting-authority.${ActingAuthority["state"]}`
   | "coordination-message.recorded"
+  | `forge-operation-attempt.${ForgeOperationAttempt["status"]}`
+  | `forge-owner-action-notice.${ForgeOwnerActionNotice["state"]}`
   | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
   | `effect-intent.${EffectIntent["status"]}`;
 
@@ -524,6 +552,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot"
       | "effect-intent.snapshot",
     subjectId: string,
   ): { id: string; value: T } | undefined => {
@@ -548,7 +578,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot",
+      | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot",
   ): T[] => {
     const rows = database
       .prepare(`
@@ -571,6 +603,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot"
       | "effect-intent.snapshot";
     subjectPrefix:
       | "worker-session"
@@ -578,6 +612,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice"
       | "effect-intent";
     transitionPrefix:
       | "worker-session"
@@ -585,6 +621,8 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice"
       | "effect-intent";
     snapshot: { id: string; state?: string; status?: string };
   };
@@ -644,19 +682,25 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot",
+      | "acting-authority.snapshot"
+      | "forge-operation-attempt.snapshot"
+      | "forge-owner-action-notice.snapshot",
     subjectPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority",
+      | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice",
     transitionPrefix:
       | "worker-session"
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority",
+      | "acting-authority"
+      | "forge-operation-attempt"
+      | "forge-owner-action-notice",
     snapshots: T[],
   ): void => {
     if (snapshots.length === 0) return;
@@ -789,6 +833,104 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       : undefined;
   };
 
+  const assertNoConflictingOpenEffect = (
+    effectIntent: EffectIntent,
+    message: string,
+  ): void => {
+    const conflict = database
+      .prepare(`
+        SELECT 1
+          FROM facts current
+         WHERE current.kind = 'effect-intent.snapshot'
+           AND (
+             COALESCE(
+               json_extract(current.value_json, '$.effectScopeKey'),
+               json_extract(current.value_json, '$.authorizedWriteRootKey'),
+               lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
+             ) = ?
+             OR json_extract(current.value_json, '$.commitmentId') = ?
+           )
+           AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         LIMIT 1
+      `)
+      .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
+    if (conflict) throw new Error(message);
+  };
+
+  const writeAttemptAndEffectSnapshots = (input: {
+    attempt: TargetProjectOperationAttempt | ForgeOperationAttempt;
+    attemptFactKind: "target-project-operation-attempt.snapshot" | "forge-operation-attempt.snapshot";
+    attemptSubjectPrefix: "target-project-operation-attempt" | "forge-operation-attempt";
+    attemptTransitionPrefix: "target-project-operation-attempt" | "forge-operation-attempt";
+    effectIntent: TargetProjectOperationEffectIntent | ForgeOperationEffectIntent;
+    predecessors?: { attemptId: string; effectIntentId: string };
+    beforeWrite?: () => void;
+  }): void => {
+    const recordedAt = new Date().toISOString();
+    const attemptFactId = randomUUID();
+    const effectFactId = randomUUID();
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      input.beforeWrite?.();
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          attemptFactId,
+          `${input.attemptSubjectPrefix}:${input.attempt.id}`,
+          input.attemptFactKind,
+          JSON.stringify(input.attempt),
+          input.predecessors?.attemptId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          `${input.attemptTransitionPrefix}.${input.attempt.status}`,
+          attemptFactId,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
+        `)
+        .run(
+          effectFactId,
+          `effect-intent:${input.effectIntent.id}`,
+          JSON.stringify(input.effectIntent),
+          input.predecessors?.effectIntentId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          `effect-intent.${input.effectIntent.status}`,
+          effectFactId,
+          recordedAt,
+        );
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
   const writeOperationAndEffect = (
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -802,12 +944,14 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     ) {
       throw new Error("Operation Attempt and effect intent attribution must match.");
     }
-    const recordedAt = new Date().toISOString();
-    const attemptFactId = randomUUID();
-    const effectFactId = randomUUID();
-    database.exec("BEGIN IMMEDIATE");
-    try {
-      if (rejectConflictingCommitmentEffect) {
+    writeAttemptAndEffectSnapshots({
+      attempt,
+      attemptFactKind: "target-project-operation-attempt.snapshot",
+      attemptSubjectPrefix: "target-project-operation-attempt",
+      attemptTransitionPrefix: "target-project-operation-attempt",
+      effectIntent,
+      ...(predecessors ? { predecessors } : {}),
+      ...(rejectConflictingCommitmentEffect ? { beforeWrite: () => {
         assertActingAuthorityDispatch(effectIntent, {
           effectClass: "test",
           target: attempt.operation,
@@ -815,77 +959,55 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
           externallyBinding: false,
           incrementalSpendUsd: 0,
         });
-        const conflict = database
-          .prepare(`
-            SELECT 1
-              FROM facts current
-             WHERE current.kind = 'effect-intent.snapshot'
-                AND (
-                  COALESCE(
-                    json_extract(current.value_json, '$.authorizedWriteRootKey'),
-                    lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
-                  ) = ?
-                  OR json_extract(current.value_json, '$.commitmentId') = ?
-                )
-               AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
-               AND NOT EXISTS (
-                 SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
-               )
-             LIMIT 1
-          `)
-          .get(effectIntent.authorizedWriteRootKey, effectIntent.commitmentId);
-        if (conflict) {
-          throw new Error("A conflicting Target Project effect is already open for this Commitment.");
-        }
-      }
-      database
-        .prepare(`
-          INSERT INTO facts (
-            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
-          ) VALUES (?, ?, 'target-project-operation-attempt.snapshot', ?, ?, ?)
-        `)
-        .run(
-          attemptFactId,
-          `target-project-operation-attempt:${attempt.id}`,
-          JSON.stringify(attempt),
-          predecessors?.attemptId ?? null,
-          recordedAt,
+        assertNoConflictingOpenEffect(
+          effectIntent,
+          "A conflicting Target Project effect is already open for this Commitment.",
         );
-      database
-        .prepare(`
-          INSERT INTO transitions (id, kind, fact_id, recorded_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(
-          randomUUID(),
-          `target-project-operation-attempt.${attempt.status}`,
-          attemptFactId,
-          recordedAt,
-        );
-      database
-        .prepare(`
-          INSERT INTO facts (
-            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
-          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
-        `)
-        .run(
-          effectFactId,
-          `effect-intent:${effectIntent.id}`,
-          JSON.stringify(effectIntent),
-          predecessors?.effectIntentId ?? null,
-          recordedAt,
-        );
-      database
-        .prepare(`
-          INSERT INTO transitions (id, kind, fact_id, recorded_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(randomUUID(), `effect-intent.${effectIntent.status}`, effectFactId, recordedAt);
-      database.exec("COMMIT");
-    } catch (error) {
-      database.exec("ROLLBACK");
-      throw error;
+      } } : {}),
+    });
+  };
+
+  const writeForgeOperationAndEffect = (
+    attempt: ForgeOperationAttempt,
+    effectIntent: ForgeOperationEffectIntent,
+    predecessors?: { attemptId: string; effectIntentId: string },
+    rejectConflict = false,
+  ): void => {
+    if (
+      attempt.effectIntentId !== effectIntent.id ||
+      effectIntent.forgeOperationAttemptId !== attempt.id ||
+      attempt.commitmentId !== effectIntent.commitmentId ||
+      attempt.provider !== effectIntent.provider
+    ) {
+      throw new Error("Forge Operation Attempt and effect intent attribution must match.");
     }
+    writeAttemptAndEffectSnapshots({
+      attempt,
+      attemptFactKind: "forge-operation-attempt.snapshot",
+      attemptSubjectPrefix: "forge-operation-attempt",
+      attemptTransitionPrefix: "forge-operation-attempt",
+      effectIntent,
+      ...(predecessors ? { predecessors } : {}),
+      ...(rejectConflict ? { beforeWrite: () => {
+        if (attempt.target.kind !== "github-issue") {
+          throw new Error("Only a typed GitHub target can dispatch a Forge mutation.");
+        }
+        if (!effectIntent.authorization.actingAuthority) {
+          throw new Error("Public GitHub effects require a bounded Standing Order authorization.");
+        }
+        assertActingAuthorityDispatch(effectIntent, {
+          effectClass: "update",
+          target: `${attempt.target.repository}#${attempt.target.issueNumber}`,
+          reversible: true,
+          externallyBinding: true,
+          incrementalSpendUsd: 0,
+        });
+        assertNoConflictingOpenEffect(
+          effectIntent,
+          "A conflicting effect is already open for this Forge target or Commitment.",
+        );
+      } } : {}),
+    });
   };
 
   return {
@@ -901,6 +1023,16 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       validateConfiguration(configuration);
       const existing = readConfigurationRow();
       if (existing) {
+        if (sameConfigurationExceptForgeAuthorities(existing.value, configuration)) {
+          if (JSON.stringify(existing.value.forgeAuthorities) !== JSON.stringify(configuration.forgeAuthorities)) {
+            appendFact(
+              { kind: "owner.configuration", value: configuration },
+              "owner.forge-authorities-reconfigured",
+              existing.id,
+            );
+          }
+          return;
+        }
         if (!sameConfiguration(existing.value, configuration)) {
           throw new Error("Authoritative state is already configured for a different Owner context.");
         }
@@ -1187,8 +1319,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
               SELECT 1
                 FROM facts current
                WHERE current.kind = 'effect-intent.snapshot'
-                 AND COALESCE(
-                   json_extract(current.value_json, '$.authorizedWriteRootKey'),
+                  AND COALESCE(
+                    json_extract(current.value_json, '$.effectScopeKey'),
+                    json_extract(current.value_json, '$.authorizedWriteRootKey'),
                    lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
                  ) = ?
                  AND (
@@ -1204,7 +1337,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
                  )
                LIMIT 1
             `)
-            .get(effectIntent.authorizedWriteRootKey);
+            .get(effectScopeKey(effectIntent));
           if (conflict) {
             throw new Error("A conflicting Target Project effect is already open for this Authorized Write Root.");
           }
@@ -1521,6 +1654,114 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
 
     readWorkerQuestions() {
       return readCurrentSnapshots<WorkerQuestion>("worker-question.snapshot");
+    },
+
+    appendForgeOperationAttemptSnapshots(snapshots) {
+      if (snapshots.some((snapshot) => snapshot.effectIntentId)) {
+        throw new Error("Mutating Forge attempts must be recorded atomically with their effect intent.");
+      }
+      appendSnapshots(
+        "forge-operation-attempt.snapshot",
+        "forge-operation-attempt",
+        "forge-operation-attempt",
+        snapshots,
+      );
+    },
+
+    readForgeOperationAttempt(attemptId) {
+      return readCurrentSnapshot<ForgeOperationAttempt>(
+        "forge-operation-attempt.snapshot",
+        `forge-operation-attempt:${attemptId}`,
+      )?.value;
+    },
+
+    readForgeOperationAttempts() {
+      return readCurrentSnapshots<ForgeOperationAttempt>("forge-operation-attempt.snapshot");
+    },
+
+    startForgeMutation(attempt, effectIntent) {
+      if (
+        readCurrentSnapshot(
+          "forge-operation-attempt.snapshot",
+          `forge-operation-attempt:${attempt.id}`,
+        ) ||
+        readEffectIntentRow(effectIntent.id)
+      ) {
+        throw new Error("Forge Operation Attempt and effect intent identities must be new.");
+      }
+      if (attempt.status !== "ready" || effectIntent.status !== "pending") {
+        throw new Error("A Forge mutation must record ready intent before dispatch.");
+      }
+      writeForgeOperationAndEffect(attempt, effectIntent, undefined, true);
+    },
+
+    claimForgeMutation(attempt, effectIntent) {
+      const currentAttempt = readCurrentSnapshot<ForgeOperationAttempt>(
+        "forge-operation-attempt.snapshot",
+        `forge-operation-attempt:${attempt.id}`,
+      );
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      if (!currentAttempt || !currentEffect) {
+        throw new Error("Cannot claim an unknown Forge mutation.");
+      }
+      if (currentAttempt.value.status !== "ready" || currentEffect.value.status !== "pending") {
+        throw new Error("Forge mutation is not ready for dispatch.");
+      }
+      if (attempt.status !== "running" || effectIntent.status !== "dispatching" || !effectIntent.lease) {
+        throw new Error("Forge dispatch claim requires a running attempt and durable effect lease.");
+      }
+      writeForgeOperationAndEffect(attempt, effectIntent, {
+        attemptId: currentAttempt.id,
+        effectIntentId: currentEffect.id,
+      });
+    },
+
+    settleForgeMutation(attempt, effectIntent) {
+      const currentAttempt = readCurrentSnapshot<ForgeOperationAttempt>(
+        "forge-operation-attempt.snapshot",
+        `forge-operation-attempt:${attempt.id}`,
+      );
+      const currentEffect = readEffectIntentRow(effectIntent.id);
+      if (!currentAttempt || !currentEffect) {
+        throw new Error("Cannot settle an unknown Forge mutation.");
+      }
+      const dispatched =
+        currentAttempt.value.status === "running" &&
+        currentEffect.value.status === "dispatching" &&
+        ["succeeded", "unknown"].includes(attempt.status) &&
+        ["succeeded", "unknown"].includes(effectIntent.status);
+      const undispatched =
+        currentAttempt.value.status === "ready" &&
+        currentEffect.value.status === "pending" &&
+        attempt.status === "rejected" &&
+        effectIntent.status === "rejected";
+      if (!dispatched && !undispatched) {
+        throw new Error("Forge mutation is not dispatching or has an invalid settlement.");
+      }
+      writeForgeOperationAndEffect(attempt, effectIntent, {
+        attemptId: currentAttempt.id,
+        effectIntentId: currentEffect.id,
+      });
+    },
+
+    readForgeOwnerActionNotice(id) {
+      return readCurrentSnapshot<ForgeOwnerActionNotice>(
+        "forge-owner-action-notice.snapshot",
+        `forge-owner-action-notice:${id}`,
+      )?.value;
+    },
+
+    readForgeOwnerActionNotices() {
+      return readCurrentSnapshots<ForgeOwnerActionNotice>("forge-owner-action-notice.snapshot");
+    },
+
+    appendForgeOwnerActionNotice(notice) {
+      appendSnapshots(
+        "forge-owner-action-notice.snapshot",
+        "forge-owner-action-notice",
+        "forge-owner-action-notice",
+        [notice],
+      );
     },
 
     startTargetProjectOperation(attempt, effectIntent) {
@@ -2227,6 +2468,8 @@ function ensureSchema(database: DatabaseSync): void {
         'standing-order.snapshot',
         'acting-authority.snapshot',
         'coordination-message.recorded',
+        'forge-operation-attempt.snapshot',
+        'forge-owner-action-notice.snapshot',
         'target-project-operation-attempt.snapshot',
         'effect-intent.snapshot'
       )),
@@ -2243,6 +2486,7 @@ function ensureSchema(database: DatabaseSync): void {
       kind TEXT NOT NULL CHECK (kind IN (
         'owner.configuration-recorded',
         'owner.model-policy-activated',
+        'owner.forge-authorities-reconfigured',
         'owner-conversation.owner-message-recorded',
         'owner-conversation.lead-agent-message-recorded',
         'commitment.committed',
@@ -2287,6 +2531,16 @@ function ensureSchema(database: DatabaseSync): void {
         'acting-authority.handoff-pending',
         'acting-authority.ended',
         'coordination-message.recorded',
+        'forge-operation-attempt.ready',
+        'forge-operation-attempt.running',
+        'forge-operation-attempt.succeeded',
+        'forge-operation-attempt.failed',
+        'forge-operation-attempt.timed-out',
+        'forge-operation-attempt.unknown',
+        'forge-operation-attempt.rejected',
+        'forge-operation-attempt.unavailable',
+        'forge-owner-action-notice.active',
+        'forge-owner-action-notice.cleared',
         'target-project-operation-attempt.running',
         'target-project-operation-attempt.ready',
         'target-project-operation-attempt.succeeded',
@@ -2343,9 +2597,13 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'standing-order.snapshot'") &&
     row.sql.includes("'acting-authority.snapshot'") &&
     row.sql.includes("'coordination-message.recorded'") &&
+    row.sql.includes("'forge-operation-attempt.snapshot'") &&
+    row.sql.includes("'forge-owner-action-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
+    transitionsRow.sql.includes("'owner.forge-authorities-reconfigured'") &&
+    transitionsRow.sql.includes("'forge-owner-action-notice.cleared'") &&
     transitionsRow.sql.includes("'effect-intent.reconciled'")
   ) {
     return;
@@ -2376,6 +2634,8 @@ function ensureSchema(database: DatabaseSync): void {
           'standing-order.snapshot',
           'acting-authority.snapshot',
           'coordination-message.recorded',
+          'forge-operation-attempt.snapshot',
+          'forge-owner-action-notice.snapshot',
           'target-project-operation-attempt.snapshot',
           'effect-intent.snapshot'
         )),
@@ -2390,6 +2650,7 @@ function ensureSchema(database: DatabaseSync): void {
         kind TEXT NOT NULL CHECK (kind IN (
           'owner.configuration-recorded',
           'owner.model-policy-activated',
+          'owner.forge-authorities-reconfigured',
           'owner-conversation.owner-message-recorded',
           'owner-conversation.lead-agent-message-recorded',
           'commitment.committed',
@@ -2434,6 +2695,16 @@ function ensureSchema(database: DatabaseSync): void {
           'acting-authority.handoff-pending',
           'acting-authority.ended',
           'coordination-message.recorded',
+          'forge-operation-attempt.ready',
+          'forge-operation-attempt.running',
+          'forge-operation-attempt.succeeded',
+          'forge-operation-attempt.failed',
+          'forge-operation-attempt.timed-out',
+          'forge-operation-attempt.unknown',
+          'forge-operation-attempt.rejected',
+          'forge-operation-attempt.unavailable',
+          'forge-owner-action-notice.active',
+          'forge-owner-action-notice.cleared',
           'target-project-operation-attempt.running',
           'target-project-operation-attempt.ready',
           'target-project-operation-attempt.succeeded',
@@ -2474,6 +2745,7 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
   const value = JSON.parse(valueJson) as OwnerConfiguration;
   return {
     targetProject: value.targetProject,
+    ...(value.forgeAuthorities ? { forgeAuthorities: value.forgeAuthorities } : {}),
     modelSelection: value.modelSelection,
     ...(Array.isArray(value.modelFallbacks) ? { modelFallbacks: value.modelFallbacks } : {}),
     ...(value.modelRequirements ? { modelRequirements: value.modelRequirements } : {}),
@@ -2483,6 +2755,20 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
 }
 
 function validateConfiguration(configuration: OwnerConfiguration): void {
+  const github = configuration.forgeAuthorities?.github;
+  if (
+    github &&
+    (!github.account.trim() || !/^[^/\s]+\/[^/\s]+$/.test(github.repository))
+  ) {
+    throw new Error("GitHub Forge authority requires an account and owner/repository target.");
+  }
+  const azure = configuration.forgeAuthorities?.azure;
+  if (
+    azure &&
+    (!azure.account.trim() || !/^[0-9a-f-]{36}$/i.test(azure.subscriptionId))
+  ) {
+    throw new Error("Azure Forge authority requires an account and subscription UUID.");
+  }
   assertSupportedModelSelection(configuration.modelSelection);
   for (const fallback of configuration.modelFallbacks ?? []) {
     assertSupportedModelSelection(fallback);
@@ -2500,11 +2786,12 @@ function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectInten
     left.kind !== right.kind ||
     left.commitmentId !== right.commitmentId ||
     left.expectedEffect !== right.expectedEffect ||
-    left.authorizedWriteRootKey !== right.authorizedWriteRootKey ||
+    effectScopeKey(left) !== effectScopeKey(right) ||
     left.retryRule !== right.retryRule ||
     left.authorization.kind !== right.authorization.kind ||
     left.authorization.commitmentId !== right.authorization.commitmentId ||
     left.authorization.targetProjectPath !== right.authorization.targetProjectPath ||
+    JSON.stringify(left.authorization.providerTarget) !== JSON.stringify(right.authorization.providerTarget) ||
     left.authorization.validatedAt !== right.authorization.validatedAt ||
     JSON.stringify(left.lease) !== JSON.stringify(right.lease)
   ) {
@@ -2517,12 +2804,29 @@ function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectInten
       JSON.stringify(left.causedByWorker) === JSON.stringify(right.causedByWorker)
     );
   }
+  if (left.kind === "forge-operation") {
+    return (
+      right.kind === "forge-operation" &&
+      left.forgeOperationAttemptId === right.forgeOperationAttemptId &&
+      left.provider === right.provider
+    );
+  }
   return (
     right.kind === "worker-assignment" &&
     left.workerSessionId === right.workerSessionId &&
     left.executionAttemptId === right.executionAttemptId &&
     left.verificationOperationAttemptId === right.verificationOperationAttemptId
   );
+}
+
+function effectScopeKey(effectIntent: EffectIntent): string {
+  const key = effectIntent.effectScopeKey ??
+    effectIntent.authorizedWriteRootKey ??
+    effectIntent.authorization.targetProjectPath?.toLowerCase();
+  if (key) return key;
+  const providerTarget = effectIntent.authorization.providerTarget;
+  if (providerTarget) return `${providerTarget.provider}:${providerTarget.resource}`;
+  throw new Error("An effect intent requires one durable scope key.");
 }
 
 function factSubject(input: FactDraft): string {
@@ -2550,6 +2854,10 @@ function factSubject(input: FactDraft): string {
       return `acting-authority:${input.value.id}`;
     case "coordination-message.recorded":
       return `coordination-message:${input.value.id}`;
+    case "forge-operation-attempt.snapshot":
+      return `forge-operation-attempt:${input.value.id}`;
+    case "forge-owner-action-notice.snapshot":
+      return `forge-owner-action-notice:${input.value.id}`;
     case "target-project-operation-attempt.snapshot":
       return `target-project-operation-attempt:${input.value.id}`;
     case "effect-intent.snapshot":
@@ -2558,6 +2866,21 @@ function factSubject(input: FactDraft): string {
 }
 
 function sameConfiguration(left: OwnerConfiguration, right: OwnerConfiguration): boolean {
+  return (
+    left.targetProject.path === right.targetProject.path &&
+    JSON.stringify(left.forgeAuthorities) === JSON.stringify(right.forgeAuthorities) &&
+    sameSelection(left.modelSelection, right.modelSelection) &&
+    sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
+    JSON.stringify(left.modelRequirements) === JSON.stringify(right.modelRequirements) &&
+    left.modelPolicyRevision === right.modelPolicyRevision &&
+    JSON.stringify(left.workerModelPolicy) === JSON.stringify(right.workerModelPolicy)
+  );
+}
+
+function sameConfigurationExceptForgeAuthorities(
+  left: OwnerConfiguration,
+  right: OwnerConfiguration,
+): boolean {
   return (
     left.targetProject.path === right.targetProject.path &&
     sameSelection(left.modelSelection, right.modelSelection) &&

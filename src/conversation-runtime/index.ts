@@ -36,6 +36,7 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import type { TargetProjectOperationResult } from "../target-project-operations/index.ts";
+import type { ForgeOperationResult } from "../forge-operations/index.ts";
 
 export type PiTurnRequest = {
   conversation: readonly ConversationMessage[];
@@ -66,6 +67,13 @@ export type PiTurnRequest = {
       operation: "test",
       actingAuthorityEffect?: ActingAuthorityEffectRequest,
     ): Promise<TargetProjectOperationResult>;
+  };
+  forgeActions?: {
+    commentOnGitHubIssue?(
+      input: { commitmentId: string; issueNumber: number; body: string },
+      actingAuthorityEffect: ActingAuthorityEffectRequest,
+    ): Promise<ForgeOperationResult>;
+    inspectAzureSubscription?(commitmentId: string): Promise<ForgeOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
   actingAuthority?: ActingAuthority;
@@ -313,6 +321,7 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       };
       const tools = [
         ...commitmentTools(request, mutationObserver),
+        ...forgeTools(request, mutationObserver),
         ...authorityTools(request, mutationObserver),
         ...workerTools(request, mutationObserver),
       ];
@@ -371,6 +380,12 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "cancel, or supersede instruction." +
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
            "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
+           (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.inspectAzureSubscription
+             ? " For a GitHub comment or Azure inspection, record one Commitment with the matching forge-operation criterion before calling its typed tool. " +
+               "Use typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
+               "A GitHub public comment additionally requires an exact active Standing Order authorization. " +
+               "Treat an unavailable result as one Owner action and do not retry blindly."
+             : "") +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
            (request.authorityActions
              ? "\nStanding Orders are created or revoked only from explicit Owner instructions. Silence never begins Acting Authority. " +
@@ -536,6 +551,74 @@ function unknownHardGates(): ModelCandidateValidation["hardGates"] {
   ) as ModelCandidateValidation["hardGates"];
 }
 
+function forgeTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  if (!request.forgeActions) return [];
+  const actions = request.forgeActions;
+  const tools: AgentTool[] = [];
+  if (actions.commentOnGitHubIssue) tools.push({
+      name: "comment_on_github_issue",
+      label: "Comment on GitHub Issue",
+      description:
+        "Create one bounded GitHub issue comment through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        issueNumber: Type.Integer({ minimum: 1 }),
+        body: Type.String({ minLength: 1, maxLength: 65_536 }),
+        actingAuthorityEffect: actingAuthorityEffectRequestSchema,
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, issueNumber, body, actingAuthorityEffect } = params as {
+          commitmentId: string;
+          issueNumber: number;
+          body: string;
+          actingAuthorityEffect: ActingAuthorityEffectRequest;
+        };
+        const result = await actions.commentOnGitHubIssue!(
+          { commitmentId, issueNumber, body },
+          actingAuthorityEffect,
+        );
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: forgeResultText(result) }],
+          details: result,
+        };
+      },
+    });
+  if (actions.inspectAzureSubscription) tools.push({
+      name: "inspect_azure_subscription",
+      label: "Inspect Azure Subscription",
+      description:
+        "Inspect one Azure subscription through the typed non-interactive adapter after proving executable, intended account, target, and read capability. No secret value is accepted or returned.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId } = params as { commitmentId: string };
+        const result = await actions.inspectAzureSubscription!(commitmentId);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: forgeResultText(result) }],
+          details: result,
+        };
+      },
+    });
+  return tools;
+}
+
+function forgeResultText(result: ForgeOperationResult): string {
+  const base = `${result.provider} operation attempt ${result.operationAttemptId} ended ${result.status}.`;
+  return result.ownerAction
+    ? `${base} Owner action: ${result.ownerAction.nextAction}`
+    : result.uncertainty
+      ? `${base} ${result.uncertainty.reason}`
+      : `${base} ${result.evidence.length} attributed evidence item(s).`;
+}
+
 const commitmentCriterionSchema = Type.Union([
   Type.Object({
     kind: Type.Literal("response-includes"),
@@ -549,6 +632,14 @@ const commitmentCriterionSchema = Type.Union([
     kind: Type.Literal("target-project-operation"),
     description: Type.String({ minLength: 1 }),
     operation: Type.Literal("test"),
+  }),
+  Type.Object({
+    kind: Type.Literal("forge-operation"),
+    description: Type.String({ minLength: 1 }),
+    operation: Type.Union([
+      Type.Literal("github-issue-comment"),
+      Type.Literal("azure-subscription-inspection"),
+    ]),
   }),
 ]);
 

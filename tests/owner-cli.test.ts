@@ -17,6 +17,7 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
       assert.match(serialized, /Keep this conversation\./);
       assert.match(serialized, /Pinned Pi turn 1\./);
       assert.match(serialized, /Continue after restart\./);
+      assert.match(serialized, /comment_on_github_issue/);
     }
     return `Pinned Pi turn ${call}.`;
   });
@@ -39,9 +40,42 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
   assert.equal(first.code, 0, first.stderr);
   assert.match(first.stdout, /Lead Agent: Pinned Pi turn 1\./);
 
+  const policyState = openAuthoritativeState(stateDirectory);
+  const durableConversation = policyState.readOwnerConversation();
+  assert.ok(durableConversation);
+  const { messages: _messages, ...durableConfiguration } = durableConversation;
+  policyState.replaceOwnerConfiguration({
+    ...durableConfiguration,
+    modelPolicyRevision: "owner-policy-2",
+  });
+  policyState.close();
+
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      forgeAuthorities: {
+        github: { account: "owner-login", repository: "owner/repository" },
+      },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: localModel.baseUrl,
+      },
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+
   const second = await runCli(stateDirectory, "Continue after restart.\n");
   assert.equal(second.code, 0, second.stderr);
   assert.match(second.stdout, /Lead Agent: Pinned Pi turn 2\./);
+  const state = openAuthoritativeState(stateDirectory);
+  assert.deepEqual(state.readOwnerConversation()?.forgeAuthorities, {
+    github: { account: "owner-login", repository: "owner/repository" },
+  });
+  assert.equal(state.readOwnerConversation()?.modelPolicyRevision, "owner-policy-2");
+  state.close();
 });
 
 test("Owner CLI carries one attributed Commitment to objective Acceptance", async (t) => {

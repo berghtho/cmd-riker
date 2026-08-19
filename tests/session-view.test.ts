@@ -335,6 +335,32 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
     commitments: [activeCommitment()],
   }));
   assert.deepEqual(owned.exceptions, []);
+
+  const promotedAndOwned = projectSessionView(fakeState({
+    workers: [exhaustedWorker, recoveryWorker],
+    attempts: [
+      workerAttempt(exhaustedWorker, { status: "blocked" }),
+      workerAttempt(recoveryWorker, { status: "running" }),
+    ],
+    commitments: [promotedRecovery],
+  }));
+  assert.deepEqual(promotedAndOwned.exceptions, []);
+
+  const completedRecoveryWorker = workerSession({
+    ...recoveryWorker,
+    state: "completed",
+  });
+  const ownershipEnded = projectSessionView(fakeState({
+    workers: [exhaustedWorker, completedRecoveryWorker],
+    attempts: [
+      workerAttempt(exhaustedWorker, { status: "blocked" }),
+      workerAttempt(completedRecoveryWorker, { status: "completed" }),
+    ],
+    commitments: [promotedRecovery],
+  }));
+  assert.deepEqual(ownershipEnded.exceptions.map((item) => item.id), [
+    `commitment-blocked:${promotedRecovery.id}`,
+  ]);
 });
 
 test("only explicitly Owner-reserved Worker questions enter attention", () => {

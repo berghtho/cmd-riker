@@ -228,6 +228,12 @@ export function projectSessionView(
 
   for (const commitment of commitments.values()) {
     if (isTerminalCommitment(commitment) || pausedCommitments.has(commitment.id)) continue;
+    if (
+      commitment.condition?.ownerAttentionCause?.kind === "worker-recovery-exhausted" &&
+      recoveryOwnedWorkerIds.has(commitment.condition.ownerAttentionCause.workerSessionId)
+    ) {
+      continue;
+    }
     if (commitment.state === "awaiting-acceptance" && !commitment.condition?.ownerAttention) {
       const exceptionId = `owner-decision:${commitment.id}`;
       exceptions.push({

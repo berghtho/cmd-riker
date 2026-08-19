@@ -5,14 +5,16 @@ import type {
   CapabilityNotice,
   Commitment,
   WorkerExecutionAttempt,
-  WorkerQuestion,
   WorkerSession,
 } from "../src/orchestration-core/index.ts";
 import {
+  createHealthAssessment,
   parseSessionViewControl,
   parseSessionViewInspection,
+  parseSessionViewWorkerInspection,
   projectSessionView,
   renderSessionView,
+  renderSessionWorkers,
   type SessionViewState,
 } from "../src/session-view/index.ts";
 import type { EffectIntent } from "../src/target-project-operations/index.ts";
@@ -61,6 +63,7 @@ test("uncertain effects expose scoped evidence, freshness, unknowns, and recover
       reference: `effect-intent:${effect.id}`,
       summary: "Authoritative effect status is unknown.",
       observedAt: "2026-08-19T10:00:00.000Z",
+      bearing: "supports",
     }],
     freshness: {
       assessedAt: "2026-08-19T10:01:00.000Z",
@@ -95,22 +98,25 @@ test("resolved effects and completed cancellations remove their exceptions", () 
   assert.deepEqual(snapshot.exceptions, []);
 });
 
-test("pause and cancel controls appear only for meaningful supported interventions", () => {
-  const worker = workerSession({ state: "waiting-question" });
+test("pause and cancel controls appear only in selected supported Worker details", () => {
+  const worker = workerSession({ state: "running" });
   const attempt = workerAttempt(worker, {
     status: "running",
     capabilities: capabilities({ cancellation: true }),
   });
-  const question = workerQuestion(worker);
   const commitment = activeCommitment();
-  const state = fakeState({ workers: [worker], attempts: [attempt], questions: [question], commitments: [commitment] });
+  const state = fakeState({ workers: [worker], attempts: [attempt], commitments: [commitment] });
   const snapshot = projectSessionView(state);
-  const exception = snapshot.exceptions[0];
+  const detail = snapshot.workers[0];
 
-  assert(exception);
-  assert.deepEqual(exception.actions.map((action) => action.kind), ["pause", "cancel"]);
-  assert.equal(parseSessionViewControl(snapshot, exception.actions[0]!.command)?.targetId, commitment.id);
-  assert.equal(parseSessionViewControl(snapshot, exception.actions[1]!.command)?.targetId, worker.id);
+  assert(detail);
+  assert.deepEqual(detail.actions.map((action) => action.kind), ["pause", "cancel"]);
+  assert.equal(parseSessionViewControl(snapshot, detail.actions[0]!.command)?.targetId, commitment.id);
+  assert.equal(parseSessionViewControl(snapshot, detail.actions[1]!.command)?.targetId, worker.id);
+  assert.doesNotMatch(renderSessionView(snapshot), /Controls:/);
+  const selected = parseSessionViewWorkerInspection(snapshot, `/session inspect worker:${worker.id}`);
+  assert(selected);
+  assert.match(renderSessionWorkers(snapshot, selected.id), /Controls:.*pause.*cancel/);
 
   const unsupportedAttempt = workerAttempt(worker, {
     status: "running",
@@ -120,10 +126,9 @@ test("pause and cancel controls appear only for meaningful supported interventio
   const unsupported = projectSessionView(fakeState({
     workers: [worker],
     attempts: [unsupportedAttempt],
-    questions: [question],
     commitments: [pausedCommitment],
   }));
-  assert.deepEqual(unsupported.exceptions[0]?.actions, []);
+  assert.deepEqual(unsupported.workers[0]?.actions, []);
 });
 
 test("active capability loss is scoped and clears with its authoritative fact", () => {
@@ -177,16 +182,15 @@ test("a recorded pause replaces its question with one incomplete-pause exception
   const snapshot = projectSessionView(fakeState({
     workers: [worker],
     attempts: [attempt],
-    questions: [workerQuestion(worker)],
     commitments: [commitment],
   }));
 
   assert.deepEqual(snapshot.exceptions.map((item) => item.kind), ["pause-incomplete"]);
   assert.deepEqual(snapshot.exceptions[0]?.actions.map((action) => action.kind), ["cancel"]);
-  assert.match(snapshot.exceptions[0]?.unknowns.join(" ") ?? "", /Worker.*effects.*unsettled/);
+  assert.match(snapshot.exceptions[0]?.unknowns.join(" ") ?? "", /Worker.*ceased.*not established/);
 });
 
-test("historical Worker failures do not remain after recovery or terminal Commitment resolution", () => {
+test("a blocked Commitment remains visible until authoritative recovery resolves it", () => {
   const failed = workerSession({ state: "failed" });
   const replacement = workerSession({
     id: "worker-2",
@@ -208,7 +212,7 @@ test("historical Worker failures do not remain after recovery or terminal Commit
     attempts: [failedAttempt, replacementAttempt],
     commitments: [blockedCommitment],
   }));
-  assert.deepEqual(recovered.exceptions, []);
+  assert.deepEqual(recovered.exceptions.map((item) => item.kind), ["relevant-failure"]);
 
   const accepted = { ...activeCommitment(), state: "accepted" as const };
   const resolved = projectSessionView(fakeState({
@@ -219,10 +223,53 @@ test("historical Worker failures do not remain after recovery or terminal Commit
   assert.deepEqual(resolved.exceptions, []);
 });
 
+test("reserved Owner decisions and non-Worker failures are material Commitment exceptions", () => {
+  const awaiting = { ...activeCommitment(), state: "awaiting-acceptance" as const };
+  const awaitingSnapshot = projectSessionView(fakeState({ commitments: [awaiting] }));
+  assert.deepEqual(awaitingSnapshot.exceptions.map((item) => item.kind), ["reserved-owner-decision"]);
+  assert.deepEqual(awaitingSnapshot.exceptions[0]?.actions.map((action) => action.targetKind), ["commitment"]);
+
+  const blocked = {
+    ...activeCommitment(),
+    condition: {
+      kind: "blocked" as const,
+      reason: "Lead turn failed.",
+      nextAction: "Retry with changed evidence.",
+    },
+  };
+  const blockedSnapshot = projectSessionView(fakeState({ commitments: [blocked] }));
+  assert.deepEqual(blockedSnapshot.exceptions.map((item) => item.kind), ["relevant-failure"]);
+  assert.equal(blockedSnapshot.exceptions[0]?.healthAssessment?.verdict, "unknown");
+});
+
+test("conflicting health evidence forces an unknown verdict", () => {
+  const health = createHealthAssessment({
+    subject: { kind: "worker-capability", id: "codex-worker", label: "Codex Worker capability" },
+    scope: { kind: "target-project", id: "configured-target-project", label: "Configured Target Project" },
+    evidence: [
+      {
+        reference: "probe:unavailable",
+        summary: "Probe failed.",
+        observedAt: "2026-08-19T10:00:00.000Z",
+        bearing: "supports",
+      },
+      {
+        reference: "probe:available",
+        summary: "A concurrent probe succeeded.",
+        observedAt: "2026-08-19T10:00:10.000Z",
+        bearing: "conflicts",
+      },
+    ],
+    assessedAt: "2026-08-19T10:00:20.000Z",
+    verdict: "unavailable",
+  });
+  assert.equal(health.freshness.status, "current");
+  assert.equal(health.verdict, "unknown");
+});
+
 function fakeState(input: {
   workers?: WorkerSession[];
   attempts?: WorkerExecutionAttempt[];
-  questions?: WorkerQuestion[];
   effects?: EffectIntent[];
   commitments?: Commitment[];
   capability?: CapabilityNotice;
@@ -232,7 +279,6 @@ function fakeState(input: {
   return {
     readWorkerSessions: () => input.workers ?? [],
     readWorkerExecutionAttempt: (id) => attempts.get(id),
-    readWorkerQuestions: () => input.questions ?? [],
     readEffectIntents: () => input.effects ?? [],
     readCommitments: () => input.commitments ?? [],
     readCommitment: (id) => commitments.get(id),
@@ -294,18 +340,6 @@ function workerEffect(
     status: "unknown",
     ...overrides,
   } as EffectIntent;
-}
-
-function workerQuestion(worker: WorkerSession): WorkerQuestion {
-  return {
-    id: "question-1",
-    workerSessionId: worker.id,
-    executionAttemptId: worker.currentExecutionAttemptId,
-    providerRequestId: "request-1",
-    itemId: "item-1",
-    questions: [{ id: "q1", question: "Choose.", isOther: false }],
-    status: "open",
-  };
 }
 
 function activeCommitment(): Commitment {

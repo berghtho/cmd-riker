@@ -2,7 +2,6 @@ import type {
   CapabilityNotice,
   Commitment,
   WorkerExecutionAttempt,
-  WorkerQuestion,
   WorkerSession,
 } from "../orchestration-core/index.ts";
 import type { EffectIntent } from "../target-project-operations/index.ts";
@@ -24,7 +23,12 @@ export type SessionViewScope = {
 export type HealthAssessment = {
   subject: SessionViewSubject;
   scope: SessionViewScope;
-  evidence: Array<{ reference: string; summary: string; observedAt: string | null }>;
+  evidence: Array<{
+    reference: string;
+    summary: string;
+    observedAt: string | null;
+    bearing: "supports" | "conflicts";
+  }>;
   freshness: {
     assessedAt: string;
     newestEvidenceObservedAt: string | null;
@@ -44,11 +48,11 @@ export type SessionViewAction = {
 export type SessionViewException = {
   id: string;
   kind:
-    | "owner-question"
+    | "reserved-owner-decision"
     | "pause-incomplete"
     | "uncertain-effect"
     | "cancellation-incomplete"
-    | "worker-impaired"
+    | "relevant-failure"
     | "capability-unavailable";
   subject: SessionViewSubject;
   scope: SessionViewScope;
@@ -59,16 +63,24 @@ export type SessionViewException = {
   actions: SessionViewAction[];
 };
 
+export type SessionViewWorker = {
+  id: string;
+  subject: SessionViewSubject;
+  scope: SessionViewScope;
+  state: WorkerSession["state"];
+  actions: SessionViewAction[];
+};
+
 export type SessionViewSnapshot = {
   leadAvailability: "available" | "responding";
   activeWorkerCount: number;
+  workers: SessionViewWorker[];
   exceptions: SessionViewException[];
 };
 
 export interface SessionViewState {
   readWorkerSessions(): WorkerSession[];
   readWorkerExecutionAttempt(attemptId: string): WorkerExecutionAttempt | undefined;
-  readWorkerQuestions(): WorkerQuestion[];
   readEffectIntents(): EffectIntent[];
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
@@ -96,19 +108,42 @@ export function projectSessionView(
   );
   const workerById = new Map(workers.map((worker) => [worker.id, worker]));
   const commitments = new Map(state.readCommitments().map((item) => [item.id, item]));
-  const latestWorkerByCommitment = new Map<string, WorkerSession>();
+  const unsettledWorkerByCommitment = new Map<string, WorkerSession>();
   for (const worker of workers) {
-    if (worker.assignment.commitmentId) {
-      latestWorkerByCommitment.set(worker.assignment.commitmentId, worker);
+    if (worker.assignment.commitmentId && !isTerminalWorker(worker)) {
+      unsettledWorkerByCommitment.set(worker.assignment.commitmentId, worker);
     }
   }
+  const unknownEffectCommitments = new Set(
+    state.readEffectIntents()
+      .filter((effect) => effect.status === "unknown")
+      .map((effect) => effect.commitmentId),
+  );
+  const visibleWorkers = workers
+    .filter((worker) => !isTerminalWorker(worker))
+    .map((worker) => ({
+      id: worker.id,
+      subject: workerSubject(worker),
+      scope: workerScope(worker),
+      state: worker.state,
+      actions: workerInterventionActions(
+        state,
+        worker,
+        attempts.get(worker.currentExecutionAttemptId),
+        `worker:${worker.id}`,
+        cancellationAvailable,
+      ),
+    }));
   const exceptions: SessionViewException[] = [];
   const pausedCommitments = new Set<string>();
 
   for (const commitment of commitments.values()) {
     if (commitment.condition?.kind !== "paused" || isTerminalCommitment(commitment)) continue;
     pausedCommitments.add(commitment.id);
-    const worker = latestWorkerByCommitment.get(commitment.id);
+    const worker = unsettledWorkerByCommitment.get(commitment.id);
+    const workerUnsettled = Boolean(worker && !isTerminalWorker(worker));
+    const effectUnsettled = unknownEffectCommitments.has(commitment.id);
+    if (!workerUnsettled && !effectUnsettled) continue;
     const attempt = worker ? attempts.get(worker.currentExecutionAttemptId) : undefined;
     const exceptionId = `pause:${commitment.id}`;
     exceptions.push({
@@ -117,61 +152,62 @@ export function projectSessionView(
       subject: commitmentSubject(commitment),
       scope: commitmentScope(commitment.id),
       knownFacts: ["The Owner pause is durably recorded for this Commitment."],
-      unknowns: worker && !isTerminalWorker(worker)
-        ? ["The linked Worker and any existing effects remain separate, unsettled facts."]
-        : [],
+      unknowns: [
+        ...(workerUnsettled ? ["Whether the linked Worker has ceased is not established."] : []),
+        ...(effectUnsettled ? ["Whether at least one expected effect was applied."] : []),
+      ],
       recoveryConditions: [
         "Resume or cancel through the Owner conversation; reconcile any uncertain effect before replay.",
       ],
       actions: worker
-        ? interventionActions(state, worker, attempt, exceptionId, cancellationAvailable)
+        ? workerInterventionActions(state, worker, attempt, exceptionId, cancellationAvailable)
         : [],
     });
   }
 
-  for (const question of state.readWorkerQuestions()) {
-    if (question.status !== "open" && question.status !== "answer-recorded") continue;
-    const worker = workerById.get(question.workerSessionId);
-    const commitment = worker?.assignment.commitmentId
-      ? commitments.get(worker.assignment.commitmentId)
-      : undefined;
-    if (
-      !worker ||
-      worker.state !== "waiting-question" ||
-      !commitment ||
-      pausedCommitments.has(commitment.id) ||
-      !commitment.criteria.some((criterion) => criterion.kind === "owner-judgment")
-    ) {
+  for (const commitment of commitments.values()) {
+    if (isTerminalCommitment(commitment) || pausedCommitments.has(commitment.id)) continue;
+    if (commitment.state === "awaiting-acceptance") {
+      const exceptionId = `owner-decision:${commitment.id}`;
+      exceptions.push({
+        id: exceptionId,
+        kind: "reserved-owner-decision",
+        subject: commitmentSubject(commitment),
+        scope: commitmentScope(commitment.id),
+        knownFacts: ["Objective work is complete and this Commitment reserves Acceptance to the Owner."],
+        unknowns: ["The Owner Acceptance verdict is not recorded."],
+        recoveryConditions: ["Accept, cancel, or supersede through the Owner conversation."],
+        actions: [commitmentCancelAction(commitment.id, exceptionId)],
+      });
       continue;
     }
-    const exceptionId = `worker-question:${question.id}`;
+    if (commitment.condition?.kind !== "blocked") continue;
+    const exceptionId = `commitment-blocked:${commitment.id}`;
     exceptions.push({
       id: exceptionId,
-      kind: "owner-question",
-      subject: workerSubject(worker),
+      kind: "relevant-failure",
+      subject: commitmentSubject(commitment),
       scope: commitmentScope(commitment.id),
-      knownFacts: [
-        question.status === "answer-recorded"
-          ? "An Owner answer is durably recorded for a reserved native Worker question."
-          : "A reserved Owner decision is waiting in a native Worker question.",
-      ],
-      unknowns: [
-        question.status === "answer-recorded"
-          ? "Delivery to the current Worker execution is not yet established."
-          : "The Owner decision has not yet been bound to the Worker question.",
-      ],
-      recoveryConditions: [
-        question.status === "answer-recorded"
-          ? "Deliver the recorded answer to the current Worker execution."
-          : "Answer the reserved decision through the Owner conversation.",
-      ],
-      actions: interventionActions(
-        state,
-        worker,
-        attempts.get(worker.currentExecutionAttemptId),
-        exceptionId,
-        cancellationAvailable,
-      ),
+      knownFacts: ["A current Commitment is authoritatively blocked."],
+      unknowns: ["Fresh, timestamped cause evidence is not available in this projection."],
+      recoveryConditions: ["Ask the Lead Agent to diagnose the named Commitment before retrying."],
+      ...(includeHealth
+        ? {
+            healthAssessment: createHealthAssessment({
+              subject: commitmentSubject(commitment),
+              scope: commitmentScope(commitment.id),
+              evidence: [{
+                reference: `commitment:${commitment.id}`,
+                summary: "Authoritative Commitment condition is blocked.",
+                observedAt: null,
+                bearing: "supports",
+              }],
+              assessedAt,
+              verdict: "impaired",
+            }),
+          }
+        : {}),
+      actions: [commitmentCancelAction(commitment.id, exceptionId)],
     });
   }
 
@@ -191,13 +227,14 @@ export function projectSessionView(
       recoveryConditions: [effect.retryRule],
       ...(includeHealth
         ? {
-            healthAssessment: assessment({
+            healthAssessment: createHealthAssessment({
               subject: effectSubject(effect.id),
               scope: commitmentScope(effect.commitmentId),
               evidence: [{
                 reference: `effect-intent:${effect.id}`,
                 summary: "Authoritative effect status is unknown.",
                 observedAt: effect.lease?.claimedAt ?? null,
+                bearing: "supports",
               }],
               assessedAt,
               verdict: "unknown",
@@ -205,7 +242,7 @@ export function projectSessionView(
           }
         : {}),
       actions: worker
-        ? interventionActions(
+        ? workerInterventionActions(
             state,
             worker,
             attempts.get(worker.currentExecutionAttemptId),
@@ -233,13 +270,14 @@ export function projectSessionView(
         ],
         ...(includeHealth
           ? {
-              healthAssessment: assessment({
+              healthAssessment: createHealthAssessment({
                 subject: workerSubject(worker),
                 scope: workerScope(worker),
                 evidence: [{
                   reference: `worker-session:${worker.id}`,
                   summary: "Cancellation intent is recorded; cessation is unsettled.",
                   observedAt: worker.cancellation?.requestedAt ?? null,
+                  bearing: "supports",
                 }],
                 assessedAt,
                 verdict: "unknown",
@@ -248,46 +286,7 @@ export function projectSessionView(
           : {}),
         actions: [],
       });
-      continue;
     }
-    const commitmentId = worker.assignment.commitmentId;
-    const commitment = commitmentId ? commitments.get(commitmentId) : undefined;
-    if (
-      (worker.state !== "failed" && worker.state !== "blocked") ||
-      !commitment ||
-      commitment.condition?.kind !== "blocked" ||
-      isTerminalCommitment(commitment) ||
-      latestWorkerByCommitment.get(commitment.id)?.id !== worker.id
-    ) {
-      continue;
-    }
-    exceptions.push({
-      id: `worker-impaired:${worker.id}`,
-      kind: "worker-impaired",
-      subject: workerSubject(worker),
-      scope: commitmentScope(commitment.id),
-      knownFacts: [
-        `The authoritative Worker state is ${worker.state} and its Commitment is blocked.`,
-      ],
-      unknowns: ["No fresh, timestamped failure evidence is available in this projection."],
-      recoveryConditions: [commitment.condition.nextAction],
-      ...(includeHealth
-        ? {
-            healthAssessment: assessment({
-              subject: workerSubject(worker),
-              scope: commitmentScope(commitment.id),
-              evidence: [{
-                reference: `worker-session:${worker.id}`,
-                summary: `Authoritative Worker state is ${worker.state}.`,
-                observedAt: null,
-              }],
-              assessedAt,
-              verdict: "impaired",
-            }),
-          }
-        : {}),
-      actions: [],
-    });
   }
 
   const capability = state.readCapabilityNotice("codex-worker");
@@ -302,13 +301,14 @@ export function projectSessionView(
       recoveryConditions: ["Prove the expected native identity and capability available again."],
       ...(includeHealth
         ? {
-            healthAssessment: assessment({
+            healthAssessment: createHealthAssessment({
               subject: capabilitySubject(capability.id),
               scope: targetProjectScope(),
               evidence: [{
                 reference: `capability-notice:${capability.id}`,
                 summary: "Capability probe recorded an unavailable result.",
                 observedAt: capability.observedAt,
+                bearing: "supports",
               }],
               assessedAt,
               verdict: "unavailable",
@@ -321,7 +321,8 @@ export function projectSessionView(
 
   return {
     leadAvailability: options.leadAvailability ?? "available",
-    activeWorkerCount: workers.filter((worker) => !isTerminalWorker(worker)).length,
+    activeWorkerCount: visibleWorkers.length,
+    workers: visibleWorkers,
     exceptions,
   };
 }
@@ -335,7 +336,8 @@ export function renderSessionView(
     ? "no attention"
     : attentionClasses(snapshot.exceptions);
   const lines = [
-    `Lead ${snapshot.leadAvailability} | ${snapshot.activeWorkerCount} ${workerLabel} | ${attention}`,
+    `Lead ${snapshot.leadAvailability} | ${snapshot.activeWorkerCount} ${workerLabel} | ${attention}` +
+      (snapshot.activeWorkerCount > 0 ? " | /session workers" : ""),
   ];
   if (snapshot.exceptions.length === 0) return lines.join("\n");
   for (const exception of snapshot.exceptions) {
@@ -373,6 +375,37 @@ export function renderSessionView(
   return lines.join("\n");
 }
 
+export function renderSessionWorkers(
+  snapshot: SessionViewSnapshot,
+  selectedWorkerId?: string,
+): string {
+  if (snapshot.workers.length === 0) return "No active Worker Sessions.";
+  const lines = snapshot.workers.map(
+    (worker) =>
+      `Worker ${worker.id} | ${worker.state} | ${worker.scope.label} | ` +
+      `/session inspect worker:${worker.id}`,
+  );
+  const selected = snapshot.workers.find((worker) => worker.id === selectedWorkerId);
+  if (!selected) return lines.join("\n");
+  lines.push(
+    `Selected Worker: ${selected.id}`,
+    `  State: ${selected.state}`,
+    `  Scope: ${selected.scope.label}`,
+  );
+  if (selected.actions.length > 0) {
+    lines.push(`  Controls: ${selected.actions.map((action) => action.command).join(" | ")}`);
+  }
+  return lines.join("\n");
+}
+
+export function parseSessionViewWorkerInspection(
+  snapshot: SessionViewSnapshot,
+  input: string,
+): SessionViewWorker | undefined {
+  const match = /^\/session\s+inspect\s+worker:(\S+)\s*$/i.exec(input);
+  return match ? snapshot.workers.find((worker) => worker.id === match[1]) : undefined;
+}
+
 export function parseSessionViewInspection(
   snapshot: SessionViewSnapshot,
   input: string,
@@ -388,12 +421,14 @@ export function parseSessionViewControl(
   const match = /^\/session\s+(pause|cancel)\s+(\S+)\s*$/i.exec(input);
   if (!match) return undefined;
   const kind = match[1]!.toLowerCase() as SessionViewAction["kind"];
-  return snapshot.exceptions
-    .find((exception) => exception.id === match[2])
-    ?.actions.find((action) => action.kind === kind);
+  const target = match[2]!;
+  return snapshot.exceptions.find((exception) => exception.id === target)?.actions
+    .find((action) => action.kind === kind) ??
+    snapshot.workers.find((worker) => `worker:${worker.id}` === target)?.actions
+      .find((action) => action.kind === kind);
 }
 
-function interventionActions(
+function workerInterventionActions(
   state: SessionViewState,
   worker: WorkerSession,
   attempt: WorkerExecutionAttempt | undefined,
@@ -406,7 +441,7 @@ function interventionActions(
   const actions: SessionViewAction[] = [];
   const commitmentId = worker.assignment.commitmentId;
   const commitment = commitmentId ? state.readCommitment(commitmentId) : undefined;
-  if (worker.state === "waiting-question" && commitment?.state === "active" && !commitment.condition) {
+  if (commitment?.state === "active" && !commitment.condition) {
     actions.push({
       kind: "pause",
       targetKind: "commitment",
@@ -425,7 +460,7 @@ function interventionActions(
   return actions;
 }
 
-function assessment(
+export function createHealthAssessment(
   input: Omit<HealthAssessment, "freshness" | "verdict"> & {
     assessedAt: string;
     verdict: Exclude<HealthAssessment["verdict"], "healthy">;
@@ -446,6 +481,7 @@ function assessment(
     : assessedTime <= evidenceTime + healthEvidenceFreshnessMs
       ? "current"
       : "stale";
+  const hasConflictingEvidence = input.evidence.some((item) => item.bearing === "conflicts");
   const { assessedAt, verdict, ...assessmentFields } = input;
   return {
     ...assessmentFields,
@@ -455,7 +491,16 @@ function assessment(
       expiresAt,
       status: freshness,
     },
-    verdict: freshness === "current" ? verdict : "unknown",
+    verdict: freshness === "current" && !hasConflictingEvidence ? verdict : "unknown",
+  };
+}
+
+function commitmentCancelAction(commitmentId: string, exceptionId: string): SessionViewAction {
+  return {
+    kind: "cancel",
+    targetKind: "commitment",
+    targetId: commitmentId,
+    command: `/session cancel ${exceptionId}`,
   };
 }
 

@@ -54,8 +54,10 @@ import { createTargetProjectOperations } from "./target-project-operations/index
 import {
   parseSessionViewControl,
   parseSessionViewInspection,
+  parseSessionViewWorkerInspection,
   projectSessionView,
   renderSessionView,
+  renderSessionWorkers,
   type SessionViewSnapshot,
 } from "./session-view/index.ts";
 
@@ -353,6 +355,19 @@ async function completeOwnerInteraction(
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisor);
+  if (/^\/session\s+workers\s*$/i.test(ownerInput)) {
+    return {
+      source: "Session View",
+      content: renderSessionWorkers(snapshot),
+    };
+  }
+  const workerInspection = parseSessionViewWorkerInspection(snapshot, ownerInput);
+  if (workerInspection) {
+    return {
+      source: "Session View",
+      content: renderSessionWorkers(snapshot, workerInspection.id),
+    };
+  }
   const inspection = parseSessionViewInspection(snapshot, ownerInput);
   if (inspection) {
     const detailedSnapshot = sessionViewSnapshot(
@@ -385,9 +400,18 @@ async function completeOwnerInteraction(
       content: "Pause recorded. The waiting Worker and any effects remain separate facts.",
     };
   }
-  if (!workerSupervisor) {
-    throw new Error("Session View exposed cancellation without a live Worker supervisor.");
+  if (action.targetKind === "commitment") {
+    createOrchestrationCore(state).cancelCommitment(
+      action.targetId,
+      ownerTurnId,
+      "Owner cancelled the outcome from the Session View.",
+    );
+    return {
+      source: "Session View",
+      content: "Commitment cancelled. Existing Worker effects remain separate facts.",
+    };
   }
+  if (!workerSupervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
   await workerSupervisor.cancel(
     action.targetId,
     ownerTurnId,

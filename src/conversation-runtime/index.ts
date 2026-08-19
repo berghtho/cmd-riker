@@ -112,6 +112,7 @@ export type PiTurnRequest = {
         rationale: string;
       }>;
     }): void;
+    reserveOwnerDecision?(questionId: string, reason: string): void;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -1033,6 +1034,31 @@ function workerTools(
       },
     });
   }
+  if (capabilities.nativeQuestions && actions.reserveOwnerDecision) {
+    tools.push({
+      name: "reserve_worker_question_for_owner",
+      label: "Reserve Worker Question for Owner",
+      description:
+        "Classify one open Worker question as an Owner-reserved decision only when authority or product judgment requires the Owner. Answering remains conversational.",
+      parameters: Type.Object({
+        questionId: Type.String({ minLength: 1 }),
+        reason: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { questionId, reason } = params as { questionId: string; reason: string };
+        actions.reserveOwnerDecision!(questionId, reason);
+        observer.onMutation();
+        return {
+          content: [{
+            type: "text",
+            text: `Worker question ${questionId} is reserved for an Owner decision in the Session View.`,
+          }],
+          details: { questionId },
+        };
+      },
+    });
+  }
   if (capabilities.cancellation && actions.cancel) {
     tools.push({
       name: "cancel_worker_session",
@@ -1089,7 +1115,9 @@ function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerAction
     (capabilities.effectful
       ? " Effectful work is confined to the active Target Project checkout; first record one Commitment with a target-project-operation test criterion, then delegate with checkout-relative targets. CMD Riker runs typed Verification after the Worker finishes."
       : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
-    (capabilities.nativeQuestions ? " Native questions are available." : " Native questions are unavailable.") +
+    (capabilities.nativeQuestions
+      ? " Native questions are available; reserve only authority or product-judgment questions for Owner attention."
+      : " Native questions are unavailable.") +
     (capabilities.cancellation ? " Native cancellation is available." : " Native cancellation is unavailable.") +
     (actions.adjudicateReview
       ? " Adjudicate every reported Review finding as must-fix, documented exception, or follow-up with Lead rationale."

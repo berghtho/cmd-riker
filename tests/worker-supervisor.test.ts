@@ -228,6 +228,14 @@ test("a native Codex question keeps one durable identity and its answer is recor
   assert.equal(question?.executionAttemptId, started.executionAttemptId);
   assert.equal(question?.providerRequestId, 0);
   assert.equal(question?.status, "open");
+  const reserved = createOrchestrationCore(state).reserveWorkerQuestionForOwner(
+    question!.id,
+    "The question crosses a product boundary reserved to the Owner.",
+  );
+  assert.deepEqual(reserved.ownerAttention, {
+    kind: "owner-reserved-decision",
+    reason: "The question crosses a product boundary reserved to the Owner.",
+  });
   execution.beforeAnswer = () => {
     assert.equal(state.readWorkerQuestion(question!.id)?.status, "answer-recorded");
   };
@@ -960,6 +968,11 @@ test("orchestration blocks startup recovery after its bounded read-only attempts
     "blocked",
   );
   assert.match(worker?.outcome?.unresolvedUncertainty ?? "", /turn\/start response lost/);
+  assert.deepEqual(worker?.ownerAttention, {
+    kind: "recovery-exhausted",
+    reason: "Automatic Worker recovery exhausted its bounded attempts.",
+    nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
+  });
   state.close();
 });
 

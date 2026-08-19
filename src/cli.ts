@@ -397,7 +397,7 @@ async function completeOwnerInteraction(
     );
     return {
       source: "Session View",
-      content: "Pause recorded. The waiting Worker and any effects remain separate facts.",
+      content: "Pause recorded. Linked Worker activity and any effects remain separate facts.",
     };
   }
   if (!workerSupervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
@@ -517,6 +517,9 @@ async function completeOwnerTurn(
                   }),
                 adjudicateReview: (input) =>
                   orchestration.adjudicateReview(input.commitmentId, input.decisions),
+                reserveOwnerDecision: (questionId: string, reason: string) => {
+                  orchestration.reserveWorkerQuestionForOwner(questionId, reason);
+                },
                 ...(workerCapabilities!.effectful
                   ? {
                       delegateEffectful: (input: {

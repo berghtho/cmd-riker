@@ -244,6 +244,21 @@ test("reserved Owner decisions and non-Worker failures are material Commitment e
   assert.equal(blockedSnapshot.exceptions[0]?.healthAssessment?.verdict, "unknown");
   assert.deepEqual(blockedSnapshot.exceptions[0]?.knownFacts, ["Lead turn failed."]);
   assert.deepEqual(blockedSnapshot.exceptions[0]?.recoveryConditions, ["Retry with changed evidence."]);
+
+  const exhaustedWorker = workerSession({
+    state: "blocked",
+    ownerAttention: {
+      kind: "recovery-exhausted",
+      reason: "Automatic Worker recovery exhausted its bounded attempts.",
+      nextAction: "The Owner must choose the next recovery strategy.",
+    },
+  });
+  const exhaustedSnapshot = projectSessionView(fakeState({
+    workers: [exhaustedWorker],
+    attempts: [workerAttempt(exhaustedWorker, { status: "blocked" })],
+    commitments: [activeCommitment()],
+  }));
+  assert.deepEqual(exhaustedSnapshot.exceptions.map((item) => item.id), ["worker-recovery:worker-1"]);
 });
 
 test("only explicitly Owner-reserved Worker questions enter attention", () => {

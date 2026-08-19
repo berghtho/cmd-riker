@@ -258,6 +258,11 @@ export type WorkerSession = {
     | "failed"
     | "cancelled";
   currentExecutionAttemptId: string;
+  ownerAttention?: {
+    kind: "recovery-exhausted";
+    reason: string;
+    nextAction: string;
+  };
   cancellation?: {
     kind: "owner" | "deadline";
     requestedAt: string;
@@ -767,6 +772,7 @@ export interface OrchestrationCore {
     itemId: string;
     questions: WorkerQuestion["questions"];
   }): WorkerQuestion;
+  reserveWorkerQuestionForOwner(questionId: string, reason: string): WorkerQuestion;
   recordWorkerAnswer(
     questionId: string,
     ownerTurnId: string,
@@ -2029,6 +2035,21 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return question;
     },
 
+    reserveWorkerQuestionForOwner(questionId, reason) {
+      if (!reason.trim()) throw new Error("An Owner-reserved Worker question requires a reason.");
+      const question = state.readWorkerQuestion(questionId);
+      if (!question) throw new Error(`Unknown Worker question ${questionId}.`);
+      if (question.status !== "open" && question.status !== "answer-recorded") {
+        throw new Error(`Worker question ${questionId} no longer needs Owner attention.`);
+      }
+      const reserved: WorkerQuestion = {
+        ...question,
+        ownerAttention: { kind: "owner-reserved-decision", reason },
+      };
+      state.appendWorkerQuestionSnapshots([reserved]);
+      return reserved;
+    },
+
     recordWorkerAnswer(questionId, ownerTurnId, answers) {
       if (state.ownerTurnSequence(ownerTurnId) === undefined) {
         throw new Error(`Unknown Owner turn ${ownerTurnId}.`);
@@ -3236,7 +3257,16 @@ function blockWorkerRecovery(
   };
   state.appendWorkerState({
     executionAttempt: { ...attempt, status: "blocked", failure: reason, outcome },
-    workerSession: { ...worker, state: "blocked", outcome },
+    workerSession: {
+      ...worker,
+      state: "blocked",
+      outcome,
+      ownerAttention: {
+        kind: "recovery-exhausted",
+        reason: "Automatic Worker recovery exhausted its bounded attempts.",
+        nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
+      },
+    },
   });
 }
 

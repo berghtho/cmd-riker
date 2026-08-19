@@ -302,6 +302,11 @@ export function projectSessionView(
     });
   }
 
+  const materialCommitmentIds = new Set(
+    [...commitments.values()]
+      .filter((commitment) => Boolean(commitment.condition?.ownerAttention))
+      .map((commitment) => commitment.id),
+  );
   for (const worker of workers) {
     if (worker.state === "cancellation-requested") {
       const scopedUnknownEffects = worker.assignment.commitmentId
@@ -342,7 +347,44 @@ export function projectSessionView(
           : {}),
         actions: [],
       });
+      continue;
     }
+    const linkedCommitment = worker.assignment.commitmentId
+      ? commitments.get(worker.assignment.commitmentId)
+      : undefined;
+    if (
+      !worker.ownerAttention ||
+      (worker.assignment.commitmentId && materialCommitmentIds.has(worker.assignment.commitmentId)) ||
+      (linkedCommitment && isTerminalCommitment(linkedCommitment))
+    ) {
+      continue;
+    }
+    exceptions.push({
+      id: `worker-recovery:${worker.id}`,
+      kind: "relevant-failure",
+      subject: workerSubject(worker),
+      scope: workerScope(worker),
+      knownFacts: [worker.ownerAttention.reason],
+      unknowns: ["Whether a changed recovery hypothesis will restore the Assignment is unknown."],
+      recoveryConditions: [worker.ownerAttention.nextAction],
+      ...(includeHealth
+        ? {
+            healthAssessment: createHealthAssessment({
+              subject: workerSubject(worker),
+              scope: workerScope(worker),
+              evidence: [{
+                reference: `worker-session:${worker.id}`,
+                summary: worker.ownerAttention.reason,
+                observedAt: null,
+                bearing: "supports",
+              }],
+              assessedAt,
+              verdict: "impaired",
+            }),
+          }
+        : {}),
+      actions: [],
+    });
   }
 
   const capability = state.readCapabilityNotice("codex-worker");
@@ -458,16 +500,18 @@ export function parseSessionViewWorkerInspection(
   snapshot: SessionViewSnapshot,
   input: string,
 ): SessionViewWorker | undefined {
-  const match = /^\/session\s+inspect\s+worker:(\S+)\s*$/i.exec(input);
-  return match ? snapshot.workers.find((worker) => worker.id === match[1]) : undefined;
+  const target = inspectionTarget(input);
+  return target?.startsWith("worker:")
+    ? snapshot.workers.find((worker) => worker.id === target.slice("worker:".length))
+    : undefined;
 }
 
 export function parseSessionViewInspection(
   snapshot: SessionViewSnapshot,
   input: string,
 ): SessionViewException | undefined {
-  const match = /^\/session\s+inspect\s+(\S+)\s*$/i.exec(input);
-  return match ? snapshot.exceptions.find((item) => item.id === match[1]) : undefined;
+  const target = inspectionTarget(input);
+  return target ? snapshot.exceptions.find((item) => item.id === target) : undefined;
 }
 
 export function parseSessionViewControl(
@@ -482,6 +526,10 @@ export function parseSessionViewControl(
     .find((action) => action.kind === kind) ??
     snapshot.workers.find((worker) => `worker:${worker.id}` === target)?.actions
       .find((action) => action.kind === kind);
+}
+
+function inspectionTarget(input: string): string | undefined {
+  return /^\/session\s+inspect\s+(\S+)\s*$/i.exec(input)?.[1];
 }
 
 function workerInterventionActions(

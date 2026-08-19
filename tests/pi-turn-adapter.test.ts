@@ -96,6 +96,7 @@ test("production adapter advertises the bounded Codex Worker controls", async (t
       assert.match(serialized, /delegate_read_only_codex/);
       assert.match(serialized, /delegate_effectful_codex/);
       assert.match(serialized, /answer_worker_question/);
+      assert.match(serialized, /reserve_worker_question_for_owner/);
       assert.match(serialized, /cancel_worker_session/);
       assert.doesNotMatch(serialized, /resume_worker/);
       return {
@@ -126,6 +127,7 @@ test("production adapter advertises the bounded Codex Worker controls", async (t
         return { workerSessionId: "worker-effectful-1", executionAttemptId: "attempt-effectful-1" };
       },
       async answer() {},
+      reserveOwnerDecision() {},
       async cancel() {},
     },
   });

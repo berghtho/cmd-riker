@@ -332,6 +332,7 @@ async function completeOwnerTurn(
         : {}),
     });
     try {
+      const workerCapabilities = workerSupervisor?.capabilities();
       const response = await adapter.completeTurn({
         conversation: conversation.messages,
         ownerInput,
@@ -343,10 +344,10 @@ async function completeOwnerTurn(
           ? {
               workerActions: {
                 capabilities: {
-                  nativeHarness: conversation.workerModelPolicy!.selection.nativeHarness,
-                  effectful: conversation.workerModelPolicy!.selection.nativeHarness === "codex",
-                  nativeQuestions: conversation.workerModelPolicy!.selection.nativeHarness === "codex",
-                  cancellation: conversation.workerModelPolicy!.selection.nativeHarness !== "copilot",
+                  nativeHarness: workerCapabilities!.nativeHarness,
+                  effectful: workerCapabilities!.effectful,
+                  nativeQuestions: workerCapabilities!.nativeQuestions,
+                  cancellation: workerCapabilities!.cancellation,
                 },
                 delegate: (input: {
                   objective: string;
@@ -359,7 +360,7 @@ async function completeOwnerTurn(
                     model: conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: conversation.workerModelPolicy!.revision,
                   }),
-                ...(conversation.workerModelPolicy!.selection.nativeHarness === "codex"
+                ...(workerCapabilities!.effectful
                   ? {
                       delegateEffectful: (input: {
                         objective: string;
@@ -383,7 +384,7 @@ async function completeOwnerTurn(
                         workerSupervisor.answer(questionId, turnId, answers),
                     }
                   : {}),
-                ...(conversation.workerModelPolicy!.selection.nativeHarness !== "copilot"
+                ...(workerCapabilities!.cancellation
                   ? {
                       cancel: (workerSessionId: string, reason: string) =>
                         workerSupervisor.cancel(workerSessionId, turnId, reason),

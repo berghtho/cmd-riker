@@ -82,6 +82,11 @@ class CopilotAcpHarness implements NativeWorkerHarness {
     let output = "";
     let terminalObserved = false;
     let terminating = false;
+    const observeFailure = (error: unknown): void => {
+      if (terminating || terminalObserved) return;
+      terminalObserved = true;
+      void observer.failed(asError(error));
+    };
     transport.onNotification = (message) => {
       if (message.method !== "session/update") return;
       const params = asRecord(message.params);
@@ -98,9 +103,7 @@ class CopilotAcpHarness implements NativeWorkerHarness {
         observer.materialCommand?.(update.title.slice(0, 8 * 1024));
       }
     };
-    transport.onFailure = (error) => {
-      if (!terminating && !terminalObserved) void observer.failed(error);
-    };
+    transport.onFailure = observeFailure;
     const processIdentity = await transport.start();
     observer.processStarted({
       process: processIdentity,
@@ -153,7 +156,7 @@ class CopilotAcpHarness implements NativeWorkerHarness {
             reported.outcome,
           );
         })
-        .catch((error: unknown) => observer.failed(asError(error)));
+        .catch(observeFailure);
       const capabilities = {
         readOnly: true,
         nativeQuestions: false,
@@ -187,8 +190,11 @@ class CopilotAcpHarness implements NativeWorkerHarness {
           terminating = true;
           const sessionCapabilities = asRecord(agentCapabilities.sessionCapabilities);
           if (sessionCapabilities.close === true) {
-            await transport.request("session/close", { sessionId: providerSessionId }, 5_000)
-              .catch(() => undefined);
+            try {
+              await transport.request("session/close", { sessionId: providerSessionId }, 5_000);
+            } catch {
+              // The transport may already be gone; process-identity termination remains authoritative.
+            }
           }
           return { gone: await transport.terminate() };
         },
@@ -220,6 +226,8 @@ class CopilotAcpTransport {
   private readonly cwd: string;
   private readonly model: string;
   private child: ChildProcessWithoutNullStreams | undefined;
+  private processIdentity: { pid: number; startedAt: string } | undefined;
+  private failed = false;
   private buffer = Buffer.alloc(0);
   private nextId = 1;
   private readonly pending = new Map<
@@ -243,6 +251,15 @@ class CopilotAcpTransport {
         "--no-auto-update",
         "--no-remote-export",
         "--no-remote",
+        "--no-custom-instructions",
+        "--no-ask-user",
+        "--no-experimental",
+        "--disable-builtin-mcps",
+        "--disallow-temp-dir",
+        "--available-tools=view,grep,glob",
+        "--deny-tool=write",
+        "--deny-tool=shell",
+        "--deny-tool=url",
         "--model",
         this.model,
         "--effort",
@@ -274,7 +291,8 @@ class CopilotAcpTransport {
       await this.terminate();
       throw new Error("Copilot process start identity could not be proven.");
     }
-    return { pid: child.pid, startedAt: inspected.startedAt };
+    this.processIdentity = { pid: child.pid, startedAt: inspected.startedAt };
+    return this.processIdentity;
   }
 
   request(method: string, params: unknown, timeoutMs = 15_000): Promise<unknown> {
@@ -299,11 +317,15 @@ class CopilotAcpTransport {
   }
 
   async terminate(): Promise<boolean> {
-    const pid = this.child?.pid;
-    if (!pid) return true;
-    const inspected = await inspectProcess(pid);
-    if (!inspected?.startedAt) return false;
-    const gone = await terminateRecordedProcess(pid, inspected.startedAt);
+    if (!this.processIdentity) {
+      if (!this.child) return true;
+      this.child.kill();
+      return false;
+    }
+    const gone = await terminateRecordedProcess(
+      this.processIdentity.pid,
+      this.processIdentity.startedAt,
+    );
     if (gone) this.child = undefined;
     return gone;
   }
@@ -379,6 +401,8 @@ class CopilotAcpTransport {
   }
 
   private fail(error: Error): void {
+    if (this.failed) return;
+    this.failed = true;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);

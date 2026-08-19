@@ -116,6 +116,12 @@ export type CodexWorkerExecution = NativeWorkerExecution;
 export interface CodexWorkerHarness extends NativeWorkerHarness {}
 
 export interface WorkerSupervisor {
+  capabilities(): {
+    nativeHarness: WorkerModelSelection["nativeHarness"];
+    effectful: boolean;
+    nativeQuestions: boolean;
+    cancellation: boolean;
+  };
   delegate(input: {
     objective: string;
     prompt: string;
@@ -429,6 +435,22 @@ export function createWorkerSupervisor(
     }
   };
   return {
+    capabilities() {
+      const liveCapabilities = [...executions.keys()].flatMap((workerSessionId) => {
+        const worker = orchestration.workerSessionView(workerSessionId);
+        const attempt = worker
+          ? orchestration.workerExecutionAttemptView(worker.currentExecutionAttemptId)
+          : undefined;
+        return attempt?.capabilities ? [attempt.capabilities] : [];
+      });
+      return {
+        nativeHarness: harness.selection.nativeHarness,
+        effectful: harness.supportsEffectful,
+        nativeQuestions: liveCapabilities.some((capabilities) => capabilities.nativeQuestions),
+        cancellation: liveCapabilities.some((capabilities) => capabilities.cancellation),
+      };
+    },
+
     async delegate(input) {
       const { model, ...assignment } = input;
       const modelSelection: WorkerModelSelection = { ...harness.selection, model };

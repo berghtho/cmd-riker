@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -138,6 +139,12 @@ test("Claude and Copilot Workers persist honest native capability limits", async
     const state = openAuthoritativeState(stateDirectory);
     const harness = new FakeLimitedNativeHarness(expected);
     const supervisor = createWorkerSupervisor(state, harness);
+    assert.deepEqual(supervisor.capabilities(), {
+      nativeHarness: expected.nativeHarness,
+      effectful: false,
+      nativeQuestions: false,
+      cancellation: false,
+    });
 
     const started = await supervisor.delegate({
       objective: `Inspect through ${expected.nativeHarness}.`,
@@ -168,6 +175,12 @@ test("Claude and Copilot Workers persist honest native capability limits", async
       nativeChildControl: false,
       exactExecutionResume: "live-connection-only",
       protocolSchemaSha256: `${expected.nativeHarness}-schema`,
+    });
+    assert.deepEqual(supervisor.capabilities(), {
+      nativeHarness: expected.nativeHarness,
+      effectful: false,
+      nativeQuestions: expected.nativeQuestions,
+      cancellation: expected.cancellation,
     });
 
     if (!expected.cancellation) {
@@ -1180,6 +1193,84 @@ test("the Copilot ACP adapter completes a bounded assignment without simulating 
     affectedArtifacts: [],
     verificationResults: ["Architecture inspected."],
   });
+});
+
+test("Copilot read-only launch denies persisted grants and write permission attempts", async (t) => {
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-copilot-read-only-test-"));
+  const sentinel = join(checkout, "should-not-exist.txt");
+  const harness = createCopilotWorkerHarness({
+    executable: process.execPath,
+    args: [fakeCopilotAcp, "attempt-write", sentinel],
+    version: "GitHub Copilot CLI 1.0.80.",
+  });
+  let terminalStatus: string | undefined;
+  let terminalError: Error | undefined;
+  const execution = await harness.start(
+    {
+      workerSessionId: "worker-session-copilot-write-denial",
+      executionAttemptId: "execution-attempt-copilot-write-denial",
+      objective: "Inspect architecture",
+      prompt: "Attempting to write must remain impossible.",
+      targetProjectPath: checkout,
+      model: "auto",
+      readOnly: true,
+    },
+    {
+      processStarted() {},
+      question() {},
+      output() {},
+      completed(status) {
+        terminalStatus = status;
+      },
+      failed(error) {
+        terminalError = error;
+      },
+    },
+  );
+  t.after(async () => {
+    await execution.terminate();
+    await rm(checkout, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+
+  await waitFor(() => terminalStatus !== undefined || terminalError !== undefined);
+  assert.equal(terminalError, undefined);
+  assert.equal(terminalStatus, "completed");
+  assert.equal(existsSync(sentinel), false);
+});
+
+test("one Copilot transport failure produces one continuity observation", async (t) => {
+  const harness = createCopilotWorkerHarness({
+    executable: process.execPath,
+    args: [fakeCopilotAcp, "fail-prompt"],
+    version: "GitHub Copilot CLI 1.0.80.",
+  });
+  let failures = 0;
+  let execution: NativeWorkerExecution | undefined;
+  execution = await harness.start(
+    {
+      workerSessionId: "worker-session-copilot-failure",
+      executionAttemptId: "execution-attempt-copilot-failure",
+      objective: "Inspect architecture",
+      prompt: "Report the module seams.",
+      targetProjectPath: process.cwd(),
+      model: "auto",
+      readOnly: true,
+    },
+    {
+      processStarted() {},
+      question() {},
+      output() {},
+      completed() {},
+      failed() {
+        failures += 1;
+      },
+    },
+  );
+  t.after(() => execution?.terminate());
+
+  await waitFor(() => failures > 0);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  assert.equal(failures, 1);
 });
 
 test("the Codex 0.147.0 adapter proves workspace-write isolation before effect dispatch", async (t) => {

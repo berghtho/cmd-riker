@@ -522,6 +522,24 @@ test("initialization is idempotent but cannot replace the one active Target Proj
       },
     }),
   );
+  assert.doesNotThrow(() =>
+    state.initialize({
+      targetProject: { path: "C:\\target-project" },
+      forgeAuthorities: {
+        github: { account: "owner-login", repository: "owner/repository" },
+      },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:11434/v1",
+      },
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+  assert.deepEqual(state.readOwnerConversation()?.forgeAuthorities, {
+    github: { account: "owner-login", repository: "owner/repository" },
+  });
   assert.throws(
     () =>
       state.initialize({

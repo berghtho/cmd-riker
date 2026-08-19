@@ -20,7 +20,7 @@ export type ForgeOperationRequest =
         expectedAccount: string;
       };
       timeoutMs: number;
-      actingAuthorityEffectAuthorization?: {
+      actingAuthorityEffectAuthorization: {
         actingAuthorityId: string;
         authorizationId: string;
         standingOrderId: string;
@@ -239,14 +239,15 @@ export class NativeGitHubCli implements GitHubCli {
     expectedAccount: string;
     timeoutMs: number;
   }): Promise<ForgeCapabilityProof> {
-    const version = await runCli(this.executable, ["--version"], input.timeoutMs, "github");
+    const deadline = Date.now() + input.timeoutMs;
+    const version = await runCli(this.executable, ["--version"], remainingTimeout(deadline), "github");
     if (version.exitCode !== 0 || !version.stdout.trim()) {
       throw new ForgeAdapterError("unavailable", "GitHub CLI is unavailable or did not report a version.");
     }
     const identity = await runCli(
       this.executable,
       ["api", "user", "--jq", ".login"],
-      input.timeoutMs,
+      remainingTimeout(deadline),
       "github",
     );
     if (identity.exitCode !== 0 || !identity.stdout.trim()) {
@@ -259,7 +260,7 @@ export class NativeGitHubCli implements GitHubCli {
     const target = await runCli(
       this.executable,
       ["repo", "view", input.repository, "--json", "nameWithOwner,viewerPermission"],
-      input.timeoutMs,
+      remainingTimeout(deadline),
       "github",
     );
     if (target.exitCode !== 0) {
@@ -282,7 +283,7 @@ export class NativeGitHubCli implements GitHubCli {
     const issue = await runCli(
       this.executable,
       ["api", `repos/${input.repository}/issues/${input.issueNumber}`, "--jq", ".number"],
-      input.timeoutMs,
+      remainingTimeout(deadline),
       "github",
     );
     if (issue.exitCode !== 0 || Number(issue.stdout.trim()) !== input.issueNumber) {
@@ -376,10 +377,11 @@ export class NativeAzureCli implements AzureCli {
     expectedAccount: string;
     timeoutMs: number;
   }): Promise<{ capability: ForgeCapabilityProof; evidence: ExternalEffectEvidence }> {
+    const deadline = Date.now() + input.timeoutMs;
     const version = await runCli(
       this.executable,
       ["version", "--output", "json"],
-      input.timeoutMs,
+      remainingTimeout(deadline),
       "azure",
     );
     if (version.exitCode !== 0) {
@@ -400,7 +402,7 @@ export class NativeAzureCli implements AzureCli {
         "json",
         "--only-show-errors",
       ],
-      input.timeoutMs,
+      remainingTimeout(deadline),
       "azure",
     );
     if (inspection.exitCode !== 0) {
@@ -463,6 +465,7 @@ async function executeGitHubMutation(
   github: GitHubCli,
   request: Extract<ForgeOperationRequest, { operation: { kind: "github-issue-comment" } }>,
 ): Promise<ForgeOperationResult> {
+  const deadline = Date.now() + request.timeoutMs;
   const operationAttemptId = randomUUID();
   const effectIntentId = randomUUID();
   const startedAt = new Date().toISOString();
@@ -479,7 +482,7 @@ async function executeGitHubMutation(
       repository: request.operation.repository,
       issueNumber: request.operation.issueNumber,
       expectedAccount: request.operation.expectedAccount,
-      timeoutMs: request.timeoutMs,
+      timeoutMs: remainingTimeout(deadline),
     });
   } catch (error) {
     return recordPreflightFailure(state, {
@@ -524,9 +527,7 @@ async function executeGitHubMutation(
         resource: `${request.operation.repository}#${request.operation.issueNumber}`,
       },
       validatedAt: startedAt,
-      ...(request.actingAuthorityEffectAuthorization
-        ? { actingAuthority: request.actingAuthorityEffectAuthorization }
-        : {}),
+      actingAuthority: request.actingAuthorityEffectAuthorization,
     },
     retryRule: "Read back the exact remote comment identity before any retry.",
     status: "pending",
@@ -539,7 +540,7 @@ async function executeGitHubMutation(
     status: "dispatching",
     lease: {
       claimedAt,
-      expiresAt: new Date(Date.now() + request.timeoutMs).toISOString(),
+      expiresAt: new Date(deadline).toISOString(),
     },
   };
   state.claimForgeMutation(runningAttempt, dispatchingEffect);
@@ -550,7 +551,7 @@ async function executeGitHubMutation(
       repository: request.operation.repository,
       issueNumber: request.operation.issueNumber,
       body: request.operation.body,
-      timeoutMs: request.timeoutMs,
+      timeoutMs: remainingTimeout(deadline),
     });
   } catch {
     return settleUnknownGitHubMutation(
@@ -567,7 +568,7 @@ async function executeGitHubMutation(
     readback = await github.readIssueComment({
       repository: request.operation.repository,
       commentId: created.id,
-      timeoutMs: request.timeoutMs,
+      timeoutMs: remainingTimeout(deadline),
     });
   } catch {
     return settleUnknownGitHubMutation(
@@ -896,6 +897,14 @@ function targetLabel(target: ForgeOperationTarget): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function remainingTimeout(deadline: number): number {
+  const remaining = deadline - Date.now();
+  if (remaining < 1) {
+    throw new ForgeAdapterError("interactive", "The Forge operation exceeded its non-interactive deadline.");
+  }
+  return remaining;
 }
 
 function parseJson(value: string, label: string): unknown {

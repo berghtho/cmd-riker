@@ -302,6 +302,7 @@ type JournalRow = {
 type TransitionKind =
   | "owner.configuration-recorded"
   | "owner.model-policy-activated"
+  | "owner.forge-authorities-reconfigured"
   | "owner-conversation.owner-message-recorded"
   | "owner-conversation.lead-agent-message-recorded"
   | `commitment.${Commitment["state"]}`
@@ -991,6 +992,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         if (attempt.target.kind !== "github-issue") {
           throw new Error("Only a typed GitHub target can dispatch a Forge mutation.");
         }
+        if (!effectIntent.authorization.actingAuthority) {
+          throw new Error("Public GitHub effects require a bounded Standing Order authorization.");
+        }
         assertActingAuthorityDispatch(effectIntent, {
           effectClass: "update",
           target: `${attempt.target.repository}#${attempt.target.issueNumber}`,
@@ -1019,6 +1023,16 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       validateConfiguration(configuration);
       const existing = readConfigurationRow();
       if (existing) {
+        if (sameConfigurationExceptForgeAuthorities(existing.value, configuration)) {
+          if (JSON.stringify(existing.value.forgeAuthorities) !== JSON.stringify(configuration.forgeAuthorities)) {
+            appendFact(
+              { kind: "owner.configuration", value: configuration },
+              "owner.forge-authorities-reconfigured",
+              existing.id,
+            );
+          }
+          return;
+        }
         if (!sameConfiguration(existing.value, configuration)) {
           throw new Error("Authoritative state is already configured for a different Owner context.");
         }
@@ -2472,6 +2486,7 @@ function ensureSchema(database: DatabaseSync): void {
       kind TEXT NOT NULL CHECK (kind IN (
         'owner.configuration-recorded',
         'owner.model-policy-activated',
+        'owner.forge-authorities-reconfigured',
         'owner-conversation.owner-message-recorded',
         'owner-conversation.lead-agent-message-recorded',
         'commitment.committed',
@@ -2587,6 +2602,7 @@ function ensureSchema(database: DatabaseSync): void {
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
+    transitionsRow.sql.includes("'owner.forge-authorities-reconfigured'") &&
     transitionsRow.sql.includes("'forge-owner-action-notice.cleared'") &&
     transitionsRow.sql.includes("'effect-intent.reconciled'")
   ) {
@@ -2634,6 +2650,7 @@ function ensureSchema(database: DatabaseSync): void {
         kind TEXT NOT NULL CHECK (kind IN (
           'owner.configuration-recorded',
           'owner.model-policy-activated',
+          'owner.forge-authorities-reconfigured',
           'owner-conversation.owner-message-recorded',
           'owner-conversation.lead-agent-message-recorded',
           'commitment.committed',
@@ -2852,6 +2869,20 @@ function sameConfiguration(left: OwnerConfiguration, right: OwnerConfiguration):
   return (
     left.targetProject.path === right.targetProject.path &&
     JSON.stringify(left.forgeAuthorities) === JSON.stringify(right.forgeAuthorities) &&
+    sameSelection(left.modelSelection, right.modelSelection) &&
+    sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
+    JSON.stringify(left.modelRequirements) === JSON.stringify(right.modelRequirements) &&
+    left.modelPolicyRevision === right.modelPolicyRevision &&
+    JSON.stringify(left.workerModelPolicy) === JSON.stringify(right.workerModelPolicy)
+  );
+}
+
+function sameConfigurationExceptForgeAuthorities(
+  left: OwnerConfiguration,
+  right: OwnerConfiguration,
+): boolean {
+  return (
+    left.targetProject.path === right.targetProject.path &&
     sameSelection(left.modelSelection, right.modelSelection) &&
     sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
     JSON.stringify(left.modelRequirements) === JSON.stringify(right.modelRequirements) &&

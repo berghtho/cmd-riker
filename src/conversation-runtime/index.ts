@@ -69,11 +69,11 @@ export type PiTurnRequest = {
     ): Promise<TargetProjectOperationResult>;
   };
   forgeActions?: {
-    commentOnGitHubIssue(
+    commentOnGitHubIssue?(
       input: { commitmentId: string; issueNumber: number; body: string },
-      actingAuthorityEffect?: ActingAuthorityEffectRequest,
+      actingAuthorityEffect: ActingAuthorityEffectRequest,
     ): Promise<ForgeOperationResult>;
-    inspectAzureSubscription(commitmentId: string): Promise<ForgeOperationResult>;
+    inspectAzureSubscription?(commitmentId: string): Promise<ForgeOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
   actingAuthority?: ActingAuthority;
@@ -380,9 +380,10 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "cancel, or supersede instruction." +
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
            "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
-           (request.forgeActions
+           (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.inspectAzureSubscription
              ? " For a GitHub comment or Azure inspection, record one Commitment with the matching forge-operation criterion before calling its typed tool. " +
                "Use typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
+               "A GitHub public comment additionally requires an exact active Standing Order authorization. " +
                "Treat an unavailable result as one Owner action and do not retry blindly."
              : "") +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
@@ -556,8 +557,8 @@ function forgeTools(
 ): AgentTool[] {
   if (!request.forgeActions) return [];
   const actions = request.forgeActions;
-  return [
-    {
+  const tools: AgentTool[] = [];
+  if (actions.commentOnGitHubIssue) tools.push({
       name: "comment_on_github_issue",
       label: "Comment on GitHub Issue",
       description:
@@ -566,7 +567,7 @@ function forgeTools(
         commitmentId: Type.String({ minLength: 1 }),
         issueNumber: Type.Integer({ minimum: 1 }),
         body: Type.String({ minLength: 1, maxLength: 65_536 }),
-        actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
+        actingAuthorityEffect: actingAuthorityEffectRequestSchema,
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -574,9 +575,9 @@ function forgeTools(
           commitmentId: string;
           issueNumber: number;
           body: string;
-          actingAuthorityEffect?: ActingAuthorityEffectRequest;
+          actingAuthorityEffect: ActingAuthorityEffectRequest;
         };
-        const result = await actions.commentOnGitHubIssue(
+        const result = await actions.commentOnGitHubIssue!(
           { commitmentId, issueNumber, body },
           actingAuthorityEffect,
         );
@@ -586,8 +587,8 @@ function forgeTools(
           details: result,
         };
       },
-    },
-    {
+    });
+  if (actions.inspectAzureSubscription) tools.push({
       name: "inspect_azure_subscription",
       label: "Inspect Azure Subscription",
       description:
@@ -598,15 +599,15 @@ function forgeTools(
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const { commitmentId } = params as { commitmentId: string };
-        const result = await actions.inspectAzureSubscription(commitmentId);
+        const result = await actions.inspectAzureSubscription!(commitmentId);
         observer.onMutation();
         return {
           content: [{ type: "text", text: forgeResultText(result) }],
           details: result,
         };
       },
-    },
-  ];
+    });
+  return tools;
 }
 
 function forgeResultText(result: ForgeOperationResult): string {

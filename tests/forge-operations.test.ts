@@ -17,12 +17,20 @@ import {
 import { createOrchestrationCore, type Commitment } from "../src/orchestration-core/index.ts";
 
 test("GitHub mutation records intent before dispatch and settles only after exact read-back", async (t) => {
-  const { state, commitment } = await configuredState(t, "github-success");
+  const { state, commitment, githubAuthorization } = await configuredState(t, "github-success");
   const body = "CMD Riker live-proof marker.";
   let createObservedDispatch = false;
+  let inspectTimeout = 0;
+  let createTimeout = 0;
+  let readTimeout = 0;
   const github: GitHubCli = {
-    inspect: async () => githubCapability(),
-    createIssueComment: async () => {
+    inspect: async (input) => {
+      inspectTimeout = input.timeoutMs;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return githubCapability();
+    },
+    createIssueComment: async (input) => {
+      createTimeout = input.timeoutMs;
       const attempt = state.readForgeOperationAttempts()[0];
       assert.equal(attempt?.status, "running");
       assert.equal(attempt?.capability?.target, "berghtho/cmd-riker#36");
@@ -30,13 +38,16 @@ test("GitHub mutation records intent before dispatch and settles only after exac
       createObservedDispatch = true;
       return { id: "comment-42", url: "https://github.test/comment-42" };
     },
-    readIssueComment: async () => ({
-      id: "comment-42",
-      url: "https://github.test/comment-42",
-      body,
-      author: "berghtho",
-      observedAt: "2026-08-19T20:00:00.000Z",
-    }),
+    readIssueComment: async (input) => {
+      readTimeout = input.timeoutMs;
+      return {
+        id: "comment-42",
+        url: "https://github.test/comment-42",
+        body,
+        author: "berghtho",
+        observedAt: "2026-08-19T20:00:00.000Z",
+      };
+    },
   };
 
   const result = await createForgeOperations(state, { github }).execute({
@@ -49,9 +60,12 @@ test("GitHub mutation records intent before dispatch and settles only after exac
       expectedAccount: "berghtho",
     },
     timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
   });
 
   assert.equal(createObservedDispatch, true);
+  assert.ok(createTimeout < inspectTimeout);
+  assert.ok(readTimeout <= createTimeout);
   assert.equal(result.status, "succeeded");
   assert.equal(result.evidence[0]?.source, "provider-readback");
   assert.equal(state.readForgeOperationAttempt(result.operationAttemptId)?.status, "succeeded");
@@ -62,7 +76,7 @@ test("GitHub mutation records intent before dispatch and settles only after exac
 });
 
 test("Forge authority is checked against durable Owner configuration before provider use", async (t) => {
-  const { state, commitment } = await configuredState(t, "authority");
+  const { state, commitment, githubAuthorization } = await configuredState(t, "authority");
   let inspected = false;
   const github: GitHubCli = {
     inspect: async () => {
@@ -84,10 +98,43 @@ test("Forge authority is checked against durable Owner configuration before prov
         expectedAccount: "attacker",
       },
       timeoutMs: 1_000,
+      actingAuthorityEffectAuthorization: githubAuthorization!,
     }),
     /outside the configured Owner authority/,
   );
   assert.equal(inspected, false);
+});
+
+test("public GitHub mutation stops without an exact Standing Order grant", async (t) => {
+  const { state, commitment, githubAuthorization } = await configuredState(t, "public-authority");
+  let dispatched = false;
+  const github: GitHubCli = {
+    inspect: async () => githubCapability(),
+    createIssueComment: async () => {
+      dispatched = true;
+      return { id: "comment-42", url: "https://github.test/comment-42" };
+    },
+    readIssueComment: async () => assert.fail("read-back must not run"),
+  };
+  await assert.rejects(
+    createForgeOperations(state, { github }).execute({
+      commitmentId: commitment.id,
+      operation: {
+        kind: "github-issue-comment",
+        repository: "berghtho/cmd-riker",
+        issueNumber: 36,
+        body: "Not authorized by this grant.",
+        expectedAccount: "berghtho",
+      },
+      timeoutMs: 1_000,
+      actingAuthorityEffectAuthorization: {
+        ...githubAuthorization!,
+        authorizationId: "forged-authorization",
+      },
+    }),
+    /does not match its durable Acting Authority authorization/,
+  );
+  assert.equal(dispatched, false);
 });
 
 test("native CLI environment excludes ambient secret-bearing variables", () => {
@@ -104,7 +151,7 @@ test("native CLI environment excludes ambient secret-bearing variables", () => {
 });
 
 test("missing GitHub authentication records one durable Owner action and deduplicates repeats", async (t) => {
-  const { state, commitment } = await configuredState(t, "github-auth");
+  const { state, commitment, githubAuthorization } = await configuredState(t, "github-auth");
   const github: GitHubCli = {
     inspect: async () => {
       throw new ForgeAdapterError("authentication", "GitHub CLI authentication is unavailable.");
@@ -123,6 +170,7 @@ test("missing GitHub authentication records one durable Owner action and dedupli
       expectedAccount: "berghtho",
     },
     timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
   };
 
   const first = await operations.execute(request);
@@ -275,7 +323,7 @@ test("Owner actions remain scoped when the configured Azure target changes", asy
 });
 
 test("mismatched GitHub read-back leaves the dispatched effect unknown", async (t) => {
-  const { state, commitment } = await configuredState(t, "github-unknown");
+  const { state, commitment, githubAuthorization } = await configuredState(t, "github-unknown");
   const github: GitHubCli = {
     inspect: async () => githubCapability(),
     createIssueComment: async () => ({ id: "comment-42", url: "https://github.test/comment-42" }),
@@ -298,6 +346,7 @@ test("mismatched GitHub read-back leaves the dispatched effect unknown", async (
       expectedAccount: "berghtho",
     },
     timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
   });
 
   assert.equal(result.status, "unknown");
@@ -308,7 +357,7 @@ test("mismatched GitHub read-back leaves the dispatched effect unknown", async (
 });
 
 test("restart marks a dispatched GitHub mutation unknown without replay", async (t) => {
-  const { state, commitment } = await configuredState(t, "github-restart");
+  const { state, commitment, githubAuthorization } = await configuredState(t, "github-restart");
   const startedAt = "2026-08-19T20:00:00.000Z";
   const attempt = {
     id: "forge-attempt-restart",
@@ -340,6 +389,7 @@ test("restart marks a dispatched GitHub mutation unknown without replay", async 
       commitmentId: commitment.id,
       providerTarget: { provider: "github" as const, resource: "berghtho/cmd-riker#36" },
       validatedAt: startedAt,
+      actingAuthority: githubAuthorization!,
     },
     retryRule: "Read back before retry.",
     status: "pending" as const,
@@ -368,7 +418,15 @@ async function configuredState(
   t: test.TestContext,
   suffix: string,
   operation: "github-issue-comment" | "azure-subscription-inspection" = "github-issue-comment",
-): Promise<{ state: AuthoritativeState; commitment: Commitment }> {
+): Promise<{
+  state: AuthoritativeState;
+  commitment: Commitment;
+  githubAuthorization?: {
+    actingAuthorityId: string;
+    authorizationId: string;
+    standingOrderId: string;
+  };
+}> {
   const stateDirectory = await mkdtemp(join(tmpdir(), `cmd-riker-forge-${suffix}-`));
   const state = openAuthoritativeState(stateDirectory);
   t.after(async () => {
@@ -392,8 +450,9 @@ async function configuredState(
     },
     modelPolicyRevision: "owner-policy-1",
   });
+  const orchestration = createOrchestrationCore(state);
   const turnId = state.appendOwnerMessage("Perform one typed Forge operation.");
-  const commitment = createOrchestrationCore(state).recordCommitment(turnId, {
+  const commitment = orchestration.recordCommitment(turnId, {
     outcome: "One typed Forge operation is completed.",
     criteria: [{
       kind: "forge-operation",
@@ -401,7 +460,47 @@ async function configuredState(
       operation,
     }],
   });
-  return { state, commitment };
+  if (operation === "azure-subscription-inspection") return { state, commitment };
+  const validUntil = new Date(Date.now() + 60_000).toISOString();
+  const standingOrderInstruction =
+    `Begin Acting Authority. Standing Order: update on berghtho/cmd-riker#36; ` +
+    `externally binding reversible effects; cost 0 USD until ${validUntil}.`;
+  const standingOrderTurnId = state.appendOwnerMessage(standingOrderInstruction);
+  const standingOrder = orchestration.recordStandingOrder(standingOrderTurnId, {
+    title: "Issue 36 public comments",
+    instruction: standingOrderInstruction,
+    commitmentIds: [commitment.id],
+    effectClasses: ["update"],
+    targets: ["berghtho/cmd-riker#36"],
+    allowIrreversibleEffects: false,
+    allowExternallyBindingEffects: true,
+    maximumIncrementalSpendUsd: 0,
+    validUntil,
+    ownerInstructionQuote: standingOrderInstruction,
+  });
+  const acting = orchestration.beginActingAuthority(standingOrderTurnId, {
+    commitmentIds: [commitment.id],
+    standingOrderIds: [standingOrder.id],
+    ownerInstructionQuote: standingOrderInstruction,
+  });
+  const authorization = orchestration.authorizeActingAuthorityEffect({
+    actingAuthorityId: acting.id,
+    commitmentId: commitment.id,
+    effectClass: "update",
+    target: "berghtho/cmd-riker#36",
+    reversible: true,
+    externallyBinding: true,
+    incrementalSpendUsd: 0,
+  });
+  return {
+    state,
+    commitment,
+    githubAuthorization: {
+      actingAuthorityId: authorization.actingAuthorityId,
+      authorizationId: authorization.id,
+      standingOrderId: authorization.standingOrderId,
+    },
+  };
 }
 
 function githubCapability(): ForgeCapabilityProof {

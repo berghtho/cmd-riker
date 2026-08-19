@@ -319,6 +319,15 @@ test("production adapter exposes typed Forge operations without provider command
             commitmentId: "commitment-1",
             issueNumber: 36,
             body: "Typed Forge proof.",
+            actingAuthorityEffect: {
+              actingAuthorityId: "acting-1",
+              commitmentId: "commitment-1",
+              effectClass: "update",
+              target: "berghtho/cmd-riker#36",
+              reversible: true,
+              externallyBinding: true,
+              incrementalSpendUsd: 0,
+            },
           },
         },
       };
@@ -368,6 +377,29 @@ test("production adapter exposes typed Forge operations without provider command
   assert.match(firstRequest, /inspect_azure_subscription/);
   assert.doesNotMatch(firstRequest, /gh api|az account/);
   assert.equal(result.content, "The typed GitHub operation is recorded.");
+});
+
+test("production adapter exposes only configured Forge provider tools", async (t) => {
+  let request = "";
+  const localModel = await startLocalModel((_call, requestBody) => {
+    request = JSON.stringify(requestBody);
+    return "Azure inspection is available.";
+  });
+  t.after(() => localModel.close());
+
+  await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Inspect configured provider tools.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    forgeActions: {
+      async inspectAzureSubscription() {
+        throw new Error("not expected");
+      },
+    },
+  });
+
+  assert.match(request, /inspect_azure_subscription/);
+  assert.doesNotMatch(request, /comment_on_github_issue/);
 });
 
 function modelSelection(baseUrl: string): ModelSelection {

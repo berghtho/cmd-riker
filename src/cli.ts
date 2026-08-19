@@ -613,12 +613,9 @@ async function completeOwnerTurn(
           },
         },
         forgeActions: {
-          commentOnGitHubIssue: async (input, actingAuthorityEffect) => {
-            const authority = conversation.forgeAuthorities?.github;
-            if (!authority) throw new Error("GitHub Forge authority is not configured by the Owner.");
-            const authorization = actingAuthorityEffect
-              ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
-              : undefined;
+          ...(conversation.forgeAuthorities?.github ? { commentOnGitHubIssue: async (input, actingAuthorityEffect) => {
+            const authority = conversation.forgeAuthorities!.github!;
+            const authorization = orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect);
             const result = await createForgeOperations(state).execute({
               commitmentId: input.commitmentId,
               operation: {
@@ -629,22 +626,17 @@ async function completeOwnerTurn(
                 expectedAccount: authority.account,
               },
               timeoutMs: 30_000,
-              ...(authorization
-                ? {
-                    actingAuthorityEffectAuthorization: {
-                      actingAuthorityId: authorization.actingAuthorityId,
-                      authorizationId: authorization.id,
-                      standingOrderId: authorization.standingOrderId,
-                    },
-                  }
-                : {}),
+              actingAuthorityEffectAuthorization: {
+                actingAuthorityId: authorization.actingAuthorityId,
+                authorizationId: authorization.id,
+                standingOrderId: authorization.standingOrderId,
+              },
             });
             orchestration.observeForgeOperationResult(input.commitmentId, result);
             return result;
-          },
-          inspectAzureSubscription: async (commitmentId) => {
-            const authority = conversation.forgeAuthorities?.azure;
-            if (!authority) throw new Error("Azure Forge authority is not configured by the Owner.");
+          } } : {}),
+          ...(conversation.forgeAuthorities?.azure ? { inspectAzureSubscription: async (commitmentId) => {
+            const authority = conversation.forgeAuthorities!.azure!;
             const result = await createForgeOperations(state).execute({
               commitmentId,
               operation: {
@@ -656,7 +648,7 @@ async function completeOwnerTurn(
             });
             orchestration.observeForgeOperationResult(commitmentId, result);
             return result;
-          },
+          } } : {}),
         },
       });
       state.appendLeadAgentMessage(turnId, response.content, {

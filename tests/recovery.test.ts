@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   openAuthoritativeState,
@@ -80,6 +82,20 @@ test("external evidence reconciles an uncertain effect without reusing its attem
         },
       }),
     /preserve the original effect identity and scope/,
+  );
+  assert.throws(
+    () =>
+      orchestration.reconcileEffect({
+        effectIntentId: effect.id,
+        disposition: "confirmed-applied",
+        evidence: {
+          source: "compensation-result",
+          reference: "recovery-log://compensation-1",
+          summary: "Compensation evidence cannot prove that the original effect was applied.",
+          observedAt: "2026-08-19T14:01:00.000Z",
+        },
+      }),
+    /compensation evidence.*does not prove.*confirmed-applied/i,
   );
 
   orchestration.reconcileEffect({
@@ -331,6 +347,35 @@ test("restore preserves damaged evidence and blocks mutations until post-backup 
       ],
     }),
   );
+  const unrelatedDatabasePath = join(backupDirectory, "unrelated.sqlite");
+  const unrelatedDatabase = new DatabaseSync(unrelatedDatabasePath);
+  unrelatedDatabase.exec("CREATE TABLE unrelated (value TEXT) STRICT;");
+  unrelatedDatabase.close();
+  const unrelatedSha256 = createHash("sha256")
+    .update(await readFile(unrelatedDatabasePath))
+    .digest("hex");
+  await writeFile(
+    `${unrelatedDatabasePath}.manifest.json`,
+    JSON.stringify({
+      version: 1,
+      databasePath: unrelatedDatabasePath,
+      sha256: unrelatedSha256,
+      createdAt: "2026-08-19T14:09:00.000Z",
+      lastJournalSequence: 0,
+      backupId: "invented-backup",
+      sourceStateId: "invented-state",
+      writeGeneration: 1,
+    }),
+  );
+  const unrelatedRestore = await runCli(stateDirectory, [
+    "--restore-state-backup",
+    unrelatedDatabasePath,
+    "--post-backup-inventory",
+    inventoryPath,
+  ]);
+  assert.equal(unrelatedRestore.code, 2);
+  assert.match(unrelatedRestore.stderr, /CMD Riker backup provenance|CMD Riker schema/i);
+
   const restoreResult = await runCli(stateDirectory, [
     "--restore-state-backup",
     backupPath,

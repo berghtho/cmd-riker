@@ -109,6 +109,32 @@ export type EffectReconciliation = {
   reconciledBy: "lead-agent";
 };
 
+export function assertExternalEffectEvidence(evidence: ExternalEffectEvidence): void {
+  if (
+    !evidence.reference.trim() ||
+    !evidence.summary.trim() ||
+    !Number.isFinite(Date.parse(evidence.observedAt))
+  ) {
+    throw new Error("Effect reconciliation requires attributed external evidence.");
+  }
+}
+
+export function assertEffectEvidenceSupportsDisposition(
+  disposition: EffectReconciliation["disposition"],
+  evidence: EffectReconciliation["evidence"],
+): void {
+  assertExternalEffectEvidence(evidence);
+  if (disposition === "compensated") {
+    if (evidence.source !== "compensation-result") {
+      throw new Error("A compensated effect requires attributed compensation evidence.");
+    }
+    return;
+  }
+  if (evidence.source === "compensation-result") {
+    throw new Error(`Compensation evidence does not prove disposition ${disposition}.`);
+  }
+}
+
 export type TargetProjectOperationEffectIntent = EffectIntentBase & {
   kind: "target-project-operation";
   operationAttemptId: string;

@@ -27,6 +27,10 @@ import type {
   WorkerQuestion,
   WorkerSession,
 } from "../orchestration-core/index.ts";
+import {
+  assertEffectEvidenceSupportsDisposition,
+  assertExternalEffectEvidence,
+} from "../target-project-operations/index.ts";
 import type {
   EffectIntent,
   ExternalEffectEvidence,
@@ -93,6 +97,9 @@ export type AuthoritativeStateRecovery = {
 
 export type AuthoritativeStateBackup = {
   version: 1;
+  backupId: string;
+  sourceStateId: string;
+  writeGeneration: number;
   databasePath: string;
   sha256: string;
   createdAt: string;
@@ -1439,6 +1446,9 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     async createBackup(databasePath) {
+      if (!readConfigurationRow()) {
+        throw new Error("An Authoritative State backup requires initialized CMD Riker state.");
+      }
       const destination = resolve(databasePath);
       const liveDatabase = resolve(join(stateDirectory, "authoritative-state.sqlite"));
       if (destination === liveDatabase) {
@@ -1452,15 +1462,27 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       const row = database.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM facts").get() as {
         sequence: number;
       };
+      const identity = readStateIdentity(database);
+      const backupId = randomUUID();
+      const createdAt = new Date().toISOString();
+      database
+        .prepare(`
+          INSERT INTO state_backups (id, state_id, write_generation, last_journal_sequence, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `)
+        .run(backupId, identity.stateId, identity.writeGeneration, row.sequence, createdAt);
       await backupDatabase(database, destination);
-      verifyDatabaseFile(destination);
       const manifest: AuthoritativeStateBackup = {
         version: 1,
+        backupId,
+        sourceStateId: identity.stateId,
+        writeGeneration: identity.writeGeneration,
         databasePath: destination,
         sha256: sha256File(destination),
-        createdAt: new Date().toISOString(),
+        createdAt,
         lastJournalSequence: row.sequence,
       };
+      verifyCmdRikerBackupProvenance(destination, manifest);
       writeJsonAtomically(backupManifestPath(destination), manifest);
       return manifest;
     },
@@ -1553,7 +1575,11 @@ export function reconcilePostBackupEffect(input: {
 }): AuthoritativeStateRecovery {
   const stateDirectory = resolve(input.stateDirectory);
   const recovery = loadRecoveryStatus(stateDirectory);
-  if (recovery?.phase !== "post-backup-reconciliation" || !recovery.postBackupInventory) {
+  if (
+    recovery?.phase !== "post-backup-reconciliation" ||
+    !recovery.postBackupInventory ||
+    !recovery.restoredBackup
+  ) {
     throw new Error("Post-backup effect reconciliation requires a restored recovery state.");
   }
   const effect = recovery.postBackupInventory.effects.find((candidate) => candidate.id === input.effectId);
@@ -1561,10 +1587,7 @@ export function reconcilePostBackupEffect(input: {
   if (recovery.postBackupReconciliations?.some((item) => item.effectId === input.effectId)) {
     throw new Error(`Post-backup effect ${input.effectId} is already reconciled.`);
   }
-  validateExternalEvidence(input.evidence);
-  if (input.disposition === "compensated" && input.evidence.source !== "compensation-result") {
-    throw new Error("A compensated effect requires attributed compensation evidence.");
-  }
+  assertEffectEvidenceSupportsDisposition(input.disposition, input.evidence);
   const updated: AuthoritativeStateRecovery = {
     ...recovery,
     postBackupReconciliations: [
@@ -1585,7 +1608,11 @@ export function reconcilePostBackupEffect(input: {
 export function completeAuthoritativeStateRecovery(stateDirectoryInput: string): void {
   const stateDirectory = resolve(stateDirectoryInput);
   const recovery = loadRecoveryStatus(stateDirectory);
-  if (recovery?.phase !== "post-backup-reconciliation" || !recovery.postBackupInventory) {
+  if (
+    recovery?.phase !== "post-backup-reconciliation" ||
+    !recovery.postBackupInventory ||
+    !recovery.restoredBackup
+  ) {
     throw new Error("Authoritative State recovery is not ready for completion.");
   }
   const reconciled = new Set(
@@ -1597,7 +1624,10 @@ export function completeAuthoritativeStateRecovery(stateDirectoryInput: string):
       `Post-backup effect ${unresolved.id} requires external evidence before recovery can complete.`,
     );
   }
-  verifyDatabaseFile(join(stateDirectory, "authoritative-state.sqlite"));
+  verifyCmdRikerBackupProvenance(
+    join(stateDirectory, "authoritative-state.sqlite"),
+    recovery.restoredBackup,
+  );
   writeJsonAtomically(
     join(recovery.damagedEvidenceDirectory, "completed-recovery.json"),
     { ...recovery, completedAt: new Date().toISOString(), mutationPolicy: "enabled" },
@@ -1693,13 +1723,93 @@ function readVerifiedBackup(databasePathInput: string): AuthoritativeStateBackup
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as AuthoritativeStateBackup;
   if (
     manifest.version !== 1 ||
+    typeof manifest.backupId !== "string" ||
+    !manifest.backupId.trim() ||
+    typeof manifest.sourceStateId !== "string" ||
+    !manifest.sourceStateId.trim() ||
+    !Number.isInteger(manifest.writeGeneration) ||
+    manifest.writeGeneration < 1 ||
+    !Number.isInteger(manifest.lastJournalSequence) ||
+    manifest.lastJournalSequence < 0 ||
+    !Number.isFinite(Date.parse(manifest.createdAt)) ||
     resolve(manifest.databasePath) !== databasePath ||
     manifest.sha256 !== sha256File(databasePath)
   ) {
     throw new Error("Authoritative State backup integrity verification failed.");
   }
-  verifyDatabaseFile(databasePath);
+  verifyCmdRikerBackupProvenance(databasePath, manifest);
   return { ...manifest, databasePath };
+}
+
+function readStateIdentity(database: DatabaseSync): {
+  stateId: string;
+  writeGeneration: number;
+} {
+  const row = database
+    .prepare(`
+      SELECT state_id AS stateId, write_generation AS writeGeneration
+        FROM state_identity
+       WHERE singleton = 1
+    `)
+    .get() as { stateId: string; writeGeneration: number } | undefined;
+  if (!row) throw new Error("CMD Riker Authoritative State identity is missing.");
+  return row;
+}
+
+function verifyCmdRikerBackupProvenance(
+  databasePath: string,
+  manifest: AuthoritativeStateBackup,
+): void {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assertDatabaseIntegrity(database);
+    const identity = readStateIdentity(database);
+    const backup = database
+      .prepare(`
+        SELECT state_id AS stateId,
+               write_generation AS writeGeneration,
+               last_journal_sequence AS lastJournalSequence,
+               created_at AS createdAt
+          FROM state_backups
+         WHERE id = ?
+      `)
+      .get(manifest.backupId) as {
+      stateId: string;
+      writeGeneration: number;
+      lastJournalSequence: number;
+      createdAt: string;
+    } | undefined;
+    const journal = database
+      .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM facts")
+      .get() as { sequence: number };
+    const configuration = database
+      .prepare("SELECT 1 FROM facts WHERE kind = 'owner.configuration' LIMIT 1")
+      .get();
+    if (
+      !configuration ||
+      identity.stateId !== manifest.sourceStateId ||
+      identity.writeGeneration !== manifest.writeGeneration ||
+      !backup ||
+      backup.stateId !== manifest.sourceStateId ||
+      backup.writeGeneration !== manifest.writeGeneration ||
+      backup.lastJournalSequence !== manifest.lastJournalSequence ||
+      backup.createdAt !== manifest.createdAt ||
+      journal.sequence !== manifest.lastJournalSequence
+    ) {
+      throw new Error("CMD Riker backup provenance does not match its embedded state lineage.");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("CMD Riker backup provenance")) {
+      throw error;
+    }
+    throw new Error(
+      `CMD Riker backup provenance or schema verification failed: ${
+        error instanceof Error ? error.message : "unknown verification failure"
+      }`,
+    );
+  } finally {
+    database.close();
+  }
 }
 
 function sha256File(path: string): string {
@@ -1723,7 +1833,7 @@ function validatePostBackupInventory(inventory: PostBackupEffectInventory): void
       "Restore requires external evidence that the post-backup effect inventory is complete.",
     );
   }
-  validateExternalEvidence(inventory.completenessEvidence);
+  assertExternalEffectEvidence(inventory.completenessEvidence);
   const identities = new Set<string>();
   for (const effect of inventory.effects) {
     if (
@@ -1735,18 +1845,6 @@ function validatePostBackupInventory(inventory: PostBackupEffectInventory): void
       throw new Error("Post-backup effect inventory requires unique attributed effects.");
     }
     identities.add(effect.id);
-  }
-}
-
-function validateExternalEvidence(
-  evidence: ExternalEffectEvidence,
-): void {
-  if (
-    !evidence.reference.trim() ||
-    !evidence.summary.trim() ||
-    !Number.isFinite(Date.parse(evidence.observedAt))
-  ) {
-    throw new Error("Effect reconciliation requires attributed external evidence.");
   }
 }
 
@@ -1960,7 +2058,28 @@ function ensureSchema(database: DatabaseSync): void {
       fact_id TEXT NOT NULL UNIQUE REFERENCES facts(id),
       recorded_at TEXT NOT NULL
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS state_identity (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      state_id TEXT NOT NULL UNIQUE,
+      write_generation INTEGER NOT NULL CHECK (write_generation > 0)
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS state_backups (
+      id TEXT PRIMARY KEY,
+      state_id TEXT NOT NULL,
+      write_generation INTEGER NOT NULL CHECK (write_generation > 0),
+      last_journal_sequence INTEGER NOT NULL CHECK (last_journal_sequence >= 0),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (state_id) REFERENCES state_identity(state_id)
+    ) STRICT;
   `);
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO state_identity (singleton, state_id, write_generation)
+      VALUES (1, ?, 1)
+    `)
+    .run(randomUUID());
   const row = database
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts'")
     .get() as { sql: string };

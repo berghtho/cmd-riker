@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import type { ModelSelection } from "../model-selection.ts";
+import { assertEffectEvidenceSupportsDisposition } from "../target-project-operations/index.ts";
 import type {
   EffectIntent,
   EffectReconciliation,
@@ -798,13 +799,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (!effectIntent || effectIntent.status !== "unknown") {
         throw new Error("Only an uncertain effect can be reconciled.");
       }
-      if (
-        !input.evidence.reference.trim() ||
-        !input.evidence.summary.trim() ||
-        !Number.isFinite(Date.parse(input.evidence.observedAt))
-      ) {
-        throw new Error("Effect reconciliation requires attributed external evidence.");
-      }
+      assertEffectEvidenceSupportsDisposition(input.disposition, input.evidence);
       state.reconcileEffectIntent({
         ...effectIntent,
         status: "reconciled",

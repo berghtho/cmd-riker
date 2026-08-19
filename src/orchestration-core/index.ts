@@ -109,6 +109,15 @@ export type Commitment = {
     kind: "blocked" | "paused" | "reconciling";
     reason: string;
     nextAction: string;
+    ownerAttention?:
+      | "owner-reserved-decision"
+      | "recovery-exhausted"
+      | "trusted-base-loss"
+      | "mission-critical-impairment";
+    ownerAttentionCause?: {
+      kind: "worker-recovery-exhausted";
+      workerSessionId: string;
+    };
   };
   disposition?: {
     kind: "cancelled" | "superseded";
@@ -253,6 +262,11 @@ export type WorkerSession = {
     | "failed"
     | "cancelled";
   currentExecutionAttemptId: string;
+  ownerAttention?: {
+    kind: "recovery-exhausted";
+    reason: string;
+    nextAction: string;
+  };
   cancellation?: {
     kind: "owner" | "deadline";
     requestedAt: string;
@@ -270,7 +284,8 @@ type WorkerAssignmentBase = {
     commitmentId?: string;
     coordination?:
       | { role: "implementer"; repairOfReviewFindingIds?: string[] }
-      | { role: "reviewer"; reviewOfWorkerSessionId: string };
+      | { role: "reviewer"; reviewOfWorkerSessionId: string }
+      | { role: "recovery"; recoveryOfWorkerSessionId: string; reason: string };
 };
 
 export type ReviewFinding = {
@@ -386,6 +401,10 @@ export type WorkerQuestion = {
     isOther: boolean;
   }>;
   status: "open" | "answer-recorded" | "delivered" | "cancelled";
+  ownerAttention?: {
+    kind: "owner-reserved-decision";
+    reason: string;
+  };
   answer?: {
     ownerTurnId: string;
     answers: Record<string, string[]>;
@@ -647,6 +666,15 @@ export interface OrchestrationCore {
     validations: readonly ModelCandidateValidation[],
   ): void;
   recordCommitment(ownerTurnId: string, draft: CommitmentDraft): Commitment;
+  recordCommitmentOwnerAttention(
+    commitmentId: string,
+    input: {
+      kind: NonNullable<Commitment["condition"]>["ownerAttention"];
+      reason: string;
+      nextAction: string;
+      cause?: NonNullable<Commitment["condition"]>["ownerAttentionCause"];
+    },
+  ): Commitment;
   reconcileInterruptedCommitments(): void;
   reconcileEffect(input: {
     effectIntentId: string;
@@ -697,6 +725,8 @@ export interface OrchestrationCore {
     modelSelection: WorkerModelSelection;
     modelPolicyRevision: string;
     commitmentId?: string;
+    recoveryOfWorkerSessionId?: string;
+    recoveryReason?: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
   delegateEffectfulWorker(input: {
     objective: string;
@@ -758,6 +788,7 @@ export interface OrchestrationCore {
     itemId: string;
     questions: WorkerQuestion["questions"];
   }): WorkerQuestion;
+  reserveWorkerQuestionForOwner(questionId: string, reason: string): WorkerQuestion;
   recordWorkerAnswer(
     questionId: string,
     ownerTurnId: string,
@@ -1242,6 +1273,41 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return active;
     },
 
+    recordCommitmentOwnerAttention(commitmentId, input) {
+      if (!input.kind || !input.reason.trim() || !input.nextAction.trim()) {
+        throw new Error("Material Commitment attention requires a kind, reason, and recovery condition.");
+      }
+      const commitment = state.readCommitment(commitmentId);
+      if (!commitment) throw new Error(`Unknown Commitment ${commitmentId}.`);
+      if (["accepted", "cancelled", "superseded"].includes(commitment.state)) {
+        throw new Error(`Terminal Commitment ${commitmentId} cannot require Owner attention.`);
+      }
+      if (input.cause) {
+        if (input.kind !== "recovery-exhausted") {
+          throw new Error("Only exhausted recovery attention can reference a Worker recovery cause.");
+        }
+        const worker = requireWorkerSession(state, input.cause.workerSessionId);
+        if (
+          worker.ownerAttention?.kind !== "recovery-exhausted" ||
+          worker.assignment.commitmentId !== commitmentId
+        ) {
+          throw new Error("Commitment attention must reference an exhausted Worker in the same scope.");
+        }
+      }
+      const material: Commitment = {
+        ...commitment,
+        condition: {
+          kind: "blocked",
+          reason: input.reason,
+          nextAction: input.nextAction,
+          ownerAttention: input.kind,
+          ...(input.cause ? { ownerAttentionCause: input.cause } : {}),
+        },
+      };
+      state.appendCommitmentSnapshots([material]);
+      return material;
+    },
+
     reconcileInterruptedCommitments() {
       for (const attempt of state.readLeadTurnAttempts()) {
         if (attempt.status !== "started") continue;
@@ -1591,6 +1657,32 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (input.commitmentId && !state.readCommitment(input.commitmentId)) {
         throw new Error(`Unknown Commitment ${input.commitmentId}.`);
       }
+      const hasRecoveryTarget = Boolean(input.recoveryOfWorkerSessionId);
+      const hasRecoveryReason = Boolean(input.recoveryReason?.trim());
+      if (hasRecoveryTarget !== hasRecoveryReason) {
+        throw new Error("A recovery Worker requires both its exhausted Worker and changed hypothesis.");
+      }
+      let recoveryCoordination: Extract<
+        NonNullable<WorkerAssignmentBase["coordination"]>,
+        { role: "recovery" }
+      > | undefined;
+      if (input.recoveryOfWorkerSessionId && input.recoveryReason) {
+        const exhausted = requireWorkerSession(state, input.recoveryOfWorkerSessionId);
+        if (exhausted.ownerAttention?.kind !== "recovery-exhausted") {
+          throw new Error(`Worker Session ${exhausted.id} has no exhausted recovery to assign.`);
+        }
+        if (
+          exhausted.assignment.targetProjectPath !== input.targetProjectPath ||
+          exhausted.assignment.commitmentId !== input.commitmentId
+        ) {
+          throw new Error("Recovery Ownership must preserve Target Project and Commitment scope.");
+        }
+        recoveryCoordination = {
+          role: "recovery",
+          recoveryOfWorkerSessionId: exhausted.id,
+          reason: input.recoveryReason,
+        };
+      }
       const workerSessionId = randomUUID();
       const executionAttemptId = randomUUID();
       const workerSession: WorkerSession = {
@@ -1602,6 +1694,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           readOnly: true,
           modelPolicyRevision: input.modelPolicyRevision,
           ...(input.commitmentId ? { commitmentId: input.commitmentId } : {}),
+          ...(recoveryCoordination ? { coordination: recoveryCoordination } : {}),
         },
         state: "starting",
         currentExecutionAttemptId: executionAttemptId,
@@ -2019,6 +2112,22 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       });
       return question;
     },
+
+    reserveWorkerQuestionForOwner(questionId, reason) {
+      if (!reason.trim()) throw new Error("An Owner-reserved Worker question requires a reason.");
+      const question = state.readWorkerQuestion(questionId);
+      if (!question) throw new Error(`Unknown Worker question ${questionId}.`);
+      if (question.status !== "open" && question.status !== "answer-recorded") {
+        throw new Error(`Worker question ${questionId} no longer needs Owner attention.`);
+      }
+      const reserved: WorkerQuestion = {
+        ...question,
+        ownerAttention: { kind: "owner-reserved-decision", reason },
+      };
+      state.appendWorkerQuestionSnapshots([reserved]);
+      return reserved;
+    },
+
 
     recordWorkerAnswer(questionId, ownerTurnId, answers) {
       if (state.ownerTurnSequence(ownerTurnId) === undefined) {
@@ -3227,7 +3336,16 @@ function blockWorkerRecovery(
   };
   state.appendWorkerState({
     executionAttempt: { ...attempt, status: "blocked", failure: reason, outcome },
-    workerSession: { ...worker, state: "blocked", outcome },
+    workerSession: {
+      ...worker,
+      state: "blocked",
+      outcome,
+      ownerAttention: {
+        kind: "recovery-exhausted",
+        reason: "Automatic Worker recovery exhausted its bounded attempts.",
+        nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
+      },
+    },
   });
 }
 

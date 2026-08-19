@@ -51,6 +51,15 @@ import {
   type WorkerSupervisor,
 } from "./worker-supervisor/index.ts";
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
+import {
+  parseSessionViewControl,
+  parseSessionViewInspection,
+  parseSessionViewWorkerInspection,
+  projectSessionView,
+  renderSessionView,
+  renderSessionWorkers,
+  type SessionViewSnapshot,
+} from "./session-view/index.ts";
 
 async function main(): Promise<void> {
   const stateDirectory = argumentValue("--state-dir");
@@ -229,11 +238,18 @@ async function runScriptableConversation(
   workerSupervisor: WorkerSupervisor | undefined,
 ): Promise<void> {
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
+  process.stdout.write(`${currentSessionView(state, workerSupervisor)}\n`);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInput of lines) {
     if (!ownerInput.trim()) continue;
-    const content = await completeOwnerTurn(state, adapter, ownerInput, workerSupervisor);
-    process.stdout.write(`Lead Agent: ${content}\n`);
+    const output = await completeOwnerInteraction(
+      state,
+      adapter,
+      ownerInput,
+      workerSupervisor,
+    );
+    process.stdout.write(`${output.source}: ${output.content}\n`);
+    process.stdout.write(`${currentSessionView(state, workerSupervisor)}\n`);
   }
 }
 
@@ -251,22 +267,38 @@ function runInteractiveConversation(
   );
   transcriptLines.push(...state.readCommitments().map(commitmentNotice));
   const transcript = new Text(transcriptLines.join("\n\n"));
+  const sessionView = new Text(currentSessionView(state, workerSupervisor));
   const input = new Input();
   let busy = false;
   let stopRequested = false;
 
   tui.addChild(new Text(`CMD Riker | Target Project: ${targetProjectPath}`));
   tui.addChild(transcript);
+  tui.addChild(sessionView);
   tui.addChild(new Text("Owner:"));
   tui.addChild(input);
   tui.setFocus(input);
 
   return new Promise((resolve, reject) => {
+    let renderedSessionView = currentSessionView(state, workerSupervisor);
+    const refreshSessionView = () => {
+      const next = currentSessionView(
+        state,
+        workerSupervisor,
+        busy ? "responding" : "available",
+      );
+      if (next === renderedSessionView) return;
+      renderedSessionView = next;
+      sessionView.setText(next);
+      tui.requestRender();
+    };
+    const refreshTimer = setInterval(refreshSessionView, 250);
     const stop = () => {
       if (busy) {
         stopRequested = true;
         return;
       }
+      clearInterval(refreshTimer);
       tui.stop();
       resolve();
     };
@@ -283,22 +315,121 @@ function runInteractiveConversation(
       input.setValue("");
       transcriptLines.push(`Owner: ${ownerInput}`, "Lead Agent: thinking...");
       transcript.setText(transcriptLines.join("\n\n"));
+      refreshSessionView();
       tui.requestRender();
-      void completeOwnerTurn(state, adapter, ownerInput, workerSupervisor)
-        .then((content) => {
-          transcriptLines[transcriptLines.length - 1] = `Lead Agent: ${content}`;
+      void completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor)
+        .then((output) => {
+          transcriptLines[transcriptLines.length - 1] = `${output.source}: ${output.content}`;
           transcript.setText(transcriptLines.join("\n\n"));
           busy = false;
+          refreshSessionView();
           if (stopRequested) stop();
           else tui.requestRender();
         })
         .catch((error: unknown) => {
+          clearInterval(refreshTimer);
           tui.stop();
           reject(error);
         });
     };
     input.onEscape = stop;
     tui.start();
+  });
+}
+
+type OwnerInteractionOutput = {
+  source: "Lead Agent" | "Session View";
+  content: string;
+};
+
+async function completeOwnerInteraction(
+  state: AuthoritativeState,
+  adapter: PiTurnAdapter,
+  ownerInput: string,
+  workerSupervisor?: WorkerSupervisor,
+): Promise<OwnerInteractionOutput> {
+  if (!/^\/session\s+/i.test(ownerInput)) {
+    return {
+      source: "Lead Agent",
+      content: await completeOwnerTurn(state, adapter, ownerInput, workerSupervisor),
+    };
+  }
+  const snapshot = sessionViewSnapshot(state, workerSupervisor);
+  if (/^\/session\s+workers\s*$/i.test(ownerInput)) {
+    return {
+      source: "Session View",
+      content: renderSessionWorkers(snapshot),
+    };
+  }
+  const workerInspection = parseSessionViewWorkerInspection(snapshot, ownerInput);
+  if (workerInspection) {
+    return {
+      source: "Session View",
+      content: renderSessionWorkers(snapshot, workerInspection.id),
+    };
+  }
+  const inspection = parseSessionViewInspection(snapshot, ownerInput);
+  if (inspection) {
+    const detailedSnapshot = sessionViewSnapshot(
+      state,
+      workerSupervisor,
+      "available",
+      true,
+    );
+    return {
+      source: "Session View",
+      content: renderSessionView(detailedSnapshot, inspection.id),
+    };
+  }
+  const action = parseSessionViewControl(snapshot, ownerInput);
+  if (!action) {
+    return {
+      source: "Session View",
+      content: "That intervention is not available for the current authoritative state.",
+    };
+  }
+  const ownerTurnId = state.appendOwnerMessage(ownerInput);
+  if (action.kind === "pause") {
+    createOrchestrationCore(state).pauseCommitment(
+      action.targetId,
+      ownerTurnId,
+      "Owner requested a pause from the Session View.",
+    );
+    return {
+      source: "Session View",
+      content: "Pause recorded. Linked Worker activity and any effects remain separate facts.",
+    };
+  }
+  if (!workerSupervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
+  await workerSupervisor.cancel(
+    action.targetId,
+    ownerTurnId,
+    "Owner requested cancellation from the Session View.",
+  );
+  return {
+    source: "Session View",
+    content: "Cancellation intent recorded and sent. Existing effects are not rolled back.",
+  };
+}
+
+function currentSessionView(
+  state: AuthoritativeState,
+  workerSupervisor?: WorkerSupervisor,
+  leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
+): string {
+  return renderSessionView(sessionViewSnapshot(state, workerSupervisor, leadAvailability));
+}
+
+function sessionViewSnapshot(
+  state: AuthoritativeState,
+  workerSupervisor?: WorkerSupervisor,
+  leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
+  includeHealthAssessments = false,
+): SessionViewSnapshot {
+  return projectSessionView(state, {
+    leadAvailability,
+    cancellationAvailable: Boolean(workerSupervisor),
+    includeHealthAssessments,
   });
 }
 
@@ -368,6 +499,8 @@ async function completeOwnerTurn(
                   objective: string;
                   prompt: string;
                   commitmentId?: string;
+                  recoveryOfWorkerSessionId?: string;
+                  recoveryReason?: string;
                 }) =>
                   workerSupervisor.delegate({
                     ...input,
@@ -386,6 +519,9 @@ async function completeOwnerTurn(
                   }),
                 adjudicateReview: (input) =>
                   orchestration.adjudicateReview(input.commitmentId, input.decisions),
+                reserveOwnerDecision: (questionId: string, reason: string) => {
+                  orchestration.reserveWorkerQuestionForOwner(questionId, reason);
+                },
                 ...(workerCapabilities!.effectful
                   ? {
                       delegateEffectful: (input: {
@@ -430,6 +566,9 @@ async function completeOwnerTurn(
           : {}),
         commitmentActions: {
           record: (draft) => orchestration.recordCommitment(turnId, draft),
+          recordOwnerAttention: (commitmentId, input) => {
+            orchestration.recordCommitmentOwnerAttention(commitmentId, input);
+          },
           accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
           resume: (commitmentId) => orchestration.resumeCommitment(commitmentId, turnId),
           control: (commitmentId, action, reason, replacementCommitmentId) => {

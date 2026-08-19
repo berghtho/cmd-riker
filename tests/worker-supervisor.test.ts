@@ -228,6 +228,14 @@ test("a native Codex question keeps one durable identity and its answer is recor
   assert.equal(question?.executionAttemptId, started.executionAttemptId);
   assert.equal(question?.providerRequestId, 0);
   assert.equal(question?.status, "open");
+  const reserved = createOrchestrationCore(state).reserveWorkerQuestionForOwner(
+    question!.id,
+    "The question crosses a product boundary reserved to the Owner.",
+  );
+  assert.deepEqual(reserved.ownerAttention, {
+    kind: "owner-reserved-decision",
+    reason: "The question crosses a product boundary reserved to the Owner.",
+  });
   execution.beforeAnswer = () => {
     assert.equal(state.readWorkerQuestion(question!.id)?.status, "answer-recorded");
   };
@@ -943,12 +951,24 @@ test("orchestration blocks startup recovery after its bounded read-only attempts
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-worker-start-block-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
   const state = openAuthoritativeState(stateDirectory);
+  state.initialize(ownerConfiguration());
+  const orchestration = createOrchestrationCore(state);
+  const ownerTurnId = state.appendOwnerMessage("Inspect the Target Project architecture.");
+  const commitment = orchestration.recordCommitment(ownerTurnId, {
+    outcome: "The Target Project architecture is inspected.",
+    criteria: [{
+      kind: "response-includes",
+      description: "The inspection reports the relevant module seams.",
+      expectedText: "module seams",
+    }],
+  });
+  const assignment = { ...workerAssignment(), commitmentId: commitment.id };
   const harness = new FakeCodexHarness();
   harness.failNextStartAfterProcess();
   harness.failNextStartAfterProcess();
   harness.failNextStartAfterProcess();
   const supervisor = createWorkerSupervisor(state, harness);
-  const started = await supervisor.delegate(workerAssignment());
+  const started = await supervisor.delegate(assignment);
 
   await waitFor(() => state.readWorkerSession(started.workerSessionId)?.state === "blocked");
 
@@ -960,6 +980,41 @@ test("orchestration blocks startup recovery after its bounded read-only attempts
     "blocked",
   );
   assert.match(worker?.outcome?.unresolvedUncertainty ?? "", /turn\/start response lost/);
+  assert.deepEqual(worker?.ownerAttention, {
+    kind: "recovery-exhausted",
+    reason: "Automatic Worker recovery exhausted its bounded attempts.",
+    nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
+  });
+  orchestration.recordCommitmentOwnerAttention(commitment.id, {
+    kind: "recovery-exhausted",
+    reason: "The linked Worker exhausted automatic recovery.",
+    nextAction: "The Owner must choose a changed recovery strategy.",
+    cause: {
+      kind: "worker-recovery-exhausted",
+      workerSessionId: started.workerSessionId,
+    },
+  });
+  assert.deepEqual(state.readCommitment(commitment.id)?.condition?.ownerAttentionCause, {
+    kind: "worker-recovery-exhausted",
+    workerSessionId: started.workerSessionId,
+  });
+  const recovery = await supervisor.delegate({
+    ...assignment,
+    recoveryOfWorkerSessionId: started.workerSessionId,
+    recoveryReason: "A fresh Worker owns the changed recovery hypothesis.",
+  });
+  await waitFor(
+    () => state.readWorkerExecutionAttempt(recovery.executionAttemptId)?.status === "running",
+  );
+  assert.equal(
+    state.readWorkerSession(started.workerSessionId)?.ownerAttention?.kind,
+    "recovery-exhausted",
+  );
+  assert.deepEqual(state.readWorkerSession(recovery.workerSessionId)?.assignment.coordination, {
+    role: "recovery",
+    recoveryOfWorkerSessionId: started.workerSessionId,
+    reason: "A fresh Worker owns the changed recovery hypothesis.",
+  });
   state.close();
 });
 

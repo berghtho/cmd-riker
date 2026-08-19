@@ -44,6 +44,15 @@ export type PiTurnRequest = {
   commitments?: readonly Commitment[];
   commitmentActions?: {
     record(draft: CommitmentDraft): Commitment;
+    recordOwnerAttention(
+      commitmentId: string,
+      input: {
+        kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
+        reason: string;
+        nextAction: string;
+        cause?: { kind: "worker-recovery-exhausted"; workerSessionId: string };
+      },
+    ): void;
     accept(commitmentId: string): void;
     resume(commitmentId: string): void;
     control(
@@ -92,6 +101,8 @@ export type PiTurnRequest = {
       objective: string;
       prompt: string;
       commitmentId?: string;
+      recoveryOfWorkerSessionId?: string;
+      recoveryReason?: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     delegateEffectful?(input: {
       objective: string;
@@ -112,6 +123,7 @@ export type PiTurnRequest = {
         rationale: string;
       }>;
     }): void;
+    reserveOwnerDecision?(questionId: string, reason: string): void;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -620,6 +632,48 @@ function commitmentTools(
       },
     },
     {
+      name: "record_material_commitment_attention",
+      label: "Record Material Commitment Attention",
+      description:
+        "Record an Owner-facing Commitment blocker only for a reserved decision, exhausted recovery, trusted-base loss, or mission-critical impairment, with the actual fact and recovery condition. When promoting an exhausted Worker recovery, include that Worker as the causal source.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        kind: Type.Union([
+          Type.Literal("owner-reserved-decision"),
+          Type.Literal("recovery-exhausted"),
+          Type.Literal("trusted-base-loss"),
+          Type.Literal("mission-critical-impairment"),
+        ]),
+        reason: Type.String({ minLength: 1 }),
+        nextAction: Type.String({ minLength: 1 }),
+        cause: Type.Optional(Type.Object({
+          kind: Type.Literal("worker-recovery-exhausted"),
+          workerSessionId: Type.String({ minLength: 1 }),
+        })),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, kind, reason, nextAction, cause } = params as {
+          commitmentId: string;
+          kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
+          reason: string;
+          nextAction: string;
+          cause?: { kind: "worker-recovery-exhausted"; workerSessionId: string };
+        };
+        actions.recordOwnerAttention(commitmentId, {
+          kind,
+          reason,
+          nextAction,
+          ...(cause ? { cause } : {}),
+        });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Material attention recorded for Commitment ${commitmentId}.` }],
+          details: { commitmentId, kind },
+        };
+      },
+    },
+    {
       name: "resume_commitment",
       label: "Resume Commitment",
       description: "Bind a blocked or paused Commitment to this Owner turn so its outcome can continue.",
@@ -874,11 +928,19 @@ function workerTools(
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
         commitmentId: Type.Optional(Type.String({ minLength: 1 })),
+        recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
+        recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const result = await actions.delegate(
-          params as { objective: string; prompt: string; commitmentId?: string },
+          params as {
+            objective: string;
+            prompt: string;
+            commitmentId?: string;
+            recoveryOfWorkerSessionId?: string;
+            recoveryReason?: string;
+          },
         );
         observer.onMutation();
         return {
@@ -1033,6 +1095,31 @@ function workerTools(
       },
     });
   }
+  if (capabilities.nativeQuestions && actions.reserveOwnerDecision) {
+    tools.push({
+      name: "reserve_worker_question_for_owner",
+      label: "Reserve Worker Question for Owner",
+      description:
+        "Classify one open Worker question as an Owner-reserved decision only when authority or product judgment requires the Owner. Answering remains conversational.",
+      parameters: Type.Object({
+        questionId: Type.String({ minLength: 1 }),
+        reason: Type.String({ minLength: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { questionId, reason } = params as { questionId: string; reason: string };
+        actions.reserveOwnerDecision!(questionId, reason);
+        observer.onMutation();
+        return {
+          content: [{
+            type: "text",
+            text: `Worker question ${questionId} is reserved for an Owner decision in the Session View.`,
+          }],
+          details: { questionId },
+        };
+      },
+    });
+  }
   if (capabilities.cancellation && actions.cancel) {
     tools.push({
       name: "cancel_worker_session",
@@ -1089,7 +1176,9 @@ function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerAction
     (capabilities.effectful
       ? " Effectful work is confined to the active Target Project checkout; first record one Commitment with a target-project-operation test criterion, then delegate with checkout-relative targets. CMD Riker runs typed Verification after the Worker finishes."
       : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
-    (capabilities.nativeQuestions ? " Native questions are available." : " Native questions are unavailable.") +
+    (capabilities.nativeQuestions
+      ? " Native questions are available; reserve only authority or product-judgment questions for Owner attention."
+      : " Native questions are unavailable.") +
     (capabilities.cancellation ? " Native cancellation is available." : " Native cancellation is unavailable.") +
     (actions.adjudicateReview
       ? " Adjudicate every reported Review finding as must-fix, documented exception, or follow-up with Lead rationale."

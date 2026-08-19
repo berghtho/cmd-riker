@@ -689,12 +689,27 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     const grant = (actingAuthority.effectAuthorizations ?? []).find(
       (candidate) => candidate.id === authorization.authorizationId,
     );
+    const standingOrder = authorization.standingOrderId
+      ? readCurrentSnapshot<StandingOrder>(
+          "standing-order.snapshot",
+          `standing-order:${authorization.standingOrderId}`,
+        )?.value
+      : undefined;
     if (
       !grant ||
       grant.actingAuthorityId !== actingAuthority.id ||
       authorization.actingAuthorityId !== actingAuthority.id ||
       grant.standingOrderId !== authorization.standingOrderId ||
-      grant.commitmentId !== effectIntent.commitmentId
+      grant.commitmentId !== effectIntent.commitmentId ||
+      !standingOrder ||
+      standingOrder.state !== "active" ||
+      Date.parse(standingOrder.validUntil) <= Date.now() ||
+      !standingOrder.commitmentIds.includes(grant.commitmentId) ||
+      !standingOrder.effectClasses.includes(grant.effectClass) ||
+      !standingOrder.targets.includes(grant.target) ||
+      grant.incrementalSpendUsd > standingOrder.maximumIncrementalSpendUsd ||
+      (!grant.reversible && !standingOrder.allowIrreversibleEffects) ||
+      (grant.externallyBinding && !standingOrder.allowExternallyBindingEffects)
     ) {
       throw new Error("Effect dispatch does not match its durable Acting Authority authorization.");
     }

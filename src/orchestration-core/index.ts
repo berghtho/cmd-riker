@@ -142,7 +142,7 @@ export type Commitment = {
   review?: {
     required: true;
     reasons: ReviewReason[];
-    status: "pending" | "passed" | "changes-requested";
+    status: "pending" | "awaiting-adjudication" | "passed" | "changes-requested";
     reviewerWorkerSessionId?: string;
     implementationWorkerSessionId?: string;
     findings: ReviewFinding[];
@@ -279,6 +279,11 @@ export type ReviewFinding = {
   disposition: "must-fix" | "follow-up";
   summary: string;
   evidence: string;
+  leadDisposition?: {
+    kind: "must-fix" | "documented-exception" | "follow-up";
+    rationale: string;
+    decidedAt: string;
+  };
 };
 
 export type WorkerAssignment =
@@ -401,6 +406,7 @@ export type CapabilityNotice = {
 export type StandingOrderEffectClass =
   | "product-decision"
   | "prioritization"
+  | "test"
   | "merge"
   | "deploy"
   | "update"
@@ -714,6 +720,14 @@ export interface OrchestrationCore {
     modelSelection: WorkerModelSelection;
     modelPolicyRevision: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
+  adjudicateReview(
+    commitmentId: string,
+    decisions: Array<{
+      reviewFindingId: string;
+      disposition: NonNullable<ReviewFinding["leadDisposition"]>["kind"];
+      rationale: string;
+    }>,
+  ): void;
   observeWorkerAttemptStarted(input: {
     workerSessionId: string;
     executionAttemptId: string;
@@ -1808,6 +1822,69 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return { workerSession, executionAttempt };
     },
 
+    adjudicateReview(commitmentId, decisions) {
+      const commitment = state.readCommitment(commitmentId);
+      if (!commitment?.review || commitment.review.status !== "awaiting-adjudication") {
+        throw new Error("Only Review findings awaiting Lead adjudication can be decided.");
+      }
+      const pendingFindings = commitment.review.findings.filter(
+        (finding) => !finding.leadDisposition,
+      );
+      const decisionIds = new Set(decisions.map((decision) => decision.reviewFindingId));
+      if (
+        decisions.length !== pendingFindings.length ||
+        decisionIds.size !== decisions.length ||
+        pendingFindings.some((finding) => !decisionIds.has(finding.id)) ||
+        decisions.some((decision) => !decision.rationale.trim())
+      ) {
+        throw new Error("Lead adjudication must decide every new Review finding with rationale.");
+      }
+      const decidedAt = new Date().toISOString();
+      const findings = commitment.review.findings.map((finding) => {
+        const decision = decisions.find((candidate) => candidate.reviewFindingId === finding.id);
+        return decision
+          ? {
+              ...finding,
+              leadDisposition: {
+                kind: decision.disposition,
+                rationale: decision.rationale,
+                decidedAt,
+              },
+            }
+          : finding;
+      });
+      const mustFix = decisions.some((decision) => decision.disposition === "must-fix");
+      const { condition: _condition, ...unblocked } = commitment;
+      const adjudicated: Commitment = mustFix
+        ? {
+            ...unblocked,
+            state: "active",
+            condition: {
+              kind: "blocked",
+              reason: "Lead adjudication requires repair of one or more must-fix Review findings.",
+              nextAction: "Repair the adjudicated findings, refresh Verification, and target re-review.",
+            },
+            review: { ...commitment.review, status: "changes-requested", findings },
+          }
+        : commitment.verification?.passed
+          ? {
+              ...unblocked,
+              state: "accepted",
+              review: { ...commitment.review, status: "passed", findings },
+              acceptance: {
+                authority: "lead-agent",
+                basis: "objective-criteria",
+                acceptedAt: decidedAt,
+              },
+            }
+          : {
+              ...unblocked,
+              state: "active",
+              review: { ...commitment.review, status: "passed", findings },
+            };
+      state.appendCommitmentSnapshots([adjudicated]);
+    },
+
     observeWorkerProcessStarted(input) {
       const worker = requireWorkerSession(state, input.workerSessionId);
       const attempt = requireCurrentWorkerAttempt(state, worker, input.executionAttemptId);
@@ -2711,7 +2788,13 @@ function normalizeReviewFindings(
   )) {
     return undefined;
   }
-  return findings.map((finding) => ({ ...finding, id: randomUUID() }));
+  return findings.map((finding) => ({
+    id: randomUUID(),
+    basis: finding.basis,
+    disposition: finding.disposition,
+    summary: finding.summary,
+    evidence: finding.evidence,
+  }));
 }
 
 function settleIndependentReview(
@@ -2738,18 +2821,17 @@ function settleIndependentReview(
   ) {
     throw new Error("Review outcome is not attributed to the pending independent Review.");
   }
-  const mustFix = findings.some((finding) => finding.disposition === "must-fix");
   const reviewFindings = [...commitment.review.findings, ...findings];
-  const reviewed: Commitment = mustFix
+  const reviewed: Commitment = findings.length > 0
     ? {
         ...commitment,
         state: "active",
         condition: {
           kind: "blocked",
-          reason: "Independent Review found one or more must-fix defects.",
-          nextAction: "Adjudicate and repair the cited criterion-, evidence-, or risk-based findings.",
+          reason: "Independent Review findings require Lead adjudication.",
+          nextAction: "Decide must-fix work, documented exceptions, and follow-ups with rationale.",
         },
-        review: { ...commitment.review, status: "changes-requested", findings: reviewFindings },
+        review: { ...commitment.review, status: "awaiting-adjudication", findings: reviewFindings },
       }
     : commitment.verification?.passed
       ? {
@@ -2876,6 +2958,17 @@ function validateStandingOrderOwnerInstruction(
   if (!namedBounds) {
     throw new Error("The Owner instruction must name every Standing Order effect class and target.");
   }
+  const escapedSpend = String(draft.maximumIncrementalSpendUsd).replace(".", "\\.");
+  const explicitSpend = new RegExp(
+    `(?:cost\\s+${escapedSpend}\\b|\\b${escapedSpend}\\s+usd\\b|\\$${escapedSpend}\\b)`,
+    "i",
+  ).test(ownerInstruction);
+  if (!explicitSpend) {
+    throw new Error("The Owner instruction must state the Standing Order cost bound explicitly.");
+  }
+  if (!ownerInstruction.includes(draft.validUntil)) {
+    throw new Error("The Owner instruction must state the Standing Order expiration explicitly.");
+  }
   const negatedEffectClass = draft.effectClasses.some((effectClass) => {
     const words = effectClass.toLowerCase().replaceAll("-", " ").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`\\b(do not|don't|never|not)\\s+(?:\\w+\\s+){0,3}${words}\\b`, "i")
@@ -2980,6 +3073,12 @@ function effectDispatchAuthorization(
   if (!actingAuthority || actingAuthority.state === "ended") {
     if (authorizationId) {
       throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
+    }
+    return undefined;
+  }
+  if (!actingAuthority.commitmentIds.includes(commitmentId)) {
+    if (authorizationId) {
+      throw new Error("Acting Authority cannot authorize an unrelated Commitment effect.");
     }
     return undefined;
   }

@@ -384,6 +384,8 @@ async function completeOwnerTurn(
                     model: conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: conversation.workerModelPolicy!.revision,
                   }),
+                adjudicateReview: (input) =>
+                  orchestration.adjudicateReview(input.commitmentId, input.decisions),
                 ...(workerCapabilities!.effectful
                   ? {
                       delegateEffectful: (input: {

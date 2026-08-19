@@ -674,12 +674,27 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     );
   };
 
-  const assertActingAuthorityDispatch = (effectIntent: EffectIntent): void => {
+  const assertActingAuthorityDispatch = (
+    effectIntent: EffectIntent,
+    actualEffect: {
+      effectClass: StandingOrder["effectClasses"][number];
+      target: string;
+      reversible: boolean;
+      externallyBinding: boolean;
+      incrementalSpendUsd: number;
+    },
+  ): void => {
     const actingAuthority = readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot").at(-1);
     const authorization = effectIntent.authorization.actingAuthority;
     if (!actingAuthority || actingAuthority.state === "ended") {
       if (authorization) {
         throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
+      }
+      return;
+    }
+    if (!actingAuthority.commitmentIds.includes(effectIntent.commitmentId)) {
+      if (authorization) {
+        throw new Error("Acting Authority cannot authorize an unrelated Commitment effect.");
       }
       return;
     }
@@ -701,6 +716,11 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       authorization.actingAuthorityId !== actingAuthority.id ||
       grant.standingOrderId !== authorization.standingOrderId ||
       grant.commitmentId !== effectIntent.commitmentId ||
+      grant.effectClass !== actualEffect.effectClass ||
+      grant.target !== actualEffect.target ||
+      grant.reversible !== actualEffect.reversible ||
+      grant.externallyBinding !== actualEffect.externallyBinding ||
+      grant.incrementalSpendUsd !== actualEffect.incrementalSpendUsd ||
       !standingOrder ||
       standingOrder.state !== "active" ||
       Date.parse(standingOrder.validUntil) <= Date.now() ||
@@ -788,6 +808,13 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     database.exec("BEGIN IMMEDIATE");
     try {
       if (rejectConflictingCommitmentEffect) {
+        assertActingAuthorityDispatch(effectIntent, {
+          effectClass: "test",
+          target: attempt.operation,
+          reversible: true,
+          externallyBinding: false,
+          incrementalSpendUsd: 0,
+        });
         const conflict = database
           .prepare(`
             SELECT 1
@@ -1130,7 +1157,6 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       if (!effectIntent && !workerSession.assignment.readOnly) {
         throw new Error("An effectful Worker launch cannot omit its effect intent.");
       }
-      if (effectIntent) assertActingAuthorityDispatch(effectIntent);
       const recordedAt = new Date().toISOString();
       let predecessorId = readCurrentSnapshot<WorkerSession>(
         "worker-session.snapshot",
@@ -1139,6 +1165,23 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       database.exec("BEGIN IMMEDIATE");
       try {
         if (effectIntent) {
+          const assignment = workerSession.assignment;
+          if (assignment.readOnly) {
+            throw new Error("An effect intent cannot dispatch a read-only Worker assignment.");
+          }
+          assertActingAuthorityDispatch(effectIntent, {
+            effectClass:
+              assignment.coordination?.role === "implementer" &&
+              assignment.coordination.repairOfReviewFindingIds?.length
+                ? "self-repair"
+                : "update",
+            target: assignment.targets.length === 1
+              ? assignment.targets[0]!
+              : "",
+            reversible: true,
+            externallyBinding: false,
+            incrementalSpendUsd: assignment.costBound.maximumIncrementalSpendUsd,
+          });
           const conflict = database
             .prepare(`
               SELECT 1
@@ -1495,7 +1538,6 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       if (!dispatching && !rejected) {
         throw new Error("New operations must atomically record dispatch or discovery rejection.");
       }
-      assertActingAuthorityDispatch(effectIntent);
       writeOperationAndEffect(attempt, effectIntent, undefined, true);
     },
 

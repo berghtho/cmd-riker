@@ -13,8 +13,10 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
   let state = openAuthoritativeState(stateDirectory);
   state.initialize(ownerConfiguration());
   const orchestration = createOrchestrationCore(state);
+  const validUntil = new Date(Date.now() + 60_000).toISOString();
   const ownerInstruction =
-    "Begin Acting Authority. Standing Order: merge and product decision on main while I am away.";
+    `Begin Acting Authority. Standing Order: merge, product decision, and test on main and test; ` +
+    `cost 0 USD until ${validUntil}.`;
   const ownerTurnId = state.appendOwnerMessage(ownerInstruction);
   const commitment = orchestration.recordCommitment(ownerTurnId, {
     outcome: "The bounded change is integrated.",
@@ -37,16 +39,46 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
     }),
     /complete verbatim/i,
   );
+  assert.throws(
+    () => orchestration.recordStandingOrder(ownerTurnId, {
+      title: "Invented cost",
+      instruction: ownerInstruction,
+      commitmentIds: [commitment.id],
+      effectClasses: ["merge", "product-decision", "test"],
+      targets: ["main", "test"],
+      allowIrreversibleEffects: false,
+      allowExternallyBindingEffects: false,
+      maximumIncrementalSpendUsd: 500,
+      validUntil,
+      ownerInstructionQuote: ownerInstruction,
+    }),
+    /cost bound explicitly/i,
+  );
+  assert.throws(
+    () => orchestration.recordStandingOrder(ownerTurnId, {
+      title: "Invented duration",
+      instruction: ownerInstruction,
+      commitmentIds: [commitment.id],
+      effectClasses: ["merge", "product-decision", "test"],
+      targets: ["main", "test"],
+      allowIrreversibleEffects: false,
+      allowExternallyBindingEffects: false,
+      maximumIncrementalSpendUsd: 0,
+      validUntil: new Date(Date.now() + 120_000).toISOString(),
+      ownerInstructionQuote: ownerInstruction,
+    }),
+    /expiration explicitly/i,
+  );
   const standingOrder = orchestration.recordStandingOrder(ownerTurnId, {
     title: "Integrate the verified change",
     instruction: ownerInstruction,
     commitmentIds: [commitment.id],
-    effectClasses: ["merge", "product-decision"],
-    targets: ["main"],
+    effectClasses: ["merge", "product-decision", "test"],
+    targets: ["main", "test"],
     allowIrreversibleEffects: false,
     allowExternallyBindingEffects: false,
     maximumIncrementalSpendUsd: 0,
-    validUntil: new Date(Date.now() + 60_000).toISOString(),
+    validUntil,
     ownerInstructionQuote: ownerInstruction,
   });
   const acting = orchestration.beginActingAuthority(ownerTurnId, {
@@ -60,8 +92,8 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
     () => orchestration.authorizeActingAuthorityEffect({
       actingAuthorityId: acting.id,
       commitmentId: commitment.id,
-      effectClass: "merge",
-      target: "main",
+      effectClass: "test",
+      target: "test",
       reversible: false,
       externallyBinding: true,
       incrementalSpendUsd: 0,
@@ -71,8 +103,8 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
   const effectAuthorization = orchestration.authorizeActingAuthorityEffect({
     actingAuthorityId: acting.id,
     commitmentId: commitment.id,
-    effectClass: "merge",
-    target: "main",
+    effectClass: "test",
+    target: "test",
     reversible: true,
     externallyBinding: false,
     incrementalSpendUsd: 0,
@@ -93,11 +125,11 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
   orchestration.recordActingAuthorityEvent(acting.id, {
     kind: "effect",
     commitmentId: commitment.id,
-    summary: "Merged the verified branch.",
-    evidence: ["Merge commit abc123 exists on main."],
+    summary: "Ran the declared verification task.",
+    evidence: ["The durable test effect intent succeeded."],
     effect: {
-      effectClass: "merge",
-      target: "main",
+      effectClass: "test",
+      target: "test",
       reversible: true,
       externallyBinding: false,
       incrementalSpendUsd: 0,
@@ -125,7 +157,7 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
   const returnTurnId = state.appendOwnerMessage("I am back. Return command.");
   const handoff = reopened.prepareActingAuthorityHandoff(acting.id, returnTurnId);
   assert.deepEqual(handoff.decisions, ["Proceed with the verified integration path."]);
-  assert.deepEqual(handoff.effects, ["Merged the verified branch."]);
+  assert.deepEqual(handoff.effects, ["Ran the declared verification task."]);
   assert.equal(handoff.exceptions.length, 1);
   assert.equal(handoff.risks.length, 1);
   assert.equal(handoff.uncertainty.length, 1);
@@ -221,7 +253,7 @@ function recordSucceededEffectIntent(
     commitmentId,
     operationAttemptId,
     kind: "target-project-operation" as const,
-    expectedEffect: "Apply the authorized merge.",
+    expectedEffect: "Run the authorized declared test operation.",
     authorizedWriteRootKey: "c:\\target-project",
     authorization: {
       kind: "lead-agent-command-authority" as const,

@@ -104,6 +104,14 @@ export type PiTurnRequest = {
       implementationWorkerSessionId: string;
       prompt: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+    adjudicateReview?(input: {
+      commitmentId: string;
+      decisions: Array<{
+        reviewFindingId: string;
+        disposition: "must-fix" | "documented-exception" | "follow-up";
+        rationale: string;
+      }>;
+    }): void;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -687,6 +695,7 @@ function commitmentTools(
 const standingOrderEffectClassSchema = Type.Union([
   Type.Literal("product-decision"),
   Type.Literal("prioritization"),
+  Type.Literal("test"),
   Type.Literal("merge"),
   Type.Literal("deploy"),
   Type.Literal("update"),
@@ -954,6 +963,42 @@ function workerTools(
       },
     });
   }
+  if (actions.adjudicateReview) {
+    tools.push({
+      name: "adjudicate_review_findings",
+      label: "Adjudicate Review Findings",
+      description:
+        "Record the Lead decision and rationale for every new Review finding before repair or Acceptance.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        decisions: Type.Array(Type.Object({
+          reviewFindingId: Type.String({ minLength: 1 }),
+          disposition: Type.Union([
+            Type.Literal("must-fix"),
+            Type.Literal("documented-exception"),
+            Type.Literal("follow-up"),
+          ]),
+          rationale: Type.String({ minLength: 1 }),
+        }), { minItems: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        actions.adjudicateReview!(params as {
+          commitmentId: string;
+          decisions: Array<{
+            reviewFindingId: string;
+            disposition: "must-fix" | "documented-exception" | "follow-up";
+            rationale: string;
+          }>;
+        });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: "Review findings were adjudicated by the Lead Agent." }],
+          details: params,
+        };
+      },
+    });
+  }
   if (capabilities.nativeQuestions && actions.answer) {
     tools.push({
       name: "answer_worker_question",
@@ -1046,6 +1091,9 @@ function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerAction
       : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
     (capabilities.nativeQuestions ? " Native questions are available." : " Native questions are unavailable.") +
     (capabilities.cancellation ? " Native cancellation is available." : " Native cancellation is unavailable.") +
+    (actions.adjudicateReview
+      ? " Adjudicate every reported Review finding as must-fix, documented exception, or follow-up with Lead rationale."
+      : "") +
     " Never claim resume, deletion, child control, rollback, or effect continuity when the recorded capability facts do not prove it."
   );
 }

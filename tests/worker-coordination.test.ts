@@ -137,10 +137,21 @@ test("an implementing Worker hands one bounded assignment to an independent revi
       }],
     },
   });
-  assert.equal(state.readCommitment(commitment.id)?.review?.status, "changes-requested");
+  assert.equal(state.readCommitment(commitment.id)?.review?.status, "awaiting-adjudication");
   assert.equal(state.readCommitment(commitment.id)?.state, "active");
   assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "blocked");
   assert.equal(orchestration.coordinationMessagesView()[1]?.kind, "review-finding");
+  const mustFixFindingId = state.readCommitment(commitment.id)!.review!.findings[0]!.id;
+  orchestration.adjudicateReview(commitment.id, [{
+    reviewFindingId: mustFixFindingId,
+    disposition: "must-fix",
+    rationale: "The missing public export violates the accepted criterion and must be repaired.",
+  }]);
+  assert.equal(state.readCommitment(commitment.id)?.review?.status, "changes-requested");
+  assert.equal(
+    state.readCommitment(commitment.id)?.review?.findings[0]?.leadDisposition?.kind,
+    "must-fix",
+  );
 
   const repairTurn = state.appendOwnerMessage("Repair and re-review the must-fix finding.");
   orchestration.resumeCommitment(commitment.id, repairTurn);
@@ -163,7 +174,7 @@ test("an implementing Worker hands one bounded assignment to an independent revi
   });
   assert.deepEqual(repair.workerSession.assignment.coordination, {
     role: "implementer",
-    repairOfReviewFindingIds: [state.readCommitment(commitment.id)!.review!.findings[0]!.id],
+    repairOfReviewFindingIds: [mustFixFindingId],
   });
   startWorker(orchestration, repair.workerSession.id, repair.executionAttempt.id, false);
   orchestration.observeWorkerTerminal({

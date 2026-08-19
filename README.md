@@ -1,4 +1,4 @@
-# CMD Riker
+<img width="600" height="632" alt="riker-small" src="https://github.com/user-attachments/assets/d337c1ef-3c17-40c0-8800-3537eb40f47a" />
 
 Your persistent Number One for agent work.
 

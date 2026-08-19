@@ -310,12 +310,18 @@ function factMetadata(kind: FactDraft["kind"]): {
 }
 
 function sameConfiguration(left: OwnerConfiguration, right: OwnerConfiguration): boolean {
-  return (
+  if (
     left.targetProject.path === right.targetProject.path &&
     left.modelSelection.provider === right.modelSelection.provider &&
     left.modelSelection.model === right.modelSelection.model &&
     left.modelSelection.api === right.modelSelection.api &&
-    left.modelSelection.baseUrl === right.modelSelection.baseUrl &&
     left.modelPolicyRevision === right.modelPolicyRevision
-  );
+  ) {
+    return (
+      left.modelSelection.api !== "openai-completions" ||
+      (right.modelSelection.api === "openai-completions" &&
+        left.modelSelection.baseUrl === right.modelSelection.baseUrl)
+    );
+  }
+  return false;
 }

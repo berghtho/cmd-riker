@@ -100,6 +100,34 @@ test("Owner CLI rejects an unsupported remote Model integration", async (t) => {
   assert.doesNotMatch(result.stdout + result.stderr, /Lead Agent:/);
 });
 
+test("Owner CLI accepts an existing Pi OpenAI Codex login configuration", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-codex-config-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "openai-codex",
+        model: "gpt-5.4-mini",
+        api: "openai-codex-responses",
+      },
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+
+  const result = await runCli(stateDirectory, "");
+
+  assert.equal(result.code, 0, result.stderr);
+  const state = openAuthoritativeState(stateDirectory);
+  assert.deepEqual(state.readOwnerConversation()?.modelSelection, {
+    provider: "openai-codex",
+    model: "gpt-5.4-mini",
+    api: "openai-codex-responses",
+  });
+  state.close();
+});
+
 test("Owner CLI rejects Model URLs that could carry secrets", async (t) => {
   for (const baseUrl of [
     "http://token@127.0.0.1:11434/v1",

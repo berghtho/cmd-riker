@@ -1,11 +1,23 @@
-export type ModelSelection = {
-  provider: string;
-  model: string;
-  api: "openai-completions";
-  baseUrl: string;
-};
+export type ModelSelection =
+  | {
+      provider: string;
+      model: string;
+      api: "openai-completions";
+      baseUrl: string;
+    }
+  | {
+      provider: "openai-codex";
+      model: string;
+      api: "openai-codex-responses";
+    };
 
 export function assertSupportedModelSelection(selection: ModelSelection): void {
+  if (selection.api === "openai-codex-responses") {
+    if (selection.provider !== "openai-codex") {
+      throw new Error("OpenAI Codex Models require the openai-codex provider.");
+    }
+    return;
+  }
   let endpoint: URL;
   try {
     endpoint = new URL(selection.baseUrl);

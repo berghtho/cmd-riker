@@ -200,24 +200,12 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     !isRecordWithKeys(targetProject, ["path"]) ||
     typeof targetProject.path !== "string" ||
     !targetProject.path.trim() ||
-    !isRecordWithKeys(modelSelection, ["provider", "model", "api", "baseUrl"]) ||
-    typeof modelSelection.provider !== "string" ||
-    !modelSelection.provider.trim() ||
-    typeof modelSelection.model !== "string" ||
-    !modelSelection.model.trim() ||
-    modelSelection.api !== "openai-completions" ||
-    typeof modelSelection.baseUrl !== "string" ||
     typeof value.modelPolicyRevision !== "string" ||
     !value.modelPolicyRevision.trim()
   ) {
     throw invalidConfiguration();
   }
-  const selection: ModelSelection = {
-    provider: modelSelection.provider,
-    model: modelSelection.model,
-    api: modelSelection.api,
-    baseUrl: modelSelection.baseUrl,
-  };
+  const selection = parseModelSelection(modelSelection);
   try {
     assertSupportedModelSelection(selection);
   } catch {
@@ -227,6 +215,49 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     targetProject: { path: targetProject.path },
     modelSelection: selection,
     modelPolicyRevision: value.modelPolicyRevision,
+  };
+}
+
+function parseModelSelection(value: unknown): ModelSelection {
+  if (!isRecordWithKeys(value, ["provider", "model", "api"])) {
+    if (!isRecordWithKeys(value, ["provider", "model", "api", "baseUrl"])) {
+      throw invalidConfiguration();
+    }
+    if (
+      typeof value.provider !== "string" ||
+      !value.provider.trim() ||
+      typeof value.model !== "string" ||
+      !value.model.trim() ||
+      value.api !== "openai-completions" ||
+      typeof value.baseUrl !== "string"
+    ) {
+      throw invalidConfiguration();
+    }
+    const selection: ModelSelection = {
+      provider: value.provider,
+      model: value.model,
+      api: value.api,
+      baseUrl: value.baseUrl,
+    };
+    try {
+      assertSupportedModelSelection(selection);
+    } catch {
+      throw invalidConfiguration();
+    }
+    return selection;
+  }
+  if (
+    value.provider !== "openai-codex" ||
+    typeof value.model !== "string" ||
+    !value.model.trim() ||
+    value.api !== "openai-codex-responses"
+  ) {
+    throw invalidConfiguration();
+  }
+  return {
+    provider: value.provider,
+    model: value.model,
+    api: value.api,
   };
 }
 

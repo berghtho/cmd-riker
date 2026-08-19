@@ -1,6 +1,12 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import {
+  InMemoryModelsStore,
+  type Api,
+  type AssistantMessage,
+  type Model,
+} from "@earendil-works/pi-ai";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 import type { ConversationMessage } from "../authoritative-state/index.ts";
 import {
@@ -35,26 +41,36 @@ export class DeterministicTurnAdapter implements PiTurnAdapter {
 }
 
 export class PiAgentTurnAdapter implements PiTurnAdapter {
+  // Pi owns credential resolution and refresh; no credential crosses this adapter's interface.
+  private authenticatedModels: Promise<ModelRuntime> | undefined;
+
   async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
     assertSupportedModelSelection(request.modelSelection);
-    const model = toPiModel(request.modelSelection);
-    const agent = new Agent({
-      initialState: {
-        systemPrompt:
-          "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
-          "occasionally witty, proactive, and loyal to the Owner's intent without becoming passive. " +
-          "Enjoy the work, challenge weak plans professionally, and serve the Owner without theatrical role-play.",
-        model,
-        messages: request.conversation.map(toPiMessage),
-        // Tools remain closed until their authority and durable effect paths exist.
-        tools: [],
-      },
-      streamFn: (selectedModel, context, options) =>
-        streamSimple(selectedModel as Model<"openai-completions">, context, options),
-      // Pi's OpenAI client requires a value, while the supported loopback endpoint is keyless.
-      // This fixed public marker prevents any environment credential lookup.
-      getApiKey: () => "cmd-riker-local-no-secret",
-    });
+    const execution = await this.resolveExecution(request.modelSelection);
+    const initialState = {
+      systemPrompt:
+        "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
+        "occasionally witty, proactive, and loyal to the Owner's intent without becoming passive. " +
+        "Enjoy the work, challenge weak plans professionally, and serve the Owner without theatrical role-play.",
+      model: execution.model,
+      messages: request.conversation.map(toPiMessage),
+      // Tools remain closed until their authority and durable effect paths exist.
+      tools: [],
+    };
+    const agent = new Agent(
+      request.modelSelection.api === "openai-completions"
+        ? {
+            initialState,
+            streamFn: execution.streamFn,
+            // Pi's OpenAI client requires a value, while the supported loopback endpoint is keyless.
+            // This fixed public marker prevents any environment credential lookup.
+            getApiKey: () => "cmd-riker-local-no-secret",
+          }
+        : {
+            initialState,
+            streamFn: execution.streamFn,
+          },
+    );
 
     await agent.prompt(request.ownerInput);
     const response = agent.state.messages.at(-1);
@@ -64,6 +80,13 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
     if (response.stopReason === "error" || response.stopReason === "aborted") {
       throw new Error(`Pi turn failed: ${response.errorMessage ?? response.stopReason}.`);
     }
+    if (
+      response.provider !== request.modelSelection.provider ||
+      response.model !== request.modelSelection.model ||
+      response.api !== request.modelSelection.api
+    ) {
+      throw new Error("Pi turn returned a different Model Selection than requested.");
+    }
     const content = response.content
       .filter((item) => item.type === "text")
       .map((item) => item.text)
@@ -71,9 +94,53 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
     if (!content) throw new Error("Pi turn completed without response text.");
     return { content };
   }
+
+  private async resolveExecution(selection: ModelSelection): Promise<{
+    model: Model<Api>;
+    streamFn: ModelRuntime["streamSimple"];
+  }> {
+    if (selection.api === "openai-completions") {
+      return {
+        model: toPiModel(selection),
+        streamFn: streamSimple,
+      };
+    }
+    this.authenticatedModels ??= import("@earendil-works/pi-coding-agent").then(
+      ({ ModelRuntime }) =>
+        ModelRuntime.create({
+          allowModelNetwork: false,
+          modelsPath: null,
+          modelsStore: new InMemoryModelsStore(),
+          refreshOnCreate: false,
+        }),
+    );
+    const models = await this.authenticatedModels;
+    const model = models.getModel(selection.provider, selection.model);
+    if (!model) {
+      throw new Error(`Configured Model ${selection.provider}/${selection.model} is unavailable.`);
+    }
+    if (
+      model.provider !== selection.provider ||
+      model.id !== selection.model ||
+      model.api !== selection.api ||
+      model.baseUrl !== "https://chatgpt.com/backend-api"
+    ) {
+      throw new Error("Pi resolved an unexpected OpenAI Codex Model definition.");
+    }
+    const auth = await models.checkAuth(selection.provider);
+    if (!auth) {
+      throw new Error(`Pi authentication for ${selection.provider} is unavailable.`);
+    }
+    return {
+      model,
+      streamFn: models.streamSimple.bind(models),
+    };
+  }
 }
 
-function toPiModel(selection: ModelSelection): Model<"openai-completions"> {
+function toPiModel(
+  selection: Extract<ModelSelection, { api: "openai-completions" }>,
+): Model<"openai-completions"> {
   return {
     id: selection.model,
     name: selection.model,

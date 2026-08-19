@@ -168,11 +168,55 @@ export type LeadTurnAttempt = {
     | "continuity-lost";
 };
 
-export type WorkerModelSelection = {
-  provider: "openai";
-  model: string;
-  nativeHarness: "codex";
+export type WorkerModelSelection =
+  | {
+      provider: "openai";
+      model: string;
+      nativeHarness: "codex";
+    }
+  | {
+      provider: "anthropic";
+      model: string;
+      nativeHarness: "claude";
+    }
+  | {
+      provider: "github";
+      model: string;
+      nativeHarness: "copilot";
+    };
+
+export type WorkerNativeHarnessSelection =
+  | { provider: "openai"; nativeHarness: "codex" }
+  | { provider: "anthropic"; nativeHarness: "claude" }
+  | { provider: "github"; nativeHarness: "copilot" };
+
+export type WorkerNativeCapabilities = {
+  readOnly: boolean;
+  nativeQuestions: boolean;
+  cancellation: boolean;
+  providerSessionResume: "unavailable" | "conversation-replay-only";
+  providerSessionDeletion: boolean;
+  nativeChildControl: boolean;
+  exactExecutionResume: "live-connection-only" | "unavailable";
+  protocolSchemaSha256: string;
+  writeIsolation?: "authorized-write-root-enforced";
 };
+
+export function assertSupportedWorkerModelSelection(selection: WorkerModelSelection): void {
+  const supported =
+    (selection.provider === "openai" &&
+      selection.nativeHarness === "codex" &&
+      selection.model === "gpt-5.6-sol") ||
+    (selection.provider === "anthropic" &&
+      selection.nativeHarness === "claude" &&
+      selection.model === "claude-sonnet-5") ||
+    (selection.provider === "github" &&
+      selection.nativeHarness === "copilot" &&
+      selection.model === "auto");
+  if (!supported) {
+    throw new Error("Worker Model Policy selects an unsupported Provider, Model, or Native Harness.");
+  }
+}
 
 export type WorkerSession = {
   id: string;
@@ -283,22 +327,7 @@ export type WorkerExecutionAttempt = {
   process?: { pid: number; startedAt: string };
   harnessVersion?: string;
   protocolSchemaSha256?: string;
-  capabilities?:
-    | {
-        readOnly: true;
-        nativeQuestions: true;
-        cancellation: true;
-        exactExecutionResume: "live-connection-only";
-        protocolSchemaSha256: string;
-      }
-    | {
-        readOnly: false;
-        nativeQuestions: true;
-        cancellation: true;
-        exactExecutionResume: "live-connection-only";
-        protocolSchemaSha256: string;
-        writeIsolation: "authorized-write-root-enforced";
-      };
+  capabilities?: WorkerNativeCapabilities;
   output?: string;
   failure?: string;
   outcome?: WorkerOutcome;
@@ -453,11 +482,11 @@ export interface OrchestrationCore {
     status: "completed" | "failed",
     failureKind?: LeadTurnAttempt["failureKind"],
   ): void;
-  delegateReadOnlyCodex(input: {
+  delegateReadOnlyWorker(input: {
     objective: string;
     prompt: string;
     targetProjectPath: string;
-    model: string;
+    modelSelection: WorkerModelSelection;
     modelPolicyRevision: string;
     commitmentId?: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
@@ -484,6 +513,7 @@ export interface OrchestrationCore {
     nativeExecutionId: string;
     process: { pid: number; startedAt: string };
     harnessVersion: string;
+    capabilities: WorkerNativeCapabilities;
     writeIsolation?: "authorized-write-root-enforced";
   }): void;
   observeWorkerProcessStarted(input: {
@@ -1026,13 +1056,13 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       ]);
     },
 
-    delegateReadOnlyCodex(input) {
+    delegateReadOnlyWorker(input) {
       if (!input.objective.trim() || !input.prompt.trim()) {
         throw new Error("A Worker assignment requires an objective and prompt.");
       }
       if (
         !input.targetProjectPath.trim() ||
-        !input.model.trim() ||
+        !input.modelSelection.model.trim() ||
         !input.modelPolicyRevision.trim()
       ) {
         throw new Error("A Worker assignment requires a Target Project and Model Policy.");
@@ -1059,11 +1089,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         id: executionAttemptId,
         workerSessionId,
         generation: 1,
-        modelSelection: {
-          provider: "openai",
-          model: input.model,
-          nativeHarness: "codex",
-        },
+        modelSelection: input.modelSelection,
         modelPolicyRevision: input.modelPolicyRevision,
         status: "launch-intent-recorded",
       };
@@ -1197,17 +1223,6 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           process: input.process,
           harnessVersion: input.harnessVersion,
           protocolSchemaSha256: input.protocolSchemaSha256,
-          ...(worker.assignment.readOnly
-            ? {
-                capabilities: {
-                  readOnly: true as const,
-                  nativeQuestions: true as const,
-                  cancellation: true as const,
-                  exactExecutionResume: "live-connection-only" as const,
-                  protocolSchemaSha256: input.protocolSchemaSha256,
-                },
-              }
-            : {}),
         },
       ]);
     },
@@ -1281,6 +1296,14 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           throw new Error(`Worker execution attempt ${attempt.id} lacks proven write isolation.`);
         }
       }
+      if (
+        input.capabilities.readOnly !== worker.assignment.readOnly ||
+        input.capabilities.protocolSchemaSha256 !== attempt.protocolSchemaSha256 ||
+        (!worker.assignment.readOnly &&
+          input.capabilities.writeIsolation !== "authorized-write-root-enforced")
+      ) {
+        throw new Error(`Worker execution attempt ${attempt.id} reported incompatible capabilities.`);
+      }
       state.appendWorkerState({
         executionAttempt: {
           ...attempt,
@@ -1289,18 +1312,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           nativeExecutionId: input.nativeExecutionId,
           process: input.process,
           harnessVersion: input.harnessVersion,
-          ...(!worker.assignment.readOnly
-            ? {
-                capabilities: {
-                  readOnly: false as const,
-                  nativeQuestions: true as const,
-                  cancellation: true as const,
-                  exactExecutionResume: "live-connection-only" as const,
-                  protocolSchemaSha256: attempt.protocolSchemaSha256 ?? "",
-                  writeIsolation: "authorized-write-root-enforced" as const,
-                },
-              }
-            : {}),
+          capabilities: input.capabilities,
         },
         workerSession: { ...worker, state: "running" },
       });
@@ -1472,6 +1484,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         ]);
         return "stale";
       }
+      const harnessName = nativeHarnessName(attempt.modelSelection.nativeHarness);
       if (!worker.assignment.readOnly) {
         const assignment = worker.assignment;
         const effect = attempt.effectIntentId
@@ -1558,12 +1571,12 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
             input.reportedOutcome?.summary ||
             input.output?.trim() ||
             input.detail ||
-            `Codex turn ended ${input.status}.`,
+            `${harnessName} turn ended ${input.status}.`,
           affectedArtifacts: observedChanges,
           materialCommands: input.materialCommands ?? [],
           verificationResults: [
             ...(input.reportedOutcome?.verificationResults ?? []),
-            `Codex native turn ${attempt.nativeExecutionId ?? attempt.id} ended ${input.status}.`,
+            `${harnessName} native turn ${attempt.nativeExecutionId ?? attempt.id} ended ${input.status}.`,
             ...(input.processGone ? ["The recorded native process is proven gone."] : []),
             ...(observedChanges.length
               ? [`Observed ${observedChanges.length} change(s) against the isolated checkout baseline.`]
@@ -1639,12 +1652,12 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           input.reportedOutcome?.summary ||
           input.output?.trim() ||
           input.detail ||
-          `Codex turn ended ${input.status}.`,
+          `${harnessName} turn ended ${input.status}.`,
         affectedArtifacts: input.reportedOutcome?.affectedArtifacts ?? [],
         materialCommands: input.materialCommands ?? [],
         verificationResults: [
           ...(input.reportedOutcome?.verificationResults ?? []),
-          `Codex native turn ${attempt.nativeExecutionId ?? attempt.id} ended ${input.status}.`,
+          `${harnessName} native turn ${attempt.nativeExecutionId ?? attempt.id} ended ${input.status}.`,
           ...(input.processGone ? ["The recorded native process is proven gone."] : []),
         ],
         ...(input.reportedOutcome?.unresolvedUncertainty ||
@@ -1763,7 +1776,8 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           state,
           worker,
           previousAttempt,
-          previousAttempt.failure ?? "Codex continuity remained unavailable.",
+          previousAttempt.failure ??
+            `${nativeHarnessName(previousAttempt.modelSelection.nativeHarness)} continuity remained unavailable.`,
         );
         return { kind: "blocked" };
       }
@@ -1812,6 +1826,10 @@ function sameRequirements(
   right: LeadModelRequirements | undefined,
 ): boolean {
   return Boolean(right) && JSON.stringify(left) === JSON.stringify(right);
+}
+
+function nativeHarnessName(harness: WorkerModelSelection["nativeHarness"]): string {
+  return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
 }
 
 function observeLeadResponse(

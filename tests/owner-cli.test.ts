@@ -328,6 +328,48 @@ test("Owner CLI accepts an existing Pi OpenAI Codex login configuration", async 
   state.close();
 });
 
+test("Owner CLI accepts Claude and Copilot Worker Model Policies", async (t) => {
+  const selections = [
+    { provider: "anthropic", model: "claude-sonnet-5", nativeHarness: "claude" },
+    { provider: "github", model: "auto", nativeHarness: "copilot" },
+  ] as const;
+
+  for (const selection of selections) {
+    await t.test(selection.nativeHarness, async (t) => {
+      const stateDirectory = await mkdtemp(
+        join(tmpdir(), `cmd-riker-cli-${selection.nativeHarness}-config-test-`),
+      );
+      t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+      await writeFile(
+        join(stateDirectory, "config.json"),
+        JSON.stringify({
+          targetProject: { path: "C:\\target-project" },
+          modelSelection: {
+            provider: "openai-codex",
+            model: "gpt-5.4-mini",
+            api: "openai-codex-responses",
+          },
+          modelPolicyRevision: "owner-policy-1",
+          workerModelPolicy: {
+            revision: `${selection.nativeHarness}-policy-1`,
+            selection,
+          },
+        }),
+      );
+
+      const result = await runCli(stateDirectory, "");
+
+      assert.equal(result.code, 0, result.stderr);
+      const state = openAuthoritativeState(stateDirectory);
+      assert.deepEqual(state.readOwnerConversation()?.workerModelPolicy, {
+        revision: `${selection.nativeHarness}-policy-1`,
+        selection,
+      });
+      state.close();
+    });
+  }
+});
+
 test("Owner CLI rejects Model URLs that could carry secrets", async (t) => {
   for (const baseUrl of [
     "http://token@127.0.0.1:11434/v1",

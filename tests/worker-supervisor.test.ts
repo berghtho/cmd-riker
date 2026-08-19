@@ -7,13 +7,18 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
-import { createOrchestrationCore } from "../src/orchestration-core/index.ts";
+import {
+  createOrchestrationCore,
+  type WorkerNativeHarnessSelection,
+} from "../src/orchestration-core/index.ts";
 import {
   createTargetProjectOperations,
   type TaskCli,
 } from "../src/target-project-operations/index.ts";
 import {
   createCodexWorkerHarness,
+  createClaudeWorkerHarness,
+  createCopilotWorkerHarness,
   createWorkerSupervisor,
   NativeEffectfulCheckoutInspector,
   proveCodexWorkspaceWriteIsolation,
@@ -21,11 +26,17 @@ import {
   type CodexWorkerExecution,
   type CodexWorkerHarness,
   type EffectfulCheckoutInspector,
+  type NativeWorkerExecution,
+  type NativeWorkerHarness,
   type WorkerExecutionObserver,
   type WorkerStartRequest,
 } from "../src/worker-supervisor/index.ts";
 
 const fakeCodexAppServer = new URL("./support/fake-codex-app-server.ts", import.meta.url)
+  .pathname.replace(/^\/(.:)/, "$1");
+const fakeClaudeProcess = new URL("./support/fake-claude-process.ts", import.meta.url)
+  .pathname.replace(/^\/(.:)/, "$1");
+const fakeCopilotAcp = new URL("./support/fake-copilot-acp.ts", import.meta.url)
   .pathname.replace(/^\/(.:)/, "$1");
 const codexSchemaSha256 = "BABFD5C98CD978DD858B4762CDFBC9FBA941E1A0E4053DE0050E4082AE1F075A";
 const execFileAsync = promisify(execFile);
@@ -82,6 +93,9 @@ test("a read-only Codex Worker Session starts without occupying the Lead Agent",
     readOnly: true,
     nativeQuestions: true,
     cancellation: true,
+    providerSessionResume: "unavailable",
+    providerSessionDeletion: false,
+    nativeChildControl: false,
     exactExecutionResume: "live-connection-only",
     protocolSchemaSha256: codexSchemaSha256,
   });
@@ -95,6 +109,75 @@ test("a read-only Codex Worker Session starts without occupying the Lead Agent",
     "codex-thread-1",
   );
   state.close();
+});
+
+test("Claude and Copilot Workers persist honest native capability limits", async (t) => {
+  const cases = [
+    {
+      provider: "anthropic" as const,
+      nativeHarness: "claude" as const,
+      model: "claude-sonnet-5",
+      nativeQuestions: false,
+      cancellation: true,
+      providerSessionResume: "conversation-replay-only" as const,
+    },
+    {
+      provider: "github" as const,
+      nativeHarness: "copilot" as const,
+      model: "auto",
+      nativeQuestions: false,
+      cancellation: false,
+      providerSessionResume: "conversation-replay-only" as const,
+    },
+  ];
+
+  for (const expected of cases) {
+    const stateDirectory = await mkdtemp(join(tmpdir(), `cmd-riker-${expected.nativeHarness}-test-`));
+    t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+    const state = openAuthoritativeState(stateDirectory);
+    const harness = new FakeLimitedNativeHarness(expected);
+    const supervisor = createWorkerSupervisor(state, harness);
+
+    const started = await supervisor.delegate({
+      objective: `Inspect through ${expected.nativeHarness}.`,
+      prompt: "Report the public module seams.",
+      targetProjectPath: "C:\\target-project",
+      model: expected.model,
+      modelPolicyRevision: `${expected.nativeHarness}-policy-1`,
+    });
+    await waitFor(
+      () => state.readWorkerExecutionAttempt(started.executionAttemptId)?.status === "running",
+    );
+
+    const attempt = state.readWorkerExecutionAttempt(started.executionAttemptId);
+    assert.deepEqual(attempt?.modelSelection, {
+      provider: expected.provider,
+      model: expected.model,
+      nativeHarness: expected.nativeHarness,
+    });
+    assert.equal(attempt?.providerSessionId, `${expected.nativeHarness}-session-1`);
+    assert.equal(attempt?.nativeExecutionId, `${expected.nativeHarness}-execution-1`);
+    assert.deepEqual(attempt?.capabilities, {
+      readOnly: true,
+      nativeQuestions: expected.nativeQuestions,
+      cancellation: expected.cancellation,
+      providerSessionResume: expected.providerSessionResume,
+      providerSessionDeletion: false,
+      nativeChildControl: false,
+      exactExecutionResume: "live-connection-only",
+      protocolSchemaSha256: `${expected.nativeHarness}-schema`,
+    });
+
+    if (!expected.cancellation) {
+      await assert.rejects(
+        supervisor.cancel(started.workerSessionId, "owner-turn", "Stop the Worker."),
+        /Copilot cancellation is unavailable/,
+      );
+      assert.equal(state.readWorkerSession(started.workerSessionId)?.state, "running");
+      assert.equal(harness.execution.interrupts, 0);
+    }
+    state.close();
+  }
 });
 
 test("a native Codex question keeps one durable identity and its answer is recorded before delivery", async (t) => {
@@ -971,6 +1054,130 @@ test("the Codex 0.147.0 adapter enforces read-only policy and carries a native q
   });
 });
 
+test("the Claude adapter completes a bounded read-only assignment with honest capabilities", async (t) => {
+  const harness = createClaudeWorkerHarness({
+    executable: process.execPath,
+    args: [fakeClaudeProcess],
+    version: "2.1.229 (Claude Code)",
+  });
+  let output = "";
+  let terminalStatus: string | undefined;
+  let reportedOutcome: Parameters<WorkerExecutionObserver["completed"]>[2];
+  const execution = await harness.start(
+    {
+      workerSessionId: "worker-session-claude-1",
+      executionAttemptId: "execution-attempt-claude-1",
+      objective: "Inspect architecture",
+      prompt: "Report the module seams.",
+      targetProjectPath: process.cwd(),
+      model: "claude-sonnet-5",
+      readOnly: true,
+    },
+    {
+      processStarted() {},
+      question() {
+        assert.fail("Claude questions are unavailable through this direct transport.");
+      },
+      output(text) {
+        output += text;
+      },
+      completed(status, _detail, reported) {
+        terminalStatus = status;
+        reportedOutcome = reported;
+      },
+      failed(error) {
+        throw error;
+      },
+    },
+  );
+  t.after(() => execution.terminate());
+
+  assert.equal(execution.identity.providerSessionId, "claude-session-1");
+  assert.match(execution.identity.nativeExecutionId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(execution.identity.capabilities, {
+    readOnly: true,
+    nativeQuestions: false,
+    cancellation: true,
+    providerSessionResume: "conversation-replay-only",
+    providerSessionDeletion: false,
+    nativeChildControl: false,
+    exactExecutionResume: "live-connection-only",
+    protocolSchemaSha256: execution.identity.protocolSchemaSha256,
+  });
+  await waitFor(() => terminalStatus !== undefined);
+  assert.equal(terminalStatus, "completed");
+  assert.equal(output, "Claude read-only result.");
+  assert.deepEqual(reportedOutcome, {
+    status: "completed",
+    summary: "Claude read-only result.",
+    affectedArtifacts: [],
+    verificationResults: ["Architecture inspected."],
+  });
+});
+
+test("the Copilot ACP adapter completes a bounded assignment without simulating lifecycle gaps", async (t) => {
+  const harness = createCopilotWorkerHarness({
+    executable: process.execPath,
+    args: [fakeCopilotAcp],
+    version: "GitHub Copilot CLI 1.0.80.",
+  });
+  let output = "";
+  let terminalStatus: string | undefined;
+  let reportedOutcome: Parameters<WorkerExecutionObserver["completed"]>[2];
+  const execution = await harness.start(
+    {
+      workerSessionId: "worker-session-copilot-1",
+      executionAttemptId: "execution-attempt-copilot-1",
+      objective: "Inspect architecture",
+      prompt: "Report the module seams.",
+      targetProjectPath: process.cwd(),
+      model: "auto",
+      readOnly: true,
+    },
+    {
+      processStarted() {},
+      question() {
+        assert.fail("Copilot elicitation is unavailable through the proven ACP seam.");
+      },
+      output(text) {
+        output += text;
+      },
+      completed(status, _detail, reported) {
+        terminalStatus = status;
+        reportedOutcome = reported;
+      },
+      failed(error) {
+        throw error;
+      },
+    },
+  );
+  t.after(() => execution.terminate());
+
+  assert.equal(execution.identity.providerSessionId, "copilot-session-1");
+  assert.match(execution.identity.nativeExecutionId, /^session\/prompt:\d+$/);
+  assert.deepEqual(execution.identity.capabilities, {
+    readOnly: true,
+    nativeQuestions: false,
+    cancellation: false,
+    providerSessionResume: "conversation-replay-only",
+    providerSessionDeletion: false,
+    nativeChildControl: false,
+    exactExecutionResume: "live-connection-only",
+    protocolSchemaSha256: execution.identity.protocolSchemaSha256,
+  });
+  await assert.rejects(execution.interrupt(), /Copilot cancellation is unavailable/);
+  await assert.rejects(execution.answer("elicitation-1", {}), /questions are unavailable/);
+  await waitFor(() => terminalStatus !== undefined);
+  assert.equal(terminalStatus, "completed");
+  assert.equal(output, "Copilot read-only result.");
+  assert.deepEqual(reportedOutcome, {
+    status: "completed",
+    summary: "Copilot read-only result.",
+    affectedArtifacts: [],
+    verificationResults: ["Architecture inspected."],
+  });
+});
+
 test("the Codex 0.147.0 adapter proves workspace-write isolation before effect dispatch", async (t) => {
   const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-codex-workspace-write-test-"));
   const harness = createCodexWorkerHarness({
@@ -1179,7 +1386,92 @@ async function exerciseHarnessContract(harness: CodexWorkerHarness): Promise<voi
   assert.equal((await execution.terminate()).gone, true);
 }
 
+class FakeLimitedNativeHarness implements NativeWorkerHarness {
+  readonly selection: WorkerNativeHarnessSelection;
+  readonly supportsEffectful = false;
+  readonly execution;
+
+  constructor(input: ({
+    provider: "anthropic";
+    nativeHarness: "claude";
+  } | {
+    provider: "github";
+    nativeHarness: "copilot";
+  }) & {
+    nativeQuestions: boolean;
+    cancellation: boolean;
+    providerSessionResume: "conversation-replay-only";
+  }) {
+    this.selection = input.nativeHarness === "claude"
+      ? { provider: "anthropic", nativeHarness: "claude" }
+      : { provider: "github", nativeHarness: "copilot" };
+    this.execution = new FakeLimitedNativeExecution(input);
+  }
+
+  async start(
+    _request: WorkerStartRequest,
+    observer: WorkerExecutionObserver,
+  ): Promise<NativeWorkerExecution> {
+    this.execution.observer = observer;
+    observer.processStarted({
+      process: this.execution.identity.process,
+      harnessVersion: this.execution.identity.harnessVersion,
+      protocolSchemaSha256: this.execution.identity.protocolSchemaSha256,
+    });
+    return this.execution;
+  }
+
+  async abandon(): Promise<{ gone: boolean }> {
+    return { gone: true };
+  }
+}
+
+class FakeLimitedNativeExecution implements NativeWorkerExecution {
+  readonly identity;
+  observer: WorkerExecutionObserver | undefined;
+  interrupts = 0;
+
+  constructor(input: {
+    nativeHarness: "claude" | "copilot";
+    nativeQuestions: boolean;
+    cancellation: boolean;
+    providerSessionResume: "conversation-replay-only";
+  }) {
+    this.identity = {
+      providerSessionId: `${input.nativeHarness}-session-1`,
+      nativeExecutionId: `${input.nativeHarness}-execution-1`,
+      process: { pid: input.nativeHarness === "claude" ? 4201 : 4202, startedAt: "2026-08-19T10:00:00.000Z" },
+      harnessVersion: `${input.nativeHarness}-version`,
+      protocolSchemaSha256: `${input.nativeHarness}-schema`,
+      capabilities: {
+        readOnly: true as const,
+        nativeQuestions: input.nativeQuestions,
+        cancellation: input.cancellation,
+        providerSessionResume: input.providerSessionResume,
+        providerSessionDeletion: false as const,
+        nativeChildControl: false as const,
+        exactExecutionResume: "live-connection-only" as const,
+        protocolSchemaSha256: `${input.nativeHarness}-schema`,
+      },
+    };
+  }
+
+  async answer(): Promise<void> {
+    throw new Error("Native questions are unavailable.");
+  }
+
+  async interrupt(): Promise<void> {
+    this.interrupts += 1;
+  }
+
+  async terminate(): Promise<{ gone: boolean }> {
+    return { gone: true };
+  }
+}
+
 class FakeCodexHarness implements CodexWorkerHarness {
+  readonly selection = { provider: "openai", nativeHarness: "codex" } as const;
+  readonly supportsEffectful = true;
   readonly starts: Array<{
     request: WorkerStartRequest;
     observer: WorkerExecutionObserver;
@@ -1300,6 +1592,19 @@ class FakeCodexExecution implements CodexWorkerExecution {
       process: { pid: 4099 + sequence, startedAt: "2026-08-19T10:00:00.000Z" },
       harnessVersion: "codex-cli 0.147.0",
       protocolSchemaSha256: codexSchemaSha256,
+      capabilities: {
+        readOnly: !effectful,
+        nativeQuestions: true,
+        cancellation: true,
+        providerSessionResume: "unavailable" as const,
+        providerSessionDeletion: false,
+        nativeChildControl: false,
+        exactExecutionResume: "live-connection-only" as const,
+        protocolSchemaSha256: codexSchemaSha256,
+        ...(effectful
+          ? { writeIsolation: "authorized-write-root-enforced" as const }
+          : {}),
+      },
       ...(effectful
         ? { writeIsolation: "codex-windows-workspace-write" as const }
         : {}),

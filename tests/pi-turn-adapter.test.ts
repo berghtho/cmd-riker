@@ -137,6 +137,50 @@ test("production adapter advertises the bounded Codex Worker controls", async (t
   assert.equal(result.content, "The read-only Codex Worker Session is running.");
 });
 
+test("production adapter exposes only proven Copilot Worker controls", async (t) => {
+  const localModel = await startLocalModel((call, requestBody) => {
+    if (call === 1) {
+      const serialized = JSON.stringify(requestBody);
+      assert.match(serialized, /delegate_read_only_copilot/);
+      assert.doesNotMatch(serialized, /delegate_effectful/);
+      assert.doesNotMatch(serialized, /answer_worker_question/);
+      assert.doesNotMatch(serialized, /cancel_worker_session/);
+      assert.doesNotMatch(serialized, /resume_worker|delete_worker|child_worker/);
+      return {
+        toolCall: {
+          id: "copilot-worker-call-1",
+          name: "delegate_read_only_copilot",
+          arguments: {
+            objective: "Inspect architecture",
+            prompt: "Report the module seams.",
+          },
+        },
+      };
+    }
+    return "The read-only Copilot Worker Session is running.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Delegate a read-only architecture inspection.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    workerActions: {
+      capabilities: {
+        nativeHarness: "copilot",
+        effectful: false,
+        nativeQuestions: false,
+        cancellation: false,
+      },
+      async delegate() {
+        return { workerSessionId: "worker-copilot-1", executionAttemptId: "attempt-copilot-1" };
+      },
+    },
+  });
+
+  assert.equal(result.content, "The read-only Copilot Worker Session is running.");
+});
+
 test("production adapter delegates effectful work only through the bounded assignment tool", async (t) => {
   let delegated: unknown;
   const localModel = await startLocalModel((call) => {

@@ -31,6 +31,7 @@ import {
   type ModelSelection,
 } from "./model-selection.ts";
 import {
+  assertSupportedWorkerModelSelection,
   assertValidatedLeadModelPolicy,
   createOrchestrationCore,
   defaultLeadModelRequirements,
@@ -38,9 +39,14 @@ import {
   type LeadModelPolicy,
 } from "./orchestration-core/index.ts";
 import {
+  createClaudeWorkerHarness,
   createCodexWorkerHarness,
+  createCopilotWorkerHarness,
   createWorkerSupervisor,
+  resolveClaudeRuntime,
   resolveCodexRuntime,
+  resolveCopilotRuntime,
+  type NativeWorkerHarness,
   type WorkerSupervisor,
 } from "./worker-supervisor/index.ts";
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
@@ -336,6 +342,12 @@ async function completeOwnerTurn(
         ...(workerSupervisor
           ? {
               workerActions: {
+                capabilities: {
+                  nativeHarness: conversation.workerModelPolicy!.selection.nativeHarness,
+                  effectful: conversation.workerModelPolicy!.selection.nativeHarness === "codex",
+                  nativeQuestions: conversation.workerModelPolicy!.selection.nativeHarness === "codex",
+                  cancellation: conversation.workerModelPolicy!.selection.nativeHarness !== "copilot",
+                },
                 delegate: (input: {
                   objective: string;
                   prompt: string;
@@ -347,28 +359,36 @@ async function completeOwnerTurn(
                     model: conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: conversation.workerModelPolicy!.revision,
                   }),
-                delegateEffectful: (input: {
-                  objective: string;
-                  prompt: string;
-                  commitmentId: string;
-                  targets: string[];
-                }) =>
-                  workerSupervisor.delegateEffectful({
-                    ...input,
-                    targetProjectPath: conversation.targetProject.path,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
-                    timeoutMs: 20 * 60_000,
-                    verification: {
-                      operation: "test",
-                      workingDirectory: conversation.targetProject.path,
-                      timeoutMs: 120_000,
-                    },
-                  }),
-                answer: (questionId: string, answers: Record<string, string[]>) =>
-                  workerSupervisor.answer(questionId, turnId, answers),
-                cancel: (workerSessionId: string, reason: string) =>
-                  workerSupervisor.cancel(workerSessionId, turnId, reason),
+                ...(conversation.workerModelPolicy!.selection.nativeHarness === "codex"
+                  ? {
+                      delegateEffectful: (input: {
+                        objective: string;
+                        prompt: string;
+                        commitmentId: string;
+                        targets: string[];
+                      }) =>
+                        workerSupervisor.delegateEffectful({
+                          ...input,
+                          targetProjectPath: conversation.targetProject.path,
+                          model: conversation.workerModelPolicy!.selection.model,
+                          modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                          timeoutMs: 20 * 60_000,
+                          verification: {
+                            operation: "test" as const,
+                            workingDirectory: conversation.targetProject.path,
+                            timeoutMs: 120_000,
+                          },
+                        }),
+                      answer: (questionId: string, answers: Record<string, string[]>) =>
+                        workerSupervisor.answer(questionId, turnId, answers),
+                    }
+                  : {}),
+                ...(conversation.workerModelPolicy!.selection.nativeHarness !== "copilot"
+                  ? {
+                      cancel: (workerSessionId: string, reason: string) =>
+                        workerSupervisor.cancel(workerSessionId, turnId, reason),
+                    }
+                  : {}),
               },
             }
           : {}),
@@ -453,37 +473,55 @@ async function availableWorkerSupervisor(
 ): Promise<WorkerSupervisor | undefined> {
   if (!configuration.workerModelPolicy) return undefined;
   const orchestration = createOrchestrationCore(state);
+  const selection = configuration.workerModelPolicy.selection;
   try {
-    const runtime = await resolveCodexRuntime();
-    if (orchestration.observeCodexCapabilityAvailable() === "cleared") {
+    let harness: NativeWorkerHarness;
+    if (selection.nativeHarness === "codex") {
+      harness = createCodexWorkerHarness(await resolveCodexRuntime());
+    } else if (selection.nativeHarness === "claude") {
+      harness = createClaudeWorkerHarness(await resolveClaudeRuntime());
+    } else {
+      harness = createCopilotWorkerHarness(await resolveCopilotRuntime());
+    }
+    if (
+      selection.nativeHarness === "codex" &&
+      orchestration.observeCodexCapabilityAvailable() === "cleared"
+    ) {
       process.stderr.write(
         "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
       );
     }
     return createWorkerSupervisor(
       state,
-      createCodexWorkerHarness(runtime),
+      harness,
       createTargetProjectOperations(state),
     );
   } catch (error) {
     orchestration.reconcileInterruptedWorkers(
-      "The Codex capability could not be proven after host restart.",
+      `The ${nativeHarnessName(selection.nativeHarness)} capability could not be proven after host restart.`,
     );
     const detail = error instanceof Error ? error.message : "capability probe failed";
-    const notice = orchestration.observeCodexCapabilityUnavailable(
-      detail,
-      configuration.targetProject.path,
-    );
+    const notice = selection.nativeHarness === "codex"
+      ? orchestration.observeCodexCapabilityUnavailable(
+          detail,
+          configuration.targetProject.path,
+        )
+      : "recorded";
     if (notice === "recorded") {
+      const code = `CMD_RIKER_${selection.nativeHarness.toUpperCase()}_UNAVAILABLE`;
       process.stderr.write(
-        "CMD_RIKER_CODEX_UNAVAILABLE: " +
-          `Codex 0.147.0 with expected ChatGPT identity for Target Project ` +
+        `${code}: ` +
+          `${nativeHarnessName(selection.nativeHarness)} with expected native identity for Target Project ` +
           `${configuration.targetProject.path} is unavailable: ` +
           `${detail}\n`,
       );
     }
     return undefined;
   }
+}
+
+function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {
+  return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
 }
 
 function commitmentFingerprint(commitment: {
@@ -631,19 +669,26 @@ function parseWorkerModelPolicy(value: unknown): NonNullable<OwnerConfiguration[
     typeof value.revision !== "string" ||
     !value.revision.trim() ||
     !isRecordWithKeys(value.selection, ["provider", "model", "nativeHarness"]) ||
-    value.selection.provider !== "openai" ||
-    value.selection.model !== "gpt-5.6-sol" ||
-    value.selection.nativeHarness !== "codex"
+    typeof value.selection.model !== "string"
   ) {
+    throw invalidConfiguration();
+  }
+  const selection = value.selection.provider === "openai" && value.selection.nativeHarness === "codex"
+    ? { provider: "openai" as const, model: value.selection.model, nativeHarness: "codex" as const }
+    : value.selection.provider === "anthropic" && value.selection.nativeHarness === "claude"
+      ? { provider: "anthropic" as const, model: value.selection.model, nativeHarness: "claude" as const }
+      : value.selection.provider === "github" && value.selection.nativeHarness === "copilot"
+        ? { provider: "github" as const, model: value.selection.model, nativeHarness: "copilot" as const }
+        : undefined;
+  if (!selection) throw invalidConfiguration();
+  try {
+    assertSupportedWorkerModelSelection(selection);
+  } catch {
     throw invalidConfiguration();
   }
   return {
     revision: value.revision,
-    selection: {
-      provider: value.selection.provider,
-      model: value.selection.model,
-      nativeHarness: value.selection.nativeHarness,
-    },
+    selection,
   };
 }
 

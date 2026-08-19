@@ -84,6 +84,8 @@ export async function resolveCodexRuntime(): Promise<CodexRuntime> {
 }
 
 class CodexAppServerHarness implements CodexWorkerHarness {
+  readonly selection = { provider: "openai", nativeHarness: "codex" } as const;
+  readonly supportsEffectful = true;
   private readonly runtime: CodexRuntime;
 
   constructor(runtime: CodexRuntime) {
@@ -183,7 +185,7 @@ class CodexAppServerHarness implements CodexWorkerHarness {
         if (status === "completed" || status === "failed" || status === "interrupted") {
           terminalObserved = true;
           setTimeout(() => {
-            const reported = parseReportedOutcome(outputText);
+            const reported = parseWorkerReportedOutcome(outputText);
             if (reported.output) observer.output(reported.output);
             void Promise.resolve(
               observer.completed(
@@ -297,6 +299,19 @@ class CodexAppServerHarness implements CodexWorkerHarness {
         process: processIdentity,
         harnessVersion: this.runtime.version,
         protocolSchemaSha256: supportedSchemaSha256,
+        capabilities: {
+          readOnly: request.readOnly,
+          nativeQuestions: true,
+          cancellation: true,
+          providerSessionResume: "unavailable",
+          providerSessionDeletion: false,
+          nativeChildControl: false,
+          exactExecutionResume: "live-connection-only",
+          protocolSchemaSha256: supportedSchemaSha256,
+          ...(!request.readOnly
+            ? { writeIsolation: "authorized-write-root-enforced" as const }
+            : {}),
+        },
         ...(!request.readOnly
           ? { writeIsolation: "codex-windows-workspace-write" as const }
           : {}),
@@ -675,7 +690,7 @@ function validateQuestion(
   };
 }
 
-function parseReportedOutcome(output: string): {
+export function parseWorkerReportedOutcome(output: string): {
   output: string;
   outcome?: WorkerReportedOutcome;
 } {
@@ -719,7 +734,7 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-async function inspectProcess(pid: number): Promise<{ pid: number; startedAt: string | null } | null> {
+export async function inspectProcess(pid: number): Promise<{ pid: number; startedAt: string | null } | null> {
   if (!isAlive(pid)) return null;
   if (process.platform !== "win32") return { pid, startedAt: null };
   const script = [
@@ -730,7 +745,7 @@ async function inspectProcess(pid: number): Promise<{ pid: number; startedAt: st
   return output ? { pid, startedAt: new Date(output).toISOString() } : null;
 }
 
-async function terminateRecordedProcess(pid: number, startedAt: string): Promise<boolean> {
+export async function terminateRecordedProcess(pid: number, startedAt: string): Promise<boolean> {
   const actual = await inspectProcess(pid);
   if (!actual) return true;
   if (actual.startedAt !== new Date(startedAt).toISOString()) return false;
@@ -769,7 +784,7 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
 }
 
-function safeChildEnvironment(): NodeJS.ProcessEnv {
+export function safeChildEnvironment(): NodeJS.ProcessEnv {
   const names = process.platform === "win32"
     ? [
         "APPDATA",

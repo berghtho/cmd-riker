@@ -1,4 +1,8 @@
-import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+  Agent,
+  type AgentMessage,
+  type AgentTool,
+} from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import {
   InMemoryModelsStore,
@@ -7,8 +11,18 @@ import {
   type Model,
 } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
-import type { ConversationMessage } from "../authoritative-state/index.ts";
+import type {
+  Commitment,
+  CommitmentDraft,
+  ConversationMessage,
+} from "../authoritative-state/index.ts";
+import {
+  defaultLeadModelRequirements,
+  type LeadModelRequirements,
+  type ModelCandidateValidation,
+} from "../orchestration-core/index.ts";
 import {
   assertSupportedModelSelection,
   type ModelSelection,
@@ -18,10 +32,42 @@ export type PiTurnRequest = {
   conversation: readonly ConversationMessage[];
   ownerInput: string;
   modelSelection: ModelSelection;
+  commitments?: readonly Commitment[];
+  commitmentActions?: {
+    record(draft: CommitmentDraft): Commitment;
+    accept(commitmentId: string): void;
+    resume(commitmentId: string): void;
+    control(
+      commitmentId: string,
+      action: "pause" | "cancel" | "supersede",
+      reason: string,
+      replacementCommitmentId?: string,
+    ): void;
+  };
 };
 
 export interface PiTurnAdapter {
+  validateSelection(
+    modelSelection: ModelSelection,
+    requirements?: LeadModelRequirements,
+  ): Promise<ModelCandidateValidation>;
   completeTurn(request: PiTurnRequest): Promise<{ content: string }>;
+}
+
+export class PiTurnFailure extends Error {
+  readonly kind: "unavailable" | "aborted" | "invalid-response" | "turn-failed";
+  readonly commitmentMutationApplied: boolean;
+
+  constructor(
+    kind: PiTurnFailure["kind"],
+    message: string,
+    commitmentMutationApplied: boolean,
+    cause?: unknown,
+  ) {
+    super(message, { cause });
+    this.kind = kind;
+    this.commitmentMutationApplied = commitmentMutationApplied;
+  }
 }
 
 export class DeterministicTurnAdapter implements PiTurnAdapter {
@@ -38,61 +84,258 @@ export class DeterministicTurnAdapter implements PiTurnAdapter {
         this.response ?? `Deterministic turn ${priorTurns + 1}: ${request.ownerInput}`,
     };
   }
+
+  async validateSelection(
+    modelSelection: ModelSelection,
+    requirements = defaultLeadModelRequirements,
+  ): Promise<ModelCandidateValidation> {
+    assertSupportedModelSelection(modelSelection);
+    return {
+      modelSelection,
+      requirements,
+      hardGates: passedHardGates(),
+      availability: "passed",
+      observedAt: new Date().toISOString(),
+    };
+  }
 }
 
 export class PiAgentTurnAdapter implements PiTurnAdapter {
   // Pi owns credential resolution and refresh; no credential crosses this adapter's interface.
   private authenticatedModels: Promise<ModelRuntime> | undefined;
 
-  async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
-    assertSupportedModelSelection(request.modelSelection);
-    const execution = await this.resolveExecution(request.modelSelection);
-    const initialState = {
-      systemPrompt:
-        "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
-        "occasionally witty, proactive, and loyal to the Owner's intent without becoming passive. " +
-        "Enjoy the work, challenge weak plans professionally, and serve the Owner without theatrical role-play.",
-      model: execution.model,
-      messages: request.conversation.map(toPiMessage),
-      // Tools remain closed until their authority and durable effect paths exist.
-      tools: [],
+  async validateSelection(
+    modelSelection: ModelSelection,
+    requirements = defaultLeadModelRequirements,
+  ): Promise<ModelCandidateValidation> {
+    const observedAt = new Date().toISOString();
+    try {
+      assertSupportedModelSelection(modelSelection);
+    } catch {
+      return {
+        modelSelection,
+        requirements,
+        hardGates: failedHardGates(),
+        availability: "failed",
+        observedAt,
+      };
+    }
+    let execution: Awaited<ReturnType<PiAgentTurnAdapter["resolveExecution"]>>;
+    try {
+      execution = await this.resolveExecution(modelSelection);
+    } catch {
+      return {
+        modelSelection,
+        requirements,
+        hardGates: {
+          ...unknownHardGates(),
+          integration: "passed",
+          dataHandling: "passed",
+        },
+        availability: "failed",
+        observedAt,
+      };
+    }
+    let availability: ModelCandidateValidation["availability"] = "passed";
+    let intendedIdentity: ModelCandidateValidation["hardGates"]["intendedIdentity"] = "passed";
+    let catalogModel:
+      | {
+          id?: unknown;
+          capabilities?: unknown;
+          context_window?: unknown;
+          input_cost_per_million_usd?: unknown;
+        }
+      | undefined;
+    try {
+      if (modelSelection.api === "openai-completions") {
+        const response = await fetch(`${modelSelection.baseUrl.replace(/\/$/, "")}/models`, {
+          signal: AbortSignal.timeout(3_000),
+        });
+        if (!response.ok) throw new Error(`Model catalog returned HTTP ${response.status}.`);
+        const catalog = (await response.json()) as { data?: typeof catalogModel[] };
+        catalogModel = catalog.data?.find((model) => model?.id === modelSelection.model);
+        if (!catalogModel) {
+          throw new Error("The configured Model is absent from the local Model catalog.");
+        }
+      }
+    } catch {
+      availability = "failed";
+      intendedIdentity = "unknown";
+    }
+    const catalogCapabilities = Array.isArray(catalogModel?.capabilities)
+      ? catalogModel.capabilities
+      : undefined;
+    const requiredCapabilities = requirements.requiredCapabilities.every((capability) =>
+      catalogModel
+        ? catalogCapabilities?.includes(capability)
+        : execution.model.input.includes(capability),
+    )
+      ? "passed"
+      : catalogModel && !catalogCapabilities
+        ? "unknown"
+        : "failed";
+    const contextValue = catalogModel
+      ? catalogModel.context_window
+      : execution.model.contextWindow;
+    const context = typeof contextValue !== "number"
+      ? "unknown"
+      : contextValue >= requirements.minimumContextWindow
+        ? "passed"
+        : "failed";
+    const dataHandling =
+      requirements.dataHandling === "supported-integrations" ||
+      modelSelection.api === "openai-completions"
+        ? "passed"
+        : "failed";
+    const costValue = catalogModel
+      ? catalogModel.input_cost_per_million_usd
+      : execution.model.cost.input;
+    const cost = requirements.maximumInputCostPerMillionUsd === null
+      ? "passed"
+      : typeof costValue !== "number"
+        ? "unknown"
+        : costValue <= requirements.maximumInputCostPerMillionUsd
+          ? "passed"
+          : "failed";
+    return {
+      modelSelection,
+      requirements,
+      hardGates: {
+        ...passedHardGates(),
+        intendedIdentity,
+        requiredCapabilities,
+        context,
+        dataHandling,
+        cost,
+      },
+      availability,
+      observedAt,
     };
-    const agent = new Agent(
-      request.modelSelection.api === "openai-completions"
-        ? {
-            initialState,
-            streamFn: execution.streamFn,
-            // Pi's OpenAI client requires a value, while the supported loopback endpoint is keyless.
-            // This fixed public marker prevents any environment credential lookup.
-            getApiKey: () => "cmd-riker-local-no-secret",
-          }
-        : {
-            initialState,
-            streamFn: execution.streamFn,
-          },
-    );
+  }
 
-    await agent.prompt(request.ownerInput);
-    const response = agent.state.messages.at(-1);
-    if (!response || response.role !== "assistant") {
-      throw new Error("Pi turn completed without an assistant response.");
+  async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
+    let commitmentMutationApplied = false;
+    try {
+      assertSupportedModelSelection(request.modelSelection);
+      let execution: Awaited<ReturnType<PiAgentTurnAdapter["resolveExecution"]>>;
+      try {
+        execution = await this.resolveExecution(request.modelSelection);
+      } catch (error) {
+        throw new PiTurnFailure("unavailable", "The configured Model is unavailable.", false, error);
+      }
+      const tools = commitmentTools(request, {
+        onMutation: () => {
+          commitmentMutationApplied = true;
+        },
+      });
+      const commitmentContext = (request.commitments ?? [])
+        .map(
+          (commitment) =>
+            `${commitment.id}: ${commitment.state}` +
+            (commitment.condition
+              ? ` (${commitment.condition.kind}: ${commitment.condition.reason}; next: ${commitment.condition.nextAction})`
+              : "") +
+            ` - ${commitment.outcome}`,
+        )
+        .join("\n");
+      const initialState = {
+        systemPrompt:
+          "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
+          "occasionally witty, proactive, and loyal to the Owner's intent without becoming passive. " +
+          "Enjoy the work, challenge weak plans professionally, and serve the Owner without theatrical role-play. " +
+          "Distinguish conversation from accepted outcome-oriented work. When you visibly accept work that can " +
+          "be completed in this response, call record_commitment before the final response. Use objective " +
+          "response-includes criteria only for exact observable response postconditions. Reserve subjective " +
+          "quality and Owner choices with owner-judgment. Never call accept_commitment unless this Owner input " +
+          "explicitly accepts the named waiting Commitment. Use resume_commitment only for a blocked or paused " +
+          "Commitment the Owner asks to continue. Use control_commitment only for the Owner's explicit pause, " +
+          "cancel, or supersede instruction." +
+          (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : ""),
+        model: execution.model,
+        messages: request.conversation.map(toPiMessage),
+        tools,
+      };
+      const agent = new Agent(
+        request.modelSelection.api === "openai-completions"
+          ? {
+              initialState,
+              streamFn: execution.streamFn,
+              // Pi's OpenAI client requires a value, while the supported loopback endpoint is keyless.
+              // This fixed public marker prevents any environment credential lookup.
+              getApiKey: () => "cmd-riker-local-no-secret",
+              toolExecution: "sequential",
+            }
+          : {
+              initialState,
+              streamFn: execution.streamFn,
+              toolExecution: "sequential",
+            },
+      );
+
+      try {
+        await agent.prompt(request.ownerInput);
+      } catch (error) {
+        throw new PiTurnFailure(
+          "turn-failed",
+          "The Lead Model turn failed during execution.",
+          commitmentMutationApplied,
+          error,
+        );
+      }
+      const response = agent.state.messages.at(-1);
+      if (!response || response.role !== "assistant") {
+        throw new PiTurnFailure(
+          "invalid-response",
+          "Pi turn completed without an assistant response.",
+          commitmentMutationApplied,
+        );
+      }
+      if (response.stopReason === "aborted") {
+        throw new PiTurnFailure(
+          "aborted",
+          `Pi turn failed: ${response.errorMessage ?? response.stopReason}.`,
+          commitmentMutationApplied,
+        );
+      }
+      if (response.stopReason === "error") {
+        throw new PiTurnFailure(
+          "unavailable",
+          `Pi turn failed: ${response.errorMessage ?? response.stopReason}.`,
+          commitmentMutationApplied,
+        );
+      }
+      if (
+        response.provider !== request.modelSelection.provider ||
+        response.model !== request.modelSelection.model ||
+        response.api !== request.modelSelection.api
+      ) {
+        throw new PiTurnFailure(
+          "invalid-response",
+          "Pi turn returned a different Model Selection than requested.",
+          commitmentMutationApplied,
+        );
+      }
+      const content = response.content
+        .filter((item) => item.type === "text")
+        .map((item) => item.text)
+        .join("");
+      if (!content) {
+        throw new PiTurnFailure(
+          "invalid-response",
+          "Pi turn completed without response text.",
+          commitmentMutationApplied,
+        );
+      }
+      return { content };
+    } catch (error) {
+      if (error instanceof PiTurnFailure) throw error;
+      throw new PiTurnFailure(
+        "turn-failed",
+        error instanceof Error ? error.message : "Pi turn failed.",
+        commitmentMutationApplied,
+        error,
+      );
     }
-    if (response.stopReason === "error" || response.stopReason === "aborted") {
-      throw new Error(`Pi turn failed: ${response.errorMessage ?? response.stopReason}.`);
-    }
-    if (
-      response.provider !== request.modelSelection.provider ||
-      response.model !== request.modelSelection.model ||
-      response.api !== request.modelSelection.api
-    ) {
-      throw new Error("Pi turn returned a different Model Selection than requested.");
-    }
-    const content = response.content
-      .filter((item) => item.type === "text")
-      .map((item) => item.text)
-      .join("");
-    if (!content) throw new Error("Pi turn completed without response text.");
-    return { content };
   }
 
   private async resolveExecution(selection: ModelSelection): Promise<{
@@ -136,6 +379,145 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
       streamFn: models.streamSimple.bind(models),
     };
   }
+}
+
+function passedHardGates(): ModelCandidateValidation["hardGates"] {
+  return {
+    integration: "passed",
+    authentication: "passed",
+    intendedIdentity: "passed",
+    requiredCapabilities: "passed",
+    context: "passed",
+    dataHandling: "passed",
+    cost: "passed",
+  };
+}
+
+function failedHardGates(): ModelCandidateValidation["hardGates"] {
+  return Object.fromEntries(
+    Object.keys(passedHardGates()).map((gate) => [gate, "failed"]),
+  ) as ModelCandidateValidation["hardGates"];
+}
+
+function unknownHardGates(): ModelCandidateValidation["hardGates"] {
+  return Object.fromEntries(
+    Object.keys(passedHardGates()).map((gate) => [gate, "unknown"]),
+  ) as ModelCandidateValidation["hardGates"];
+}
+
+const commitmentCriterionSchema = Type.Union([
+  Type.Object({
+    kind: Type.Literal("response-includes"),
+    description: Type.String({ minLength: 1 }),
+    expectedText: Type.String({ minLength: 1 }),
+  }),
+  Type.Object({
+    kind: Type.Literal("owner-judgment"),
+  }),
+]);
+
+function commitmentTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  if (!request.commitmentActions) return [];
+  const actions = request.commitmentActions;
+  return [
+    {
+      name: "record_commitment",
+      label: "Record Commitment",
+      description:
+        "Visibly accept one outcome-oriented unit of work and declare how its response outcome is accepted.",
+      parameters: Type.Object({
+        outcome: Type.String({ minLength: 1 }),
+        criteria: Type.Array(commitmentCriterionSchema, { minItems: 1 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const commitment = actions.record(params as CommitmentDraft);
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Commitment ${commitment.id} is active and will be verified against the final response.`,
+            },
+          ],
+          details: { commitmentId: commitment.id, state: commitment.state },
+        };
+      },
+    },
+    {
+      name: "resume_commitment",
+      label: "Resume Commitment",
+      description: "Bind a blocked or paused Commitment to this Owner turn so its outcome can continue.",
+      parameters: Type.Object({ commitmentId: Type.String({ minLength: 1 }) }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId } = params as { commitmentId: string };
+        actions.resume(commitmentId);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: `Commitment ${commitmentId} resumed.` }],
+          details: { commitmentId, state: "active" },
+        };
+      },
+    },
+    {
+      name: "control_commitment",
+      label: "Control Commitment",
+      description: "Apply the Owner's explicit pause, cancellation, or supersession instruction.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        action: Type.Union([
+          Type.Literal("pause"),
+          Type.Literal("cancel"),
+          Type.Literal("supersede"),
+        ]),
+        reason: Type.String({ minLength: 1 }),
+        replacementCommitmentId: Type.Optional(Type.String({ minLength: 1 })),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, action, reason, replacementCommitmentId } = params as {
+          commitmentId: string;
+          action: "pause" | "cancel" | "supersede";
+          reason: string;
+          replacementCommitmentId?: string;
+        };
+        actions.control(commitmentId, action, reason, replacementCommitmentId);
+        observer.onMutation();
+        const disposition =
+          action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "superseded";
+        return {
+          content: [{ type: "text", text: `Commitment ${commitmentId} is ${disposition}.` }],
+          details: { commitmentId, action },
+        };
+      },
+    },
+    {
+      name: "accept_commitment",
+      label: "Accept Commitment",
+      description:
+        "Record the Owner's explicit verdict for one Commitment currently awaiting Owner Acceptance.",
+      parameters: Type.Object({ commitmentId: Type.String({ minLength: 1 }) }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId } = params as { commitmentId: string };
+        actions.accept(commitmentId);
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Owner Acceptance recorded for Commitment ${commitmentId}.`,
+            },
+          ],
+          details: { commitmentId, state: "accepted" },
+        };
+      },
+    },
+  ];
 }
 
 function toPiModel(

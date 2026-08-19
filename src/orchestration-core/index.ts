@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute, relative, resolve } from "node:path";
 
 import type { ModelSelection } from "../model-selection.ts";
 import type {
   EffectIntent,
+  TargetProjectOperationEffectIntent,
   TargetProjectOperationAttempt,
+  TargetProjectOperationRequest,
   TargetProjectOperationResult,
 } from "../target-project-operations/index.ts";
 
@@ -171,14 +174,7 @@ export type WorkerModelSelection = {
 
 export type WorkerSession = {
   id: string;
-  assignment: {
-    objective: string;
-    prompt: string;
-    targetProjectPath: string;
-    readOnly: true;
-    modelPolicyRevision: string;
-    commitmentId?: string;
-  };
+  assignment: WorkerAssignment;
   state:
     | "starting"
     | "running"
@@ -191,6 +187,7 @@ export type WorkerSession = {
     | "cancelled";
   currentExecutionAttemptId: string;
   cancellation?: {
+    kind: "owner" | "deadline";
     requestedAt: string;
     requestedByOwnerTurnId?: string;
     reason: string;
@@ -198,8 +195,44 @@ export type WorkerSession = {
   outcome?: WorkerOutcome;
 };
 
+type WorkerAssignmentBase = {
+    objective: string;
+    prompt: string;
+    targetProjectPath: string;
+    modelPolicyRevision: string;
+    commitmentId?: string;
+};
+
+export type WorkerAssignment =
+  | (WorkerAssignmentBase & { readOnly: true })
+  | (WorkerAssignmentBase & {
+      readOnly: false;
+      commitmentId: string;
+      targets: string[];
+      effectClasses: ["filesystem-write", "bounded-process-execution"];
+      authorizedWriteRoots: [string];
+      timeoutMs: number;
+      costBound: { maximumIncrementalSpendUsd: 0 };
+      checkoutIsolation: {
+        root: string;
+        baselineCommit: string;
+        isolation: { kind: "branch"; branch: string } | { kind: "worktree"; branch?: string };
+      };
+      authority: {
+        kind: "lead-agent-command-authority";
+        commitmentId: string;
+        validatedAt: string;
+      };
+      recoveryConstraint: "reconcile-before-replay";
+      verification: {
+        operation: "test";
+        workingDirectory: string;
+        timeoutMs: number;
+      };
+    });
+
 export type WorkerOutcome = {
-  status: "completed" | "blocked" | "failed" | "cancelled";
+  status: "completed" | "blocked" | "failed" | "cancelled" | "timed-out";
   summary: string;
   affectedArtifacts: string[];
   materialCommands: string[];
@@ -209,6 +242,7 @@ export type WorkerOutcome = {
     providerSessionId?: string;
     nativeExecutionId?: string;
     harnessVersion?: string;
+    baselineCommit?: string;
   };
 };
 
@@ -226,6 +260,7 @@ export type WorkerExecutionAttempt = {
   generation: number;
   modelSelection: WorkerModelSelection;
   modelPolicyRevision: string;
+  effectIntentId?: string;
   dispatch?: {
     leaseId: string;
     claimedAt: string;
@@ -239,18 +274,29 @@ export type WorkerExecutionAttempt = {
     | "blocked"
     | "failed"
     | "cancelled"
+    | "timed-out"
     | "continuity-lost";
   providerSessionId?: string;
   nativeExecutionId?: string;
   process?: { pid: number; startedAt: string };
   harnessVersion?: string;
-  capabilities?: {
-    readOnly: true;
-    nativeQuestions: true;
-    cancellation: true;
-    exactExecutionResume: "live-connection-only";
-    protocolSchemaSha256: string;
-  };
+  protocolSchemaSha256?: string;
+  capabilities?:
+    | {
+        readOnly: true;
+        nativeQuestions: true;
+        cancellation: true;
+        exactExecutionResume: "live-connection-only";
+        protocolSchemaSha256: string;
+      }
+    | {
+        readOnly: false;
+        nativeQuestions: true;
+        cancellation: true;
+        exactExecutionResume: "live-connection-only";
+        protocolSchemaSha256: string;
+        writeIsolation: "authorized-write-root-enforced";
+      };
   output?: string;
   failure?: string;
   outcome?: WorkerOutcome;
@@ -310,17 +356,23 @@ export interface OrchestrationState {
   startWorkerExecution(
     workerSessionSnapshots: WorkerSession[],
     executionAttempt: WorkerExecutionAttempt,
+    effectIntent?: EffectIntent,
   ): void;
   appendWorkerState(input: {
     workerSession?: WorkerSession;
     executionAttempt?: WorkerExecutionAttempt;
     questions?: WorkerQuestion[];
+    effectIntent?: EffectIntent;
   }): void;
+  settleWorkerVerification(
+    effectIntent: Extract<EffectIntent, { kind: "worker-assignment" }>,
+    commitmentSnapshots: Commitment[],
+  ): void;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
   settleTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
-    effectIntent: EffectIntent,
+    effectIntent: TargetProjectOperationEffectIntent,
   ): void;
   readTargetProjectOperationAttempt(attemptId: string): TargetProjectOperationAttempt | undefined;
   readTargetProjectOperationAttempts(): TargetProjectOperationAttempt[];
@@ -337,6 +389,14 @@ export interface OrchestrationCore {
     workerSession: WorkerSession;
     executionAttempt: WorkerExecutionAttempt;
   }>;
+  workerVerificationRecoveryView(): Array<{
+    workerSession: WorkerSession;
+    executionAttempt: WorkerExecutionAttempt;
+  }>;
+  workerVerificationRequest(
+    workerSessionId: string,
+    executionAttemptId: string,
+  ): TargetProjectOperationRequest;
   observeCodexCapabilityUnavailable(
     detail: string,
     targetProjectPath: string,
@@ -360,6 +420,11 @@ export interface OrchestrationCore {
   observeLeadResponse(ownerTurnId: string, leadAgentResponse: string): void;
   observeTargetProjectOperationResult(
     commitmentId: string,
+    result: TargetProjectOperationResult,
+  ): void;
+  observeWorkerVerificationResult(
+    workerSessionId: string,
+    executionAttemptId: string,
     result: TargetProjectOperationResult,
   ): void;
   observeLeadTurnFailure(ownerTurnId: string, reason: string): void;
@@ -388,6 +453,22 @@ export interface OrchestrationCore {
     modelPolicyRevision: string;
     commitmentId?: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
+  delegateEffectfulWorker(input: {
+    objective: string;
+    prompt: string;
+    targetProjectPath: string;
+    modelSelection: WorkerModelSelection;
+    modelPolicyRevision: string;
+    commitmentId: string;
+    targets: string[];
+    timeoutMs: number;
+    checkoutIsolation: {
+      root: string;
+      baselineCommit: string;
+      isolation: { kind: "branch"; branch: string } | { kind: "worktree"; branch?: string };
+    };
+    verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
+  }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
   observeWorkerAttemptStarted(input: {
     workerSessionId: string;
     executionAttemptId: string;
@@ -395,6 +476,7 @@ export interface OrchestrationCore {
     nativeExecutionId: string;
     process: { pid: number; startedAt: string };
     harnessVersion: string;
+    writeIsolation?: "authorized-write-root-enforced";
   }): void;
   observeWorkerProcessStarted(input: {
     workerSessionId: string;
@@ -407,6 +489,7 @@ export interface OrchestrationCore {
     workerSessionId: string,
     executionAttemptId: string,
   ): WorkerExecutionAttempt;
+  claimWorkerEffectDispatch(workerSessionId: string, executionAttemptId: string): void;
   observeWorkerQuestion(input: {
     workerSessionId: string;
     executionAttemptId: string;
@@ -430,6 +513,7 @@ export interface OrchestrationCore {
     ownerTurnId: string,
     reason: string,
   ): void;
+  requestWorkerDeadlineExceeded(workerSessionId: string): void;
   observeWorkerTerminal(input: {
     workerSessionId: string;
     executionAttemptId: string;
@@ -438,6 +522,7 @@ export interface OrchestrationCore {
     output?: string;
     detail?: string;
     materialCommands?: string[];
+    observedChanges?: string[];
     reportedOutcome?: WorkerReportedOutcome;
   }): "settled" | "stale";
   recordWorkerContinuityLoss(
@@ -446,7 +531,7 @@ export interface OrchestrationCore {
     reason: string,
   ): void;
   reconcileInterruptedWorkers(reason: string): void;
-  recoverReadOnlyWorker(
+  recoverWorker(
     workerSessionId: string,
     processGone: boolean,
   ):
@@ -485,6 +570,53 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           }
           return { workerSession: worker, executionAttempt };
         });
+    },
+
+    workerVerificationRecoveryView() {
+      return state.readWorkerSessions().flatMap((worker) => {
+        if (worker.assignment.readOnly || worker.state !== "completed") return [];
+        const attempt = state.readWorkerExecutionAttempt(worker.currentExecutionAttemptId);
+        const effect = attempt?.effectIntentId
+          ? state.readEffectIntent(attempt.effectIntentId)
+          : undefined;
+        return attempt &&
+          attempt.status === "completed" &&
+          effect?.kind === "worker-assignment" &&
+          effect.status === "succeeded" &&
+          !effect.verificationOperationAttemptId
+          ? [{ workerSession: worker, executionAttempt: attempt }]
+          : [];
+      });
+    },
+
+    workerVerificationRequest(workerSessionId, executionAttemptId) {
+      const worker = requireWorkerSession(state, workerSessionId);
+      const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+      const effect = attempt.effectIntentId
+        ? state.readEffectIntent(attempt.effectIntentId)
+        : undefined;
+      if (
+        worker.assignment.readOnly ||
+        worker.state !== "completed" ||
+        attempt.status !== "completed" ||
+        effect?.kind !== "worker-assignment" ||
+        effect.status !== "succeeded" ||
+        effect.verificationOperationAttemptId
+      ) {
+        throw new Error("Worker effect is not ready for its attributed Verification operation.");
+      }
+      return {
+        commitmentId: worker.assignment.commitmentId,
+        operation: { kind: worker.assignment.verification.operation, inputs: {} },
+        checkout: worker.assignment.targetProjectPath,
+        workingDirectory: worker.assignment.verification.workingDirectory,
+        timeoutMs: worker.assignment.verification.timeoutMs,
+        causedByWorker: {
+          workerSessionId: worker.id,
+          executionAttemptId: attempt.id,
+          generation: attempt.generation,
+        },
+      };
     },
 
     observeCodexCapabilityUnavailable(detail, targetProjectPath) {
@@ -572,6 +704,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       }
       for (const attempt of state.readTargetProjectOperationAttempts()) {
         const effectIntent = state.readEffectIntent(attempt.effectIntentId);
+        if (effectIntent?.kind !== "target-project-operation") continue;
         if (attempt.status === "ready" && effectIntent?.status === "pending") {
           const result: TargetProjectOperationResult = {
             operationAttemptId: attempt.id,
@@ -591,6 +724,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
             uncertainty: null,
             startedAt: attempt.startedAt,
             completedAt: new Date().toISOString(),
+            ...(attempt.causedByWorker ? { causedByWorker: attempt.causedByWorker } : {}),
           };
           state.settleTargetProjectOperation(
             { ...attempt, status: "rejected", result },
@@ -623,6 +757,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           },
           startedAt: attempt.startedAt,
           completedAt,
+          ...(attempt.causedByWorker ? { causedByWorker: attempt.causedByWorker } : {}),
         };
         state.settleTargetProjectOperation(
           { ...attempt, status: "unknown", result },
@@ -630,8 +765,14 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         );
         recordTargetProjectOperationVerification(state, attempt.commitmentId, result, "reconciling");
       }
+      const commitmentsAwaitingWorkerVerification = new Set(
+        this.workerVerificationRecoveryView().map(
+          ({ workerSession }) => workerSession.assignment.commitmentId,
+        ),
+      );
       for (const commitment of state.readCommitments()) {
         if (commitment.state !== "active" || commitment.condition) continue;
+        if (commitmentsAwaitingWorkerVerification.has(commitment.id)) continue;
         state.appendCommitmentSnapshots([
           {
             ...commitment,
@@ -725,6 +866,47 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
 
     observeTargetProjectOperationResult(commitmentId, result) {
       recordTargetProjectOperationVerification(state, commitmentId, result, "blocked");
+    },
+
+    observeWorkerVerificationResult(workerSessionId, executionAttemptId, result) {
+      const worker = requireWorkerSession(state, workerSessionId);
+      const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+      const effect = attempt.effectIntentId
+        ? state.readEffectIntent(attempt.effectIntentId)
+        : undefined;
+      if (
+        worker.assignment.readOnly ||
+        effect?.kind !== "worker-assignment" ||
+        effect.status !== "succeeded" ||
+        effect.verificationOperationAttemptId ||
+        result.causedByWorker?.workerSessionId !== worker.id ||
+        result.causedByWorker.executionAttemptId !== attempt.id ||
+        result.causedByWorker.generation !== attempt.generation
+      ) {
+        throw new Error("Worker Verification result is not attributed to the current settled effect.");
+      }
+      const commitment = state.readCommitment(worker.assignment.commitmentId);
+      if (
+        commitment?.condition &&
+        commitment.verification?.evidence.some(
+          (evidence) => evidence.operationAttemptId === result.operationAttemptId,
+        )
+      ) {
+        state.appendWorkerState({
+          effectIntent: { ...effect, verificationOperationAttemptId: result.operationAttemptId },
+        });
+        return;
+      }
+      const commitmentSnapshots = buildTargetProjectOperationVerification(
+        state,
+        worker.assignment.commitmentId,
+        result,
+        "blocked",
+      );
+      state.settleWorkerVerification(
+        { ...effect, verificationOperationAttemptId: result.operationAttemptId },
+        commitmentSnapshots,
+      );
     },
 
     observeLeadTurnFailure(ownerTurnId, reason) {
@@ -863,6 +1045,119 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return { workerSession, executionAttempt };
     },
 
+    delegateEffectfulWorker(input) {
+      if (!input.objective.trim() || !input.prompt.trim()) {
+        throw new Error("A Worker assignment requires an objective and prompt.");
+      }
+      if (!input.modelSelection.model.trim() || !input.modelPolicyRevision.trim()) {
+        throw new Error("A Worker assignment requires a Model Policy.");
+      }
+      const configuredPath = state.readOwnerConversation()?.targetProject.path;
+      if (!configuredPath || !samePath(configuredPath, input.targetProjectPath)) {
+        throw new Error("An effectful Worker requires the active Target Project checkout.");
+      }
+      const commitment = state.readCommitment(input.commitmentId);
+      if (!commitment || commitment.state !== "active" || commitment.condition) {
+        throw new Error("An effectful Worker requires one active unblocked Commitment.");
+      }
+      if (
+        !commitment.criteria.some(
+          (criterion) =>
+            criterion.kind === "target-project-operation" &&
+            criterion.operation === input.verification.operation,
+        )
+      ) {
+        throw new Error("The effectful Worker Commitment must declare its Verification operation.");
+      }
+      if (
+        !Number.isInteger(input.timeoutMs) ||
+        input.timeoutMs < 1 ||
+        !Number.isInteger(input.verification.timeoutMs) ||
+        input.verification.timeoutMs < 1
+      ) {
+        throw new Error("Effectful Worker and Verification timeouts must be positive integers.");
+      }
+      if (!samePath(input.verification.workingDirectory, configuredPath)) {
+        throw new Error("Effectful Worker Verification must run from the active checkout root.");
+      }
+      if (
+        !samePath(input.checkoutIsolation.root, configuredPath) ||
+        !/^[0-9a-f]{40,64}$/i.test(input.checkoutIsolation.baselineCommit)
+      ) {
+        throw new Error("Effectful work requires a proven isolated checkout baseline.");
+      }
+      if (
+        input.targets.length === 0 ||
+        input.targets.length > 64 ||
+        input.targets.some(
+          (target) =>
+            !target.trim() ||
+            isAbsolute(target) ||
+            !isWithin(configuredPath, resolve(configuredPath, target)),
+        )
+      ) {
+        throw new Error("Effectful Worker targets must be bounded checkout-relative paths.");
+      }
+      const workerSessionId = randomUUID();
+      const executionAttemptId = randomUUID();
+      const effectIntentId = randomUUID();
+      const validatedAt = new Date().toISOString();
+      const workerSession: WorkerSession = {
+        id: workerSessionId,
+        assignment: {
+          objective: input.objective,
+          prompt: input.prompt,
+          targetProjectPath: configuredPath,
+          readOnly: false,
+          modelPolicyRevision: input.modelPolicyRevision,
+          commitmentId: input.commitmentId,
+          targets: input.targets,
+          effectClasses: ["filesystem-write", "bounded-process-execution"],
+          authorizedWriteRoots: [configuredPath],
+          timeoutMs: input.timeoutMs,
+          costBound: { maximumIncrementalSpendUsd: 0 },
+          checkoutIsolation: input.checkoutIsolation,
+          authority: {
+            kind: "lead-agent-command-authority",
+            commitmentId: input.commitmentId,
+            validatedAt,
+          },
+          recoveryConstraint: "reconcile-before-replay",
+          verification: input.verification,
+        },
+        state: "starting",
+        currentExecutionAttemptId: executionAttemptId,
+      };
+      const executionAttempt: WorkerExecutionAttempt = {
+        id: executionAttemptId,
+        workerSessionId,
+        generation: 1,
+        modelSelection: input.modelSelection,
+        modelPolicyRevision: input.modelPolicyRevision,
+        effectIntentId,
+        status: "launch-intent-recorded",
+      };
+      const effectIntent: EffectIntent = {
+        id: effectIntentId,
+        commitmentId: input.commitmentId,
+        kind: "worker-assignment",
+        workerSessionId,
+        executionAttemptId,
+        expectedEffect: `Apply the bounded Worker assignment to ${input.targets.join(", ")}.`,
+        authorizedWriteRootKey: normalizedAuthorizedWriteRoot(configuredPath),
+        authorization: {
+          kind: "lead-agent-command-authority",
+          commitmentId: input.commitmentId,
+          targetProjectPath: configuredPath,
+          validatedAt,
+        },
+        retryRule: "Reconcile the prior effect before starting any replacement assignment.",
+        status: "pending",
+      };
+      state.startWorkerExecution([workerSession], executionAttempt, effectIntent);
+      return { workerSession, executionAttempt };
+    },
+
     observeWorkerProcessStarted(input) {
       const worker = requireWorkerSession(state, input.workerSessionId);
       const attempt = requireCurrentWorkerAttempt(state, worker, input.executionAttemptId);
@@ -875,13 +1170,18 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           status: "starting",
           process: input.process,
           harnessVersion: input.harnessVersion,
-          capabilities: {
-            readOnly: true,
-            nativeQuestions: true,
-            cancellation: true,
-            exactExecutionResume: "live-connection-only",
-            protocolSchemaSha256: input.protocolSchemaSha256,
-          },
+          protocolSchemaSha256: input.protocolSchemaSha256,
+          ...(worker.assignment.readOnly
+            ? {
+                capabilities: {
+                  readOnly: true as const,
+                  nativeQuestions: true as const,
+                  cancellation: true as const,
+                  exactExecutionResume: "live-connection-only" as const,
+                  protocolSchemaSha256: input.protocolSchemaSha256,
+                },
+              }
+            : {}),
         },
       ]);
     },
@@ -901,6 +1201,36 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return dispatching;
     },
 
+    claimWorkerEffectDispatch(workerSessionId, executionAttemptId) {
+      const worker = requireWorkerSession(state, workerSessionId);
+      if (worker.assignment.readOnly) {
+        throw new Error("A read-only Worker has no mutating effect to dispatch.");
+      }
+      const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+      const effect = attempt.effectIntentId
+        ? state.readEffectIntent(attempt.effectIntentId)
+        : undefined;
+      if (
+        attempt.status !== "starting" ||
+        effect?.kind !== "worker-assignment" ||
+        effect.executionAttemptId !== attempt.id ||
+        effect.status !== "pending"
+      ) {
+        throw new Error(`Worker execution attempt ${attempt.id} has no pending effect to dispatch.`);
+      }
+      const claimedAt = new Date().toISOString();
+      state.appendWorkerState({
+        effectIntent: {
+          ...effect,
+          status: "dispatching",
+          lease: {
+            claimedAt,
+            expiresAt: new Date(Date.now() + worker.assignment.timeoutMs).toISOString(),
+          },
+        },
+      });
+    },
+
     observeWorkerAttemptStarted(input) {
       const worker = requireWorkerSession(state, input.workerSessionId);
       const attempt = requireCurrentWorkerAttempt(state, worker, input.executionAttemptId);
@@ -914,6 +1244,17 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       ) {
         throw new Error(`Worker execution attempt ${attempt.id} changed native process identity.`);
       }
+      if (!worker.assignment.readOnly) {
+        const effect = attempt.effectIntentId
+          ? state.readEffectIntent(attempt.effectIntentId)
+          : undefined;
+        if (
+          input.writeIsolation !== "authorized-write-root-enforced" ||
+          effect?.status !== "dispatching"
+        ) {
+          throw new Error(`Worker execution attempt ${attempt.id} lacks proven write isolation.`);
+        }
+      }
       state.appendWorkerState({
         executionAttempt: {
           ...attempt,
@@ -922,6 +1263,18 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           nativeExecutionId: input.nativeExecutionId,
           process: input.process,
           harnessVersion: input.harnessVersion,
+          ...(!worker.assignment.readOnly
+            ? {
+                capabilities: {
+                  readOnly: false as const,
+                  nativeQuestions: true as const,
+                  cancellation: true as const,
+                  exactExecutionResume: "live-connection-only" as const,
+                  protocolSchemaSha256: attempt.protocolSchemaSha256 ?? "",
+                  writeIsolation: "authorized-write-root-enforced" as const,
+                },
+              }
+            : {}),
         },
         workerSession: { ...worker, state: "running" },
       });
@@ -1048,9 +1401,29 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           ...worker,
           state: "cancellation-requested",
           cancellation: {
+            kind: "owner",
             requestedAt: new Date().toISOString(),
             requestedByOwnerTurnId: ownerTurnId,
             reason,
+          },
+        },
+      ]);
+    },
+
+    requestWorkerDeadlineExceeded(workerSessionId) {
+      const worker = requireWorkerSession(state, workerSessionId);
+      if (worker.assignment.readOnly) {
+        throw new Error("Only effectful Worker assignments have an orchestrated work deadline.");
+      }
+      if (["completed", "blocked", "failed", "cancelled"].includes(worker.state)) return;
+      state.appendWorkerSessionSnapshots([
+        {
+          ...worker,
+          state: "cancellation-requested",
+          cancellation: {
+            kind: "deadline",
+            requestedAt: new Date().toISOString(),
+            reason: `Effectful Worker exceeded its ${worker.assignment.timeoutMs}ms deadline.`,
           },
         },
       ]);
@@ -1072,6 +1445,147 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           },
         ]);
         return "stale";
+      }
+      if (!worker.assignment.readOnly) {
+        const assignment = worker.assignment;
+        const effect = attempt.effectIntentId
+          ? state.readEffectIntent(attempt.effectIntentId)
+          : undefined;
+        if (
+          effect?.kind !== "worker-assignment" ||
+          effect.workerSessionId !== worker.id ||
+          effect.executionAttemptId !== attempt.id ||
+          (effect.status !== "pending" && effect.status !== "dispatching")
+        ) {
+          throw new Error(`Effectful Worker execution attempt ${attempt.id} has no open effect.`);
+        }
+        const artifactPathsValid =
+          input.reportedOutcome?.affectedArtifacts.every((artifact) => {
+            if (!artifact.trim() || isAbsolute(artifact)) return false;
+            const artifactPath = resolve(assignment.targetProjectPath, artifact);
+            return (
+              isWithin(assignment.targetProjectPath, artifactPath) &&
+              assignment.targets.some((target) =>
+                isWithin(resolve(assignment.targetProjectPath, target), artifactPath),
+              )
+            );
+          }) ?? false;
+        const observedChanges = input.observedChanges ?? [];
+        const observedChangesValid =
+          observedChanges.length > 0 &&
+          observedChanges.every((artifact) => {
+            if (!artifact.trim() || isAbsolute(artifact)) return false;
+            const artifactPath = resolve(assignment.targetProjectPath, artifact);
+            return (
+              isWithin(assignment.targetProjectPath, artifactPath) &&
+              assignment.targets.some((target) =>
+                isWithin(resolve(assignment.targetProjectPath, target), artifactPath),
+              )
+            );
+          });
+        const reportedArtifactsMatch =
+          artifactPathsValid &&
+          observedChanges.length === input.reportedOutcome?.affectedArtifacts.length &&
+          observedChanges.every((path) => input.reportedOutcome?.affectedArtifacts.includes(path));
+        const deadlineExceeded = worker.cancellation?.kind === "deadline";
+        const completedSafely =
+          effect.status === "dispatching" &&
+          input.status === "completed" &&
+          input.processGone &&
+          input.reportedOutcome?.status === "completed" &&
+          !input.reportedOutcome.unresolvedUncertainty &&
+          observedChangesValid &&
+          reportedArtifactsMatch &&
+          !deadlineExceeded;
+        const effectStatus = completedSafely
+          ? "succeeded"
+          : effect.status === "pending"
+            ? "rejected"
+            : "unknown";
+        const timedOut = deadlineExceeded;
+        const cancelled =
+          !timedOut && input.status === "interrupted" && worker.state === "cancellation-requested";
+        const uncertainty = completedSafely
+          ? undefined
+          : effectStatus === "unknown"
+            ? input.reportedOutcome?.unresolvedUncertainty ??
+              input.detail ??
+              (!input.processGone
+                ? "The recorded native process is not proven gone."
+                : deadlineExceeded
+                  ? "The Worker completed after its durable assignment deadline expired."
+                : !observedChangesValid
+                  ? "No bounded Target Project change was observed against the assignment baseline."
+                  : !reportedArtifactsMatch
+                    ? "The Worker report did not match the observed Target Project changes."
+                  : "The dispatched Worker effect could not be proven settled.")
+            : input.detail ?? "The Worker failed before its effect was dispatched.";
+        const outcome: WorkerOutcome = {
+          status: completedSafely
+            ? "completed"
+            : timedOut
+              ? "timed-out"
+              : cancelled
+                ? "cancelled"
+                : "failed",
+          summary:
+            input.reportedOutcome?.summary ||
+            input.output?.trim() ||
+            input.detail ||
+            `Codex turn ended ${input.status}.`,
+          affectedArtifacts: observedChanges,
+          materialCommands: input.materialCommands ?? [],
+          verificationResults: [
+            ...(input.reportedOutcome?.verificationResults ?? []),
+            `Codex native turn ${attempt.nativeExecutionId ?? attempt.id} ended ${input.status}.`,
+            ...(input.processGone ? ["The recorded native process is proven gone."] : []),
+            ...(observedChanges.length
+              ? [`Observed ${observedChanges.length} change(s) against the isolated checkout baseline.`]
+              : []),
+          ],
+          ...(uncertainty ? { unresolvedUncertainty: uncertainty } : {}),
+          evidence: {
+            ...(attempt.providerSessionId ? { providerSessionId: attempt.providerSessionId } : {}),
+            ...(attempt.nativeExecutionId ? { nativeExecutionId: attempt.nativeExecutionId } : {}),
+            ...(attempt.harnessVersion ? { harnessVersion: attempt.harnessVersion } : {}),
+            baselineCommit: assignment.checkoutIsolation.baselineCommit,
+          },
+        };
+        const settledQuestions = state
+          .readWorkerQuestions()
+          .filter(
+            (question) =>
+              question.executionAttemptId === attempt.id &&
+              (question.status === "open" || question.status === "answer-recorded"),
+          )
+          .map((question) => ({ ...question, status: "cancelled" as const }));
+        state.appendWorkerState({
+          executionAttempt: {
+            ...attempt,
+            status: completedSafely
+              ? "completed"
+              : timedOut
+                ? "timed-out"
+                : cancelled
+                  ? "cancelled"
+                  : "failed",
+            ...(input.output ? { output: input.output } : {}),
+            ...(input.detail ? { failure: input.detail } : {}),
+            outcome,
+          },
+          questions: settledQuestions,
+          workerSession: {
+            ...worker,
+            state: completedSafely
+              ? "completed"
+              : effectStatus === "unknown"
+                ? "reconciling"
+                : "failed",
+            outcome,
+          },
+          effectIntent: { ...effect, status: effectStatus },
+        });
+        return "settled";
       }
       const cancelled = input.status === "interrupted" && worker.state === "cancellation-requested";
       if (cancelled && !input.processGone) {
@@ -1180,7 +1694,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       }
     },
 
-    recoverReadOnlyWorker(workerSessionId, processGone) {
+    recoverWorker(workerSessionId, processGone) {
       const worker = requireWorkerSession(state, workerSessionId);
       const previousAttempt = requireCurrentWorkerAttempt(
         state,
@@ -1199,7 +1713,18 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         return { kind: "settled" };
       }
       if (!worker.assignment.readOnly) {
-        throw new Error("Only a proven read-only Worker assignment may restart automatically.");
+        if (!processGone) return { kind: "blocked" };
+        this.observeWorkerTerminal({
+          workerSessionId: worker.id,
+          executionAttemptId: previousAttempt.id,
+          status: "failed",
+          processGone: true,
+          detail: "Effectful Worker continuity was lost; replay is forbidden.",
+        });
+        const effect = previousAttempt.effectIntentId
+          ? state.readEffectIntent(previousAttempt.effectIntentId)
+          : undefined;
+        return { kind: effect?.status === "unknown" ? "blocked" : "settled" };
       }
       if (["completed", "blocked", "failed", "cancelled"].includes(worker.state)) {
         throw new Error(`Worker Session ${worker.id} is already terminal.`);
@@ -1340,6 +1865,17 @@ function recordTargetProjectOperationVerification(
   result: TargetProjectOperationResult,
   failureCondition: "blocked" | "reconciling",
 ): void {
+  state.appendCommitmentSnapshots(
+    buildTargetProjectOperationVerification(state, commitmentId, result, failureCondition),
+  );
+}
+
+function buildTargetProjectOperationVerification(
+  state: OrchestrationState,
+  commitmentId: string,
+  result: TargetProjectOperationResult,
+  failureCondition: "blocked" | "reconciling",
+): Commitment[] {
   const commitment = state.readCommitment(commitmentId);
   if (!commitment) throw new Error(`Unknown Commitment ${commitmentId}.`);
   if (commitment.state !== "active" || commitment.condition) {
@@ -1360,6 +1896,7 @@ function recordTargetProjectOperationVerification(
     attempt.commitmentId !== commitmentId ||
     attempt.effectIntentId !== result.effectIntentId ||
     JSON.stringify(attempt.result) !== JSON.stringify(result) ||
+    effectIntent?.kind !== "target-project-operation" ||
     effectIntent?.operationAttemptId !== attempt.id ||
     effectIntent.commitmentId !== commitmentId ||
     effectIntent.status !== expectedEffectStatus
@@ -1415,7 +1952,25 @@ function recordTargetProjectOperationVerification(
           nextAction: result.uncertainty?.nextAction ?? "Diagnose the failed operation before retrying.",
         },
       };
-  state.appendCommitmentSnapshots([verifying, settled]);
+  return [verifying, settled];
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function normalizedAuthorizedWriteRoot(path: string): string {
+  const normalized = resolve(path);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function isWithin(parent: string, candidate: string): boolean {
+  const path = relative(resolve(parent), resolve(candidate));
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
 function validateCommitmentDraft(draft: CommitmentDraft): void {

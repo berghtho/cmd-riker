@@ -88,15 +88,16 @@ test("production adapter refuses a Model URL that can carry secrets", async () =
   );
 });
 
-test("production adapter advertises only the proven read-only Codex Worker controls", async (t) => {
+test("production adapter advertises the bounded Codex Worker controls", async (t) => {
   let delegated: unknown;
   const localModel = await startLocalModel((call, requestBody) => {
     if (call === 1) {
       const serialized = JSON.stringify(requestBody);
       assert.match(serialized, /delegate_read_only_codex/);
+      assert.match(serialized, /delegate_effectful_codex/);
       assert.match(serialized, /answer_worker_question/);
       assert.match(serialized, /cancel_worker_session/);
-      assert.doesNotMatch(serialized, /delegate_write|resume_worker/);
+      assert.doesNotMatch(serialized, /resume_worker/);
       return {
         toolCall: {
           id: "worker-call-1",
@@ -121,6 +122,9 @@ test("production adapter advertises only the proven read-only Codex Worker contr
         delegated = input;
         return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
       },
+      async delegateEffectful() {
+        return { workerSessionId: "worker-effectful-1", executionAttemptId: "attempt-effectful-1" };
+      },
       async answer() {},
       async cancel() {},
     },
@@ -131,6 +135,53 @@ test("production adapter advertises only the proven read-only Codex Worker contr
     prompt: "Report the module seams.",
   });
   assert.equal(result.content, "The read-only Codex Worker Session is running.");
+});
+
+test("production adapter delegates effectful work only through the bounded assignment tool", async (t) => {
+  let delegated: unknown;
+  const localModel = await startLocalModel((call) => {
+    if (call === 1) {
+      return {
+        toolCall: {
+          id: "effectful-worker-call-1",
+          name: "delegate_effectful_codex",
+          arguments: {
+            objective: "Implement the accepted change",
+            prompt: "Change only src/index.ts.",
+            commitmentId: "commitment-1",
+            targets: ["src/index.ts"],
+          },
+        },
+      };
+    }
+    return "The bounded implementation Worker Session is running.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Implement the accepted Target Project change.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    workerActions: {
+      async delegate() {
+        return { workerSessionId: "worker-read-only", executionAttemptId: "attempt-read-only" };
+      },
+      async delegateEffectful(input) {
+        delegated = input;
+        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+      },
+      async answer() {},
+      async cancel() {},
+    },
+  });
+
+  assert.deepEqual(delegated, {
+    objective: "Implement the accepted change",
+    prompt: "Change only src/index.ts.",
+    commitmentId: "commitment-1",
+    targets: ["src/index.ts"],
+  });
+  assert.equal(result.content, "The bounded implementation Worker Session is running.");
 });
 
 function modelSelection(baseUrl: string): ModelSelection {

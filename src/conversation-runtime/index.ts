@@ -56,6 +56,12 @@ export type PiTurnRequest = {
       prompt: string;
       commitmentId?: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+    delegateEffectful(input: {
+      objective: string;
+      prompt: string;
+      commitmentId: string;
+      targets: string[];
+    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     answer(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -293,9 +299,11 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
            "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
            (request.workerActions
-             ? "\nA proven Codex 0.147.0 Worker capability is available only for read-only, " +
-               "network-disabled Target Project assignments. It supports native questions and cancellation. " +
-               "Do not claim write capability, rollback, or exact resume after connection loss."
+              ? "\nA proven Codex 0.147.0 Worker capability is available for network-disabled read-only work and " +
+                "effectful work confined to the active Target Project checkout. For implementation, first record " +
+                "one Commitment with a target-project-operation test criterion, then call delegate_effectful_codex " +
+                "with checkout-relative targets. CMD Riker runs typed Verification after the Worker finishes. " +
+                "It supports native questions and cancellation. Never claim rollback or effectful replay after connection loss."
              : "") +
            (workerContext ? `\nCurrent Worker Sessions:\n${workerContext}` : "") +
            (questionContext ? `\nOpen Worker questions:\n${questionContext}` : ""),
@@ -634,6 +642,41 @@ function workerTools(
               text:
                 `Worker Session ${result.workerSessionId} started read-only ` +
                 `execution attempt ${result.executionAttemptId}.`,
+            },
+          ],
+          details: result,
+        };
+      },
+    },
+    {
+      name: "delegate_effectful_codex",
+      label: "Delegate Effectful Codex Worker",
+      description:
+        "Start one bounded, network-disabled Codex implementation assignment inside the technically enforced active Target Project checkout. Requires an active Commitment with declared test Verification.",
+      parameters: Type.Object({
+        objective: Type.String({ minLength: 1 }),
+        prompt: Type.String({ minLength: 1 }),
+        commitmentId: Type.String({ minLength: 1 }),
+        targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const result = await actions.delegateEffectful(
+          params as {
+            objective: string;
+            prompt: string;
+            commitmentId: string;
+            targets: string[];
+          },
+        );
+        observer.onMutation();
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Worker Session ${result.workerSessionId} started effectful ` +
+                `execution attempt ${result.executionAttemptId} inside its Authorized Write Root.`,
             },
           ],
           details: result,

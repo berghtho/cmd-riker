@@ -5,27 +5,47 @@ import {
   type WorkerReportedOutcome,
   type WorkerSession,
 } from "../orchestration-core/index.ts";
+import type { TargetProjectOperations } from "../target-project-operations/index.ts";
+import {
+  NativeEffectfulCheckoutInspector,
+  type EffectfulCheckoutInspector,
+} from "./checkout-isolation.ts";
 
 export {
   createCodexWorkerHarness,
+  proveCodexWorkspaceWriteIsolation,
   resolveCodexRuntime,
   type CodexRuntime,
 } from "./codex-app-server.ts";
+export {
+  NativeEffectfulCheckoutInspector,
+  type EffectfulCheckoutInspector,
+  type IsolatedCheckout,
+} from "./checkout-isolation.ts";
 
-export type WorkerStartRequest = {
+type WorkerStartRequestBase = {
   workerSessionId: string;
   executionAttemptId: string;
   objective: string;
   prompt: string;
   targetProjectPath: string;
   model: string;
-  readOnly: true;
   priorAnswers?: Array<{
     questionId: string;
     questions: Array<{ id: string; question: string }>;
     answers: Record<string, string[]>;
   }>;
 };
+
+export type WorkerStartRequest =
+  | (WorkerStartRequestBase & { readOnly: true })
+  | (WorkerStartRequestBase & {
+      readOnly: false;
+      targets: string[];
+      authorizedWriteRoot: string;
+      timeoutMs: number;
+      recoveryConstraint: "reconcile-before-replay";
+    });
 
 export type WorkerExecutionObserver = {
   processStarted(identity: {
@@ -45,6 +65,7 @@ export type WorkerExecutionObserver = {
   }): void;
   output(text: string): void;
   materialCommand?(command: string): void;
+  effectDispatchStarted?(): void | Promise<void>;
   completed(
     status: "completed" | "failed" | "interrupted",
     detail?: string,
@@ -60,6 +81,7 @@ export type CodexWorkerExecution = {
     process: { pid: number; startedAt: string };
     harnessVersion: string;
     protocolSchemaSha256: string;
+    writeIsolation?: "codex-windows-workspace-write";
   };
   answer(providerRequestId: number | string, answers: Record<string, string[]>): Promise<void>;
   interrupt(): Promise<void>;
@@ -83,6 +105,17 @@ export interface WorkerSupervisor {
     modelPolicyRevision: string;
     commitmentId?: string;
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+  delegateEffectful(input: {
+    objective: string;
+    prompt: string;
+    targetProjectPath: string;
+    model: string;
+    modelPolicyRevision: string;
+    commitmentId: string;
+    targets: string[];
+    timeoutMs: number;
+    verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
+  }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
   answer(
     questionId: string,
     ownerTurnId: string,
@@ -95,11 +128,46 @@ export interface WorkerSupervisor {
 export function createWorkerSupervisor(
   state: OrchestrationState,
   harness: CodexWorkerHarness,
+  verificationOperations?: TargetProjectOperations,
+  checkoutInspector: EffectfulCheckoutInspector = new NativeEffectfulCheckoutInspector(),
 ): WorkerSupervisor {
   const orchestration = createOrchestrationCore(state);
   const executions = new Map<string, CodexWorkerExecution>();
   const outputByAttempt = new Map<string, string>();
   const commandsByAttempt = new Map<string, string[]>();
+  const deadlinesByAttempt = new Map<string, NodeJS.Timeout[]>();
+  const clearDeadlines = (executionAttemptId: string): void => {
+    for (const timer of deadlinesByAttempt.get(executionAttemptId) ?? []) clearTimeout(timer);
+    deadlinesByAttempt.delete(executionAttemptId);
+  };
+  const verifySettledWorker = async (
+    workerSession: WorkerSession,
+    executionAttempt: WorkerExecutionAttempt,
+  ): Promise<void> => {
+    if (workerSession.assignment.readOnly || !verificationOperations) {
+      throw new Error("Effectful Worker Verification operations are unavailable.");
+    }
+    const existingAttempt = state.readTargetProjectOperationAttempts().find(
+      (attempt) =>
+        attempt.causedByWorker?.workerSessionId === workerSession.id &&
+        attempt.causedByWorker.executionAttemptId === executionAttempt.id &&
+        attempt.causedByWorker.generation === executionAttempt.generation,
+    );
+    if (existingAttempt) {
+      if (existingAttempt.result) {
+        orchestration.observeWorkerVerificationResult(
+          workerSession.id,
+          executionAttempt.id,
+          existingAttempt.result,
+        );
+      }
+      return;
+    }
+    const result = await verificationOperations.execute(
+      orchestration.workerVerificationRequest(workerSession.id, executionAttempt.id),
+    );
+    orchestration.observeWorkerVerificationResult(workerSession.id, executionAttempt.id, result);
+  };
   const startExecution = async (
     workerSession: WorkerSession,
     executionAttempt: WorkerExecutionAttempt,
@@ -122,17 +190,27 @@ export function createWorkerSupervisor(
         answers: question.answer!.answers,
       }));
     try {
-      const execution = await harness.start(
-        {
+      const requestBase = {
           workerSessionId: workerSession.id,
           executionAttemptId: executionAttempt.id,
           objective: workerSession.assignment.objective,
           prompt: workerSession.assignment.prompt,
           targetProjectPath: workerSession.assignment.targetProjectPath,
           model: executionAttempt.modelSelection.model,
-          readOnly: true,
           ...(retainedAnswers.length ? { priorAnswers: retainedAnswers } : {}),
-        },
+        };
+      const request: WorkerStartRequest = workerSession.assignment.readOnly
+        ? { ...requestBase, readOnly: true }
+        : {
+            ...requestBase,
+            readOnly: false,
+            targets: workerSession.assignment.targets,
+            authorizedWriteRoot: workerSession.assignment.authorizedWriteRoots[0],
+            timeoutMs: workerSession.assignment.timeoutMs,
+            recoveryConstraint: workerSession.assignment.recoveryConstraint,
+          };
+      const execution = await harness.start(
+        request,
         {
           processStarted(identity) {
             orchestration.observeWorkerProcessStarted({
@@ -156,10 +234,29 @@ export function createWorkerSupervisor(
             const commands = commandsByAttempt.get(executionAttempt.id) ?? [];
             commandsByAttempt.set(executionAttempt.id, [...commands, command].slice(-100));
           },
+          effectDispatchStarted() {
+            orchestration.claimWorkerEffectDispatch(workerSession.id, executionAttempt.id);
+          },
           async completed(status, detail, reportedOutcome) {
+            clearDeadlines(executionAttempt.id);
             const liveExecution = await ready.promise;
             const termination = await liveExecution.terminate();
-            orchestration.observeWorkerTerminal({
+            let observedChanges: string[] | undefined;
+            let observationFailure: string | undefined;
+            if (!workerSession.assignment.readOnly && status === "completed") {
+              try {
+                observedChanges = await checkoutInspector.observeChanges(
+                  workerSession.assignment.checkoutIsolation,
+                  workerSession.assignment.timeoutMs,
+                );
+              } catch (error) {
+                observationFailure = error instanceof Error
+                  ? error.message
+                  : "The isolated checkout change could not be observed.";
+              }
+            }
+            const terminalDetail = observationFailure ?? detail;
+            const terminal = orchestration.observeWorkerTerminal({
               workerSessionId: workerSession.id,
               executionAttemptId: executionAttempt.id,
               status,
@@ -167,17 +264,29 @@ export function createWorkerSupervisor(
               ...(outputByAttempt.get(executionAttempt.id)
                 ? { output: outputByAttempt.get(executionAttempt.id)! }
                 : {}),
-              ...(detail ? { detail } : {}),
+              ...(terminalDetail ? { detail: terminalDetail } : {}),
               ...(commandsByAttempt.get(executionAttempt.id)
                 ? { materialCommands: commandsByAttempt.get(executionAttempt.id)! }
                 : {}),
               ...(reportedOutcome ? { reportedOutcome } : {}),
+              ...(observedChanges ? { observedChanges } : {}),
             });
-            executions.delete(workerSession.id);
+            if (executions.get(workerSession.id) === liveExecution) {
+              executions.delete(workerSession.id);
+            }
             outputByAttempt.delete(executionAttempt.id);
             commandsByAttempt.delete(executionAttempt.id);
+            if (terminal === "settled" && !workerSession.assignment.readOnly) {
+              const effect = executionAttempt.effectIntentId
+                ? state.readEffectIntent(executionAttempt.effectIntentId)
+                : undefined;
+              if (effect?.status === "succeeded") {
+                await verifySettledWorker(workerSession, executionAttempt);
+              }
+            }
           },
           async failed(error) {
+            clearDeadlines(executionAttempt.id);
             let liveExecution: CodexWorkerExecution;
             try {
               liveExecution = await ready.promise;
@@ -190,11 +299,13 @@ export function createWorkerSupervisor(
               executionAttempt.id,
               error.message,
             );
-            const recovery = orchestration.recoverReadOnlyWorker(
+            const recovery = orchestration.recoverWorker(
               workerSession.id,
               termination.gone,
             );
-            executions.delete(workerSession.id);
+            if (executions.get(workerSession.id) === liveExecution) {
+              executions.delete(workerSession.id);
+            }
             outputByAttempt.delete(executionAttempt.id);
             commandsByAttempt.delete(executionAttempt.id);
             if (recovery.kind === "restart") {
@@ -206,10 +317,58 @@ export function createWorkerSupervisor(
       orchestration.observeWorkerAttemptStarted({
         workerSessionId: workerSession.id,
         executionAttemptId: executionAttempt.id,
-        ...execution.identity,
+        providerSessionId: execution.identity.providerSessionId,
+        nativeExecutionId: execution.identity.nativeExecutionId,
+        process: execution.identity.process,
+        harnessVersion: execution.identity.harnessVersion,
+        ...(execution.identity.writeIsolation
+          ? { writeIsolation: "authorized-write-root-enforced" as const }
+          : {}),
       });
       executions.set(workerSession.id, execution);
       ready.resolve(execution);
+      if (!workerSession.assignment.readOnly) {
+        const deadline = setTimeout(() => {
+          orchestration.requestWorkerDeadlineExceeded(workerSession.id);
+          void execution.interrupt().catch(async (error: unknown) => {
+            const termination = await execution.terminate();
+            if (!termination.gone) return;
+            orchestration.observeWorkerTerminal({
+              workerSessionId: workerSession.id,
+              executionAttemptId: executionAttempt.id,
+              status: "interrupted",
+              processGone: true,
+              detail: error instanceof Error ? error.message : "Worker deadline interruption failed.",
+            });
+            executions.delete(workerSession.id);
+            clearDeadlines(executionAttempt.id);
+          });
+          const escalation = setTimeout(async () => {
+            const current = orchestration.workerExecutionAttemptView(executionAttempt.id);
+            if (!current || current.status !== "running") return;
+            const termination = await execution.terminate();
+            if (!termination.gone) return;
+            orchestration.observeWorkerTerminal({
+              workerSessionId: workerSession.id,
+              executionAttemptId: executionAttempt.id,
+              status: "interrupted",
+              processGone: true,
+              detail: "Worker deadline interruption required process termination.",
+            });
+            executions.delete(workerSession.id);
+            clearDeadlines(executionAttempt.id);
+          }, 10_000);
+          escalation.unref();
+          deadlinesByAttempt.set(executionAttempt.id, [escalation]);
+        }, Math.max(
+          0,
+          Date.parse(workerSession.assignment.authority.validatedAt) +
+            workerSession.assignment.timeoutMs -
+            Date.now(),
+        ));
+        deadline.unref();
+        deadlinesByAttempt.set(executionAttempt.id, [deadline]);
+      }
       if (retainedAnswers.length) {
         orchestration.observeWorkerAnswersReplayed(
           workerSession.id,
@@ -218,6 +377,7 @@ export function createWorkerSupervisor(
         );
       }
     } catch (error) {
+      clearDeadlines(executionAttempt.id);
       ready.reject(error);
       const latestAttempt = orchestration.workerExecutionAttemptView(executionAttempt.id);
       if (latestAttempt?.process) {
@@ -227,7 +387,7 @@ export function createWorkerSupervisor(
           executionAttempt.id,
           error instanceof Error ? error.message : "Codex startup continuity was lost.",
         );
-        const recovery = orchestration.recoverReadOnlyWorker(workerSession.id, abandoned.gone);
+        const recovery = orchestration.recoverWorker(workerSession.id, abandoned.gone);
         if (recovery.kind === "restart") {
           await startExecution(recovery.workerSession, recovery.executionAttempt);
         }
@@ -246,6 +406,27 @@ export function createWorkerSupervisor(
   return {
     async delegate(input) {
       const { workerSession, executionAttempt } = orchestration.delegateReadOnlyCodex(input);
+      void startExecution(workerSession, executionAttempt).catch(() => {});
+      return {
+        workerSessionId: workerSession.id,
+        executionAttemptId: executionAttempt.id,
+      };
+    },
+
+    async delegateEffectful(input) {
+      if (!verificationOperations) {
+        throw new Error("Effectful Worker delegation requires typed Verification operations.");
+      }
+      const checkoutIsolation = await checkoutInspector.verify(
+        input.targetProjectPath,
+        input.timeoutMs,
+      );
+      const { model, ...assignment } = input;
+      const { workerSession, executionAttempt } = orchestration.delegateEffectfulWorker({
+        ...assignment,
+        modelSelection: { provider: "openai", model, nativeHarness: "codex" },
+        checkoutIsolation,
+      });
       void startExecution(workerSession, executionAttempt).catch(() => {});
       return {
         workerSessionId: workerSession.id,
@@ -308,10 +489,13 @@ export function createWorkerSupervisor(
             "The host restart could not prove exact native execution continuity.",
           );
         }
-        const recovery = orchestration.recoverReadOnlyWorker(worker.id, abandoned.gone);
+        const recovery = orchestration.recoverWorker(worker.id, abandoned.gone);
         if (recovery.kind === "restart") {
           await startExecution(recovery.workerSession, recovery.executionAttempt);
         }
+      }
+      for (const { workerSession, executionAttempt } of orchestration.workerVerificationRecoveryView()) {
+        await verifySettledWorker(workerSession, executionAttempt);
       }
     },
   };

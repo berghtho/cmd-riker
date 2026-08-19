@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import type { WorkerReportedOutcome } from "../orchestration-core/index.ts";
@@ -92,7 +94,15 @@ class CodexAppServerHarness implements CodexWorkerHarness {
     request: WorkerStartRequest,
     observer: WorkerExecutionObserver,
   ): Promise<CodexWorkerExecution> {
-    if (!request.readOnly) throw new Error("Codex Worker assignments must be read-only.");
+    if (!request.readOnly && process.platform !== "win32") {
+      throw new Error("Effectful Codex Worker assignments require Windows write isolation.");
+    }
+    if (
+      !request.readOnly &&
+      resolve(request.authorizedWriteRoot) !== resolve(request.targetProjectPath)
+    ) {
+      throw new Error("The Codex Authorized Write Root must be the Target Project checkout.");
+    }
     const transport = new JsonlTransport(this.runtime, request.targetProjectPath);
     const queuedMessages: ProtocolMessage[] = [];
     let providerSessionId: string | undefined;
@@ -100,12 +110,24 @@ class CodexAppServerHarness implements CodexWorkerHarness {
     let outputText = "";
     let terminalObserved = false;
     let terminating = false;
+    let isolationFailure: string | undefined;
     const answerDeliveries = new Map<
       string,
       { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }
     >();
 
     const route = (message: ProtocolMessage): void => {
+      if (message.method === "windows/worldWritableWarning") {
+        const warning = asRecord(message.params);
+        const samplePaths = Array.isArray(warning.samplePaths)
+          ? warning.samplePaths.map(String)
+          : [];
+        if (warning.failedScan === true || samplePaths.length > 0 || Number(warning.extraCount) > 0) {
+          isolationFailure =
+            "Codex reported Windows paths that cannot be protected by its write sandbox.";
+        }
+        return;
+      }
       if (!providerSessionId || !nativeExecutionId) {
         queuedMessages.push(message);
         return;
@@ -201,11 +223,15 @@ class CodexAppServerHarness implements CodexWorkerHarness {
         throw new Error("Codex app-server returned an unproven protocol identity.");
       }
       transport.notify("initialized", {});
+      if (!request.readOnly) {
+        await proveWorkspaceWriteIsolation(transport, request.authorizedWriteRoot);
+        if (isolationFailure) throw new Error(isolationFailure);
+      }
       const threadResult = asRecord(
         await transport.request("thread/start", {
           cwd: request.targetProjectPath,
           approvalPolicy: "never",
-          sandbox: "read-only",
+          sandbox: request.readOnly ? "read-only" : "workspace-write",
           ephemeral: true,
           model: request.model,
           config: { model_reasoning_effort: "high" },
@@ -217,6 +243,10 @@ class CodexAppServerHarness implements CodexWorkerHarness {
         throw new Error("Codex selected a different Model than requested.");
       }
       providerSessionId = thread.id;
+      if (!request.readOnly) {
+        if (isolationFailure) throw new Error(isolationFailure);
+        await observer.effectDispatchStarted?.();
+      }
       const turnResult = asRecord(
         await transport.request("turn/start", {
           threadId: providerSessionId,
@@ -224,11 +254,18 @@ class CodexAppServerHarness implements CodexWorkerHarness {
             {
               type: "text",
               text:
-                `Read-only assignment: ${request.objective}\n\n${request.prompt}\n\n` +
+                (request.readOnly
+                  ? `Read-only assignment: ${request.objective}\n\n${request.prompt}\n\n`
+                  : `Effectful assignment: ${request.objective}\n\n${request.prompt}\n\n` +
+                    `Authorized targets: ${JSON.stringify(request.targets)}\n` +
+                    `Authorized Write Root: ${request.authorizedWriteRoot}\n` +
+                    `Deadline: ${request.timeoutMs}ms. Recovery: ${request.recoveryConstraint}.\n\n`) +
                 (request.priorAnswers?.length
                   ? `Retained Owner answers from the same Worker Session: ${JSON.stringify(request.priorAnswers)}\n\n`
                   : "") +
-                "Do not modify files, configuration, credentials, processes, or external state. " +
+                (request.readOnly
+                  ? "Do not modify files, configuration, credentials, processes, or external state. "
+                  : "Modify only assigned targets inside the Authorized Write Root. Do not access network services, credentials, global configuration, or external state. ") +
                 "Report findings and evidence only. End with exactly one line beginning " +
                 "CMD_RIKER_OUTCOME: followed by JSON with status (completed or blocked), summary, " +
                 "affectedArtifacts, verificationResults, and optional unresolvedUncertainty.",
@@ -238,7 +275,9 @@ class CodexAppServerHarness implements CodexWorkerHarness {
           model: request.model,
           effort: "high",
           approvalPolicy: "never",
-          sandboxPolicy: { type: "readOnly", networkAccess: false },
+          sandboxPolicy: request.readOnly
+            ? { type: "readOnly", networkAccess: false }
+            : workspaceWritePolicy(),
         }),
       );
       const turn = asRecord(turnResult.turn);
@@ -258,6 +297,9 @@ class CodexAppServerHarness implements CodexWorkerHarness {
         process: processIdentity,
         harnessVersion: this.runtime.version,
         protocolSchemaSha256: supportedSchemaSha256,
+        ...(!request.readOnly
+          ? { writeIsolation: "codex-windows-workspace-write" as const }
+          : {}),
       },
       async answer(providerRequestId, answers) {
         const delivery = Promise.withResolvers<void>();
@@ -347,6 +389,7 @@ class JsonlTransport {
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
+      env: safeChildEnvironment(),
     });
     this.child = child;
     child.stdout.on("data", (chunk: Buffer) => this.accept(chunk));
@@ -455,6 +498,126 @@ class JsonlTransport {
     }
     this.pending.clear();
     this.onFailure(error);
+  }
+}
+
+export async function proveCodexWorkspaceWriteIsolation(
+  runtime: CodexRuntime,
+  authorizedWriteRoot: string,
+): Promise<void> {
+  if (process.platform !== "win32") {
+    throw new Error("Codex workspace-write isolation is supported on Windows only.");
+  }
+  if (runtime.version !== supportedVersion) {
+    throw new Error(`Unsupported Codex version ${runtime.version}; expected ${supportedVersion}.`);
+  }
+  const transport = new JsonlTransport(runtime, authorizedWriteRoot);
+  let isolationFailure: string | undefined;
+  transport.onMessage = (message) => {
+    if (message.method !== "windows/worldWritableWarning") return;
+    const warning = asRecord(message.params);
+    const samplePaths = Array.isArray(warning.samplePaths) ? warning.samplePaths : [];
+    if (warning.failedScan === true || samplePaths.length > 0 || Number(warning.extraCount) > 0) {
+      isolationFailure = "Codex reported Windows paths that cannot be protected by its write sandbox.";
+    }
+  };
+  transport.onFailure = () => {};
+  await transport.start();
+  try {
+    const initialized = asRecord(
+      await transport.request("initialize", {
+        clientInfo: { name: "cmd-riker", version: "1" },
+        capabilities: { experimentalApi: true },
+      }),
+    );
+    if (typeof initialized.userAgent !== "string" || !initialized.userAgent.includes("0.147.0")) {
+      throw new Error("Codex app-server returned an unproven protocol identity.");
+    }
+    transport.notify("initialized", {});
+    await proveWorkspaceWriteIsolation(transport, authorizedWriteRoot);
+    if (isolationFailure) throw new Error(isolationFailure);
+  } finally {
+    await transport.terminate();
+  }
+}
+
+function workspaceWritePolicy() {
+  return {
+    type: "workspaceWrite" as const,
+    writableRoots: [] as string[],
+    networkAccess: false,
+    excludeTmpdirEnvVar: true,
+    excludeSlashTmp: true,
+  };
+}
+
+async function proveWorkspaceWriteIsolation(
+  transport: JsonlTransport,
+  authorizedWriteRoot: string,
+): Promise<void> {
+  const readiness = asRecord(await transport.request("windowsSandbox/readiness", null, 10_000));
+  if (readiness.status !== "ready") {
+    throw new Error(`Codex Windows write isolation is ${String(readiness.status ?? "unknown")}.`);
+  }
+  const probeDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-isolation-probe-"));
+  const token = randomUUID();
+  const allowedPath = join(authorizedWriteRoot, `.cmd-riker-write-probe-${token}`);
+  const deniedPath = join(probeDirectory, `denied-${token}`);
+  const command = (path: string) => [
+    process.execPath,
+    "-e",
+    'process.getBuiltinModule("node:fs").writeFileSync(process.argv[1], "cmd-riker-isolation-probe")',
+    path,
+  ];
+  let boundaryViolation = false;
+  try {
+    const allowed = asRecord(
+      await transport.request(
+        "command/exec",
+        {
+          command: command(allowedPath),
+          cwd: authorizedWriteRoot,
+          timeoutMs: 10_000,
+          sandboxPolicy: workspaceWritePolicy(),
+        },
+        15_000,
+      ),
+    );
+    if (
+      allowed.exitCode !== 0 ||
+      (await readFile(allowedPath, "utf8").catch(() => "")) !== "cmd-riker-isolation-probe"
+    ) {
+      throw new Error("Codex Windows write isolation did not permit an in-root probe write.");
+    }
+    let denied: Record<string, unknown> | undefined;
+    try {
+      denied = asRecord(
+        await transport.request(
+          "command/exec",
+          {
+            command: command(deniedPath),
+            cwd: authorizedWriteRoot,
+            timeoutMs: 10_000,
+            sandboxPolicy: workspaceWritePolicy(),
+          },
+          15_000,
+        ),
+      );
+    } catch {
+      // A sandbox-level JSON-RPC rejection is the expected denial shape on Windows.
+    }
+    const deniedPathExists = await access(deniedPath).then(() => true, () => false);
+    if (denied?.exitCode === 0 || deniedPathExists) {
+      boundaryViolation = deniedPathExists;
+      throw new Error(
+        `Codex Windows write isolation permitted an out-of-root probe write at ${deniedPath}.`,
+      );
+    }
+  } finally {
+    await rm(allowedPath, { force: true }).catch(() => undefined);
+    if (!boundaryViolation) {
+      await rm(probeDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -604,6 +767,28 @@ function isAlive(pid: number): boolean {
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+function safeChildEnvironment(): NodeJS.ProcessEnv {
+  const names = process.platform === "win32"
+    ? [
+        "APPDATA",
+        "CODEX_HOME",
+        "ComSpec",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "SystemDrive",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "windir",
+      ]
+    : ["HOME", "LANG", "PATH", "SHELL", "TMPDIR"];
+  return Object.fromEntries(
+    names.flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name]]]),
+  );
 }
 
 function execText(file: string, args: string[]): Promise<string> {

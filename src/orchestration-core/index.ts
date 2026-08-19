@@ -16,6 +16,10 @@ import type {
 
 export type OwnerConfiguration = {
   targetProject: { path: string };
+  forgeAuthorities?: {
+    github?: { account: string; repository: string };
+    azure?: { account: string; subscriptionId: string };
+  };
   modelSelection: ModelSelection;
   modelFallbacks?: ModelSelection[];
   modelRequirements?: LeadModelRequirements;
@@ -1249,6 +1253,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       assertValidatedLeadModelPolicy(policy, validations);
       state.replaceOwnerConfiguration({
         targetProject: existing.targetProject,
+        ...(existing.forgeAuthorities ? { forgeAuthorities: existing.forgeAuthorities } : {}),
         modelSelection: policy.default,
         modelFallbacks: policy.fallbacks,
         modelRequirements: policy.requirements,

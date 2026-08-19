@@ -613,13 +613,23 @@ async function completeOwnerTurn(
           },
         },
         forgeActions: {
-          execute: async (request, actingAuthorityEffect) => {
+          commentOnGitHubIssue: async (input, actingAuthorityEffect) => {
+            const authority = conversation.forgeAuthorities?.github;
+            if (!authority) throw new Error("GitHub Forge authority is not configured by the Owner.");
             const authorization = actingAuthorityEffect
               ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
               : undefined;
             const result = await createForgeOperations(state).execute({
-              ...request,
-              ...(request.operation.kind === "github-issue-comment" && authorization
+              commitmentId: input.commitmentId,
+              operation: {
+                kind: "github-issue-comment",
+                repository: authority.repository,
+                issueNumber: input.issueNumber,
+                body: input.body,
+                expectedAccount: authority.account,
+              },
+              timeoutMs: 30_000,
+              ...(authorization
                 ? {
                     actingAuthorityEffectAuthorization: {
                       actingAuthorityId: authorization.actingAuthorityId,
@@ -629,7 +639,22 @@ async function completeOwnerTurn(
                   }
                 : {}),
             });
-            orchestration.observeForgeOperationResult(request.commitmentId, result);
+            orchestration.observeForgeOperationResult(input.commitmentId, result);
+            return result;
+          },
+          inspectAzureSubscription: async (commitmentId) => {
+            const authority = conversation.forgeAuthorities?.azure;
+            if (!authority) throw new Error("Azure Forge authority is not configured by the Owner.");
+            const result = await createForgeOperations(state).execute({
+              commitmentId,
+              operation: {
+                kind: "azure-subscription-inspection",
+                subscriptionId: authority.subscriptionId,
+                expectedAccount: authority.account,
+              },
+              timeoutMs: 30_000,
+            });
+            orchestration.observeForgeOperationResult(commitmentId, result);
             return result;
           },
         },
@@ -832,7 +857,7 @@ function invalidConfiguration(): HostDiagnostic {
 
 function parseConfiguration(value: unknown): OwnerConfiguration {
   const legacyKeys = ["targetProject", "modelSelection", "modelPolicyRevision"];
-  const acceptedKeySets = [
+  const baseKeySets = [
     legacyKeys,
     [...legacyKeys, "modelFallbacks"],
     [...legacyKeys, "modelRequirements"],
@@ -842,6 +867,7 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     [...legacyKeys, "modelRequirements", "workerModelPolicy"],
     [...legacyKeys, "modelFallbacks", "modelRequirements", "workerModelPolicy"],
   ];
+  const acceptedKeySets = baseKeySets.flatMap((keys) => [keys, [...keys, "forgeAuthorities"]]);
   if (!acceptedKeySets.some((keys) => isRecordWithKeys(value, keys))) {
     throw invalidConfiguration();
   }
@@ -867,6 +893,9 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   const workerModelPolicy = configuration.workerModelPolicy !== undefined
     ? parseWorkerModelPolicy(configuration.workerModelPolicy)
     : undefined;
+  const forgeAuthorities = configuration.forgeAuthorities !== undefined
+    ? parseForgeAuthorities(configuration.forgeAuthorities)
+    : undefined;
   try {
     assertSupportedModelSelection(selection);
     for (const fallback of parsedFallbacks ?? []) assertSupportedModelSelection(fallback);
@@ -875,11 +904,41 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   }
   return {
     targetProject: { path: targetProject.path },
+    ...(forgeAuthorities ? { forgeAuthorities } : {}),
     modelSelection: selection,
     ...(parsedFallbacks ? { modelFallbacks: parsedFallbacks } : {}),
     ...(requirements ? { modelRequirements: requirements } : {}),
     modelPolicyRevision: configuration.modelPolicyRevision,
     ...(workerModelPolicy ? { workerModelPolicy } : {}),
+  };
+}
+
+function parseForgeAuthorities(value: unknown): NonNullable<OwnerConfiguration["forgeAuthorities"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw invalidConfiguration();
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => key !== "github" && key !== "azure")) {
+    throw invalidConfiguration();
+  }
+  const github = record.github;
+  const azure = record.azure;
+  if (github !== undefined && (
+    !isRecordWithKeys(github, ["account", "repository"]) ||
+    typeof github.account !== "string" ||
+    typeof github.repository !== "string" ||
+    !github.account.trim() ||
+    !/^[^/\s]+\/[^/\s]+$/.test(github.repository)
+  )) throw invalidConfiguration();
+  if (azure !== undefined && (
+    !isRecordWithKeys(azure, ["account", "subscriptionId"]) ||
+    typeof azure.account !== "string" ||
+    typeof azure.subscriptionId !== "string" ||
+    !azure.account.trim() ||
+    !/^[0-9a-f-]{36}$/i.test(azure.subscriptionId)
+  )) throw invalidConfiguration();
+  if (github === undefined && azure === undefined) throw invalidConfiguration();
+  return {
+    ...(github ? { github: { account: github.account as string, repository: github.repository as string } } : {}),
+    ...(azure ? { azure: { account: azure.account as string, subscriptionId: azure.subscriptionId as string } } : {}),
   };
 }
 

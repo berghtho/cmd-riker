@@ -832,6 +832,104 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       : undefined;
   };
 
+  const assertNoConflictingOpenEffect = (
+    effectIntent: EffectIntent,
+    message: string,
+  ): void => {
+    const conflict = database
+      .prepare(`
+        SELECT 1
+          FROM facts current
+         WHERE current.kind = 'effect-intent.snapshot'
+           AND (
+             COALESCE(
+               json_extract(current.value_json, '$.effectScopeKey'),
+               json_extract(current.value_json, '$.authorizedWriteRootKey'),
+               lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
+             ) = ?
+             OR json_extract(current.value_json, '$.commitmentId') = ?
+           )
+           AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
+           AND NOT EXISTS (
+             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+           )
+         LIMIT 1
+      `)
+      .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
+    if (conflict) throw new Error(message);
+  };
+
+  const writeAttemptAndEffectSnapshots = (input: {
+    attempt: TargetProjectOperationAttempt | ForgeOperationAttempt;
+    attemptFactKind: "target-project-operation-attempt.snapshot" | "forge-operation-attempt.snapshot";
+    attemptSubjectPrefix: "target-project-operation-attempt" | "forge-operation-attempt";
+    attemptTransitionPrefix: "target-project-operation-attempt" | "forge-operation-attempt";
+    effectIntent: TargetProjectOperationEffectIntent | ForgeOperationEffectIntent;
+    predecessors?: { attemptId: string; effectIntentId: string };
+    beforeWrite?: () => void;
+  }): void => {
+    const recordedAt = new Date().toISOString();
+    const attemptFactId = randomUUID();
+    const effectFactId = randomUUID();
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      input.beforeWrite?.();
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          attemptFactId,
+          `${input.attemptSubjectPrefix}:${input.attempt.id}`,
+          input.attemptFactKind,
+          JSON.stringify(input.attempt),
+          input.predecessors?.attemptId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          `${input.attemptTransitionPrefix}.${input.attempt.status}`,
+          attemptFactId,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO facts (
+            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
+        `)
+        .run(
+          effectFactId,
+          `effect-intent:${input.effectIntent.id}`,
+          JSON.stringify(input.effectIntent),
+          input.predecessors?.effectIntentId ?? null,
+          recordedAt,
+        );
+      database
+        .prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(
+          randomUUID(),
+          `effect-intent.${input.effectIntent.status}`,
+          effectFactId,
+          recordedAt,
+        );
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
+
   const writeOperationAndEffect = (
     attempt: TargetProjectOperationAttempt,
     effectIntent: TargetProjectOperationEffectIntent,
@@ -845,12 +943,14 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     ) {
       throw new Error("Operation Attempt and effect intent attribution must match.");
     }
-    const recordedAt = new Date().toISOString();
-    const attemptFactId = randomUUID();
-    const effectFactId = randomUUID();
-    database.exec("BEGIN IMMEDIATE");
-    try {
-      if (rejectConflictingCommitmentEffect) {
+    writeAttemptAndEffectSnapshots({
+      attempt,
+      attemptFactKind: "target-project-operation-attempt.snapshot",
+      attemptSubjectPrefix: "target-project-operation-attempt",
+      attemptTransitionPrefix: "target-project-operation-attempt",
+      effectIntent,
+      ...(predecessors ? { predecessors } : {}),
+      ...(rejectConflictingCommitmentEffect ? { beforeWrite: () => {
         assertActingAuthorityDispatch(effectIntent, {
           effectClass: "test",
           target: attempt.operation,
@@ -858,78 +958,12 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
           externallyBinding: false,
           incrementalSpendUsd: 0,
         });
-        const conflict = database
-          .prepare(`
-            SELECT 1
-              FROM facts current
-             WHERE current.kind = 'effect-intent.snapshot'
-                AND (
-                  COALESCE(
-                    json_extract(current.value_json, '$.effectScopeKey'),
-                    json_extract(current.value_json, '$.authorizedWriteRootKey'),
-                    lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
-                  ) = ?
-                  OR json_extract(current.value_json, '$.commitmentId') = ?
-                )
-               AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
-               AND NOT EXISTS (
-                 SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
-               )
-             LIMIT 1
-          `)
-          .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
-        if (conflict) {
-          throw new Error("A conflicting Target Project effect is already open for this Commitment.");
-        }
-      }
-      database
-        .prepare(`
-          INSERT INTO facts (
-            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
-          ) VALUES (?, ?, 'target-project-operation-attempt.snapshot', ?, ?, ?)
-        `)
-        .run(
-          attemptFactId,
-          `target-project-operation-attempt:${attempt.id}`,
-          JSON.stringify(attempt),
-          predecessors?.attemptId ?? null,
-          recordedAt,
+        assertNoConflictingOpenEffect(
+          effectIntent,
+          "A conflicting Target Project effect is already open for this Commitment.",
         );
-      database
-        .prepare(`
-          INSERT INTO transitions (id, kind, fact_id, recorded_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(
-          randomUUID(),
-          `target-project-operation-attempt.${attempt.status}`,
-          attemptFactId,
-          recordedAt,
-        );
-      database
-        .prepare(`
-          INSERT INTO facts (
-            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
-          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
-        `)
-        .run(
-          effectFactId,
-          `effect-intent:${effectIntent.id}`,
-          JSON.stringify(effectIntent),
-          predecessors?.effectIntentId ?? null,
-          recordedAt,
-        );
-      database
-        .prepare(`
-          INSERT INTO transitions (id, kind, fact_id, recorded_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(randomUUID(), `effect-intent.${effectIntent.status}`, effectFactId, recordedAt);
-      database.exec("COMMIT");
-    } catch (error) {
-      database.exec("ROLLBACK");
-      throw error;
-    }
+      } } : {}),
+    });
   };
 
   const writeForgeOperationAndEffect = (
@@ -946,12 +980,14 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     ) {
       throw new Error("Forge Operation Attempt and effect intent attribution must match.");
     }
-    const recordedAt = new Date().toISOString();
-    const attemptFactId = randomUUID();
-    const effectFactId = randomUUID();
-    database.exec("BEGIN IMMEDIATE");
-    try {
-      if (rejectConflict) {
+    writeAttemptAndEffectSnapshots({
+      attempt,
+      attemptFactKind: "forge-operation-attempt.snapshot",
+      attemptSubjectPrefix: "forge-operation-attempt",
+      attemptTransitionPrefix: "forge-operation-attempt",
+      effectIntent,
+      ...(predecessors ? { predecessors } : {}),
+      ...(rejectConflict ? { beforeWrite: () => {
         if (attempt.target.kind !== "github-issue") {
           throw new Error("Only a typed GitHub target can dispatch a Forge mutation.");
         }
@@ -962,78 +998,12 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
           externallyBinding: true,
           incrementalSpendUsd: 0,
         });
-        const conflict = database
-          .prepare(`
-            SELECT 1
-              FROM facts current
-             WHERE current.kind = 'effect-intent.snapshot'
-               AND (
-                 COALESCE(
-                   json_extract(current.value_json, '$.effectScopeKey'),
-                   json_extract(current.value_json, '$.authorizedWriteRootKey'),
-                   lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
-                 ) = ?
-                 OR json_extract(current.value_json, '$.commitmentId') = ?
-               )
-               AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
-               AND NOT EXISTS (
-                 SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
-               )
-             LIMIT 1
-          `)
-          .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
-        if (conflict) {
-          throw new Error("A conflicting effect is already open for this Forge target or Commitment.");
-        }
-      }
-      database
-        .prepare(`
-          INSERT INTO facts (
-            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
-          ) VALUES (?, ?, 'forge-operation-attempt.snapshot', ?, ?, ?)
-        `)
-        .run(
-          attemptFactId,
-          `forge-operation-attempt:${attempt.id}`,
-          JSON.stringify(attempt),
-          predecessors?.attemptId ?? null,
-          recordedAt,
+        assertNoConflictingOpenEffect(
+          effectIntent,
+          "A conflicting effect is already open for this Forge target or Commitment.",
         );
-      database
-        .prepare(`
-          INSERT INTO transitions (id, kind, fact_id, recorded_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(
-          randomUUID(),
-          `forge-operation-attempt.${attempt.status}`,
-          attemptFactId,
-          recordedAt,
-        );
-      database
-        .prepare(`
-          INSERT INTO facts (
-            id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
-          ) VALUES (?, ?, 'effect-intent.snapshot', ?, ?, ?)
-        `)
-        .run(
-          effectFactId,
-          `effect-intent:${effectIntent.id}`,
-          JSON.stringify(effectIntent),
-          predecessors?.effectIntentId ?? null,
-          recordedAt,
-        );
-      database
-        .prepare(`
-          INSERT INTO transitions (id, kind, fact_id, recorded_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(randomUUID(), `effect-intent.${effectIntent.status}`, effectFactId, recordedAt);
-      database.exec("COMMIT");
-    } catch (error) {
-      database.exec("ROLLBACK");
-      throw error;
-    }
+      } } : {}),
+    });
   };
 
   return {
@@ -2758,6 +2728,7 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
   const value = JSON.parse(valueJson) as OwnerConfiguration;
   return {
     targetProject: value.targetProject,
+    ...(value.forgeAuthorities ? { forgeAuthorities: value.forgeAuthorities } : {}),
     modelSelection: value.modelSelection,
     ...(Array.isArray(value.modelFallbacks) ? { modelFallbacks: value.modelFallbacks } : {}),
     ...(value.modelRequirements ? { modelRequirements: value.modelRequirements } : {}),
@@ -2767,6 +2738,20 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
 }
 
 function validateConfiguration(configuration: OwnerConfiguration): void {
+  const github = configuration.forgeAuthorities?.github;
+  if (
+    github &&
+    (!github.account.trim() || !/^[^/\s]+\/[^/\s]+$/.test(github.repository))
+  ) {
+    throw new Error("GitHub Forge authority requires an account and owner/repository target.");
+  }
+  const azure = configuration.forgeAuthorities?.azure;
+  if (
+    azure &&
+    (!azure.account.trim() || !/^[0-9a-f-]{36}$/i.test(azure.subscriptionId))
+  ) {
+    throw new Error("Azure Forge authority requires an account and subscription UUID.");
+  }
   assertSupportedModelSelection(configuration.modelSelection);
   for (const fallback of configuration.modelFallbacks ?? []) {
     assertSupportedModelSelection(fallback);
@@ -2789,6 +2774,7 @@ function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectInten
     left.authorization.kind !== right.authorization.kind ||
     left.authorization.commitmentId !== right.authorization.commitmentId ||
     left.authorization.targetProjectPath !== right.authorization.targetProjectPath ||
+    JSON.stringify(left.authorization.providerTarget) !== JSON.stringify(right.authorization.providerTarget) ||
     left.authorization.validatedAt !== right.authorization.validatedAt ||
     JSON.stringify(left.lease) !== JSON.stringify(right.lease)
   ) {
@@ -2817,9 +2803,13 @@ function sameEffectIntentIdentityAndScope(left: EffectIntent, right: EffectInten
 }
 
 function effectScopeKey(effectIntent: EffectIntent): string {
-  return effectIntent.effectScopeKey ??
+  const key = effectIntent.effectScopeKey ??
     effectIntent.authorizedWriteRootKey ??
-    effectIntent.authorization.targetProjectPath.toLowerCase();
+    effectIntent.authorization.targetProjectPath?.toLowerCase();
+  if (key) return key;
+  const providerTarget = effectIntent.authorization.providerTarget;
+  if (providerTarget) return `${providerTarget.provider}:${providerTarget.resource}`;
+  throw new Error("An effect intent requires one durable scope key.");
 }
 
 function factSubject(input: FactDraft): string {
@@ -2861,6 +2851,7 @@ function factSubject(input: FactDraft): string {
 function sameConfiguration(left: OwnerConfiguration, right: OwnerConfiguration): boolean {
   return (
     left.targetProject.path === right.targetProject.path &&
+    JSON.stringify(left.forgeAuthorities) === JSON.stringify(right.forgeAuthorities) &&
     sameSelection(left.modelSelection, right.modelSelection) &&
     sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
     JSON.stringify(left.modelRequirements) === JSON.stringify(right.modelRequirements) &&

@@ -86,7 +86,8 @@ export type EffectIntentBase = {
   authorization: {
     kind: "lead-agent-command-authority";
     commitmentId: string;
-    targetProjectPath: string;
+    targetProjectPath?: string;
+    providerTarget?: { provider: "github"; resource: string };
     validatedAt: string;
     actingAuthority?: {
       actingAuthorityId: string;

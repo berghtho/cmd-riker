@@ -8,6 +8,7 @@ import { openAuthoritativeState, type AuthoritativeState } from "../src/authorit
 import {
   createForgeOperations,
   ForgeAdapterError,
+  nativeCliEnvironment,
   NativeAzureCli,
   type AzureCli,
   type ForgeCapabilityProof,
@@ -24,6 +25,7 @@ test("GitHub mutation records intent before dispatch and settles only after exac
     createIssueComment: async () => {
       const attempt = state.readForgeOperationAttempts()[0];
       assert.equal(attempt?.status, "running");
+      assert.equal(attempt?.capability?.target, "berghtho/cmd-riker#36");
       assert.equal(state.readEffectIntent(attempt?.effectIntentId ?? "")?.status, "dispatching");
       createObservedDispatch = true;
       return { id: "comment-42", url: "https://github.test/comment-42" };
@@ -59,6 +61,48 @@ test("GitHub mutation records intent before dispatch and settles only after exac
   assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
 });
 
+test("Forge authority is checked against durable Owner configuration before provider use", async (t) => {
+  const { state, commitment } = await configuredState(t, "authority");
+  let inspected = false;
+  const github: GitHubCli = {
+    inspect: async () => {
+      inspected = true;
+      return githubCapability();
+    },
+    createIssueComment: async () => assert.fail("mutation must not dispatch"),
+    readIssueComment: async () => assert.fail("read-back must not run"),
+  };
+
+  await assert.rejects(
+    createForgeOperations(state, { github }).execute({
+      commitmentId: commitment.id,
+      operation: {
+        kind: "github-issue-comment",
+        repository: "attacker/other",
+        issueNumber: 36,
+        body: "Not authorized.",
+        expectedAccount: "attacker",
+      },
+      timeoutMs: 1_000,
+    }),
+    /outside the configured Owner authority/,
+  );
+  assert.equal(inspected, false);
+});
+
+test("native CLI environment excludes ambient secret-bearing variables", () => {
+  assert.deepEqual(nativeCliEnvironment({
+    PATH: "C:\\tools",
+    USERPROFILE: "C:\\Users\\owner",
+    GH_TOKEN: "github-secret",
+    AZURE_CLIENT_SECRET: "azure-secret",
+    UNRELATED_SECRET: "other-secret",
+  }), {
+    PATH: "C:\\tools",
+    USERPROFILE: "C:\\Users\\owner",
+  });
+});
+
 test("missing GitHub authentication records one durable Owner action and deduplicates repeats", async (t) => {
   const { state, commitment } = await configuredState(t, "github-auth");
   const github: GitHubCli = {
@@ -88,7 +132,7 @@ test("missing GitHub authentication records one durable Owner action and dedupli
   assert.equal(first.ownerAction?.disposition, "recorded");
   assert.equal(second.ownerAction?.disposition, "deduplicated");
   assert.equal(state.readForgeOwnerActionNotices().length, 1);
-  assert.equal(state.readForgeOwnerActionNotice("github-cli")?.state, "active");
+  assert.equal(state.readForgeOwnerActionNotices()[0]?.state, "active");
   assert.equal(state.readEffectIntents().length, 0);
 });
 
@@ -161,9 +205,73 @@ test("Azure inspection persists attributed read-only evidence and clears its Own
   assert.equal(result.effectIntentId, undefined);
   assert.equal(result.capability?.account, "owner@example.test");
   assert.equal(state.readForgeOperationAttempt(result.operationAttemptId)?.status, "succeeded");
-  assert.equal(state.readForgeOwnerActionNotice("azure-cli")?.state, "cleared");
+  assert.equal(state.readForgeOwnerActionNotices()[0]?.state, "cleared");
   createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
   assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
+});
+
+test("Owner actions remain scoped when the configured Azure target changes", async (t) => {
+  const { state, commitment } = await configuredState(
+    t,
+    "azure-scopes",
+    "azure-subscription-inspection",
+  );
+  const unavailableAzure: AzureCli = {
+    inspectSubscription: async () => {
+      throw new ForgeAdapterError("authentication", "Azure CLI authentication is unavailable.");
+    },
+  };
+  const target36Request = {
+    commitmentId: commitment.id,
+    operation: {
+      kind: "azure-subscription-inspection" as const,
+      subscriptionId: "00000000-0000-0000-0000-000000000036",
+      expectedAccount: "owner@example.test",
+    },
+    timeoutMs: 1_000,
+  };
+  await createForgeOperations(state, { azure: unavailableAzure }).execute(target36Request);
+  const configuration = state.readOwnerConversation();
+  assert.ok(configuration);
+  const { messages: _messages, ...ownerConfiguration } = configuration;
+  state.replaceOwnerConfiguration({
+    ...ownerConfiguration,
+    forgeAuthorities: {
+      ...ownerConfiguration.forgeAuthorities,
+      azure: {
+        account: "owner@example.test",
+        subscriptionId: "00000000-0000-0000-0000-000000000037",
+      },
+    },
+  });
+  const target37Request = {
+    ...target36Request,
+    operation: {
+      ...target36Request.operation,
+      subscriptionId: "00000000-0000-0000-0000-000000000037",
+    },
+  };
+  await createForgeOperations(state, { azure: unavailableAzure }).execute(target37Request);
+  assert.equal(state.readForgeOwnerActionNotices().filter((notice) => notice.state === "active").length, 2);
+
+  const availableAzure: AzureCli = {
+    inspectSubscription: async () => ({
+      capability: {
+        ...azureCapability(),
+        target: "00000000-0000-0000-0000-000000000037",
+      },
+      evidence: {
+        source: "provider-readback",
+        reference: "azure-subscription:00000000-0000-0000-0000-000000000037",
+        summary: "Azure subscription 37 is enabled for the intended account.",
+        observedAt: "2026-08-19T20:00:00.000Z",
+      },
+    }),
+  };
+  await createForgeOperations(state, { azure: availableAzure }).execute(target37Request);
+  const notices = state.readForgeOwnerActionNotices();
+  assert.equal(notices.find((notice) => notice.target.endsWith("36"))?.state, "active");
+  assert.equal(notices.find((notice) => notice.target.endsWith("37"))?.state, "cleared");
 });
 
 test("mismatched GitHub read-back leaves the dispatched effect unknown", async (t) => {
@@ -230,7 +338,7 @@ test("restart marks a dispatched GitHub mutation unknown without replay", async 
     authorization: {
       kind: "lead-agent-command-authority" as const,
       commitmentId: commitment.id,
-      targetProjectPath: "berghtho/cmd-riker",
+      providerTarget: { provider: "github" as const, resource: "berghtho/cmd-riker#36" },
       validatedAt: startedAt,
     },
     retryRule: "Read back before retry.",
@@ -269,6 +377,13 @@ async function configuredState(
   });
   state.initialize({
     targetProject: { path: "C:\\target-project" },
+    forgeAuthorities: {
+      github: { account: "berghtho", repository: "berghtho/cmd-riker" },
+      azure: {
+        account: "owner@example.test",
+        subscriptionId: "00000000-0000-0000-0000-000000000036",
+      },
+    },
     modelSelection: {
       provider: "local-openai",
       model: "owner-model",
@@ -296,7 +411,7 @@ function githubCapability(): ForgeCapabilityProof {
     version: "gh version 2.97.0",
     authentication: "verified",
     account: "berghtho",
-    target: "berghtho/cmd-riker",
+    target: "berghtho/cmd-riker#36",
     capability: "issue-comment:ADMIN",
     observedAt: "2026-08-19T20:00:00.000Z",
   };

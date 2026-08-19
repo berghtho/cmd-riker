@@ -317,10 +317,8 @@ test("production adapter exposes typed Forge operations without provider command
           name: "comment_on_github_issue",
           arguments: {
             commitmentId: "commitment-1",
-            repository: "berghtho/cmd-riker",
             issueNumber: 36,
             body: "Typed Forge proof.",
-            expectedAccount: "berghtho",
           },
         },
       };
@@ -334,13 +332,13 @@ test("production adapter exposes typed Forge operations without provider command
     ownerInput: "Record the GitHub proof.",
     modelSelection: modelSelection(localModel.baseUrl),
     forgeActions: {
-      async execute(request) {
-        executed = request;
+      async commentOnGitHubIssue(input) {
+        executed = input;
         return {
           operationAttemptId: "forge-attempt-1",
           effectIntentId: "forge-effect-1",
-          commitmentId: request.commitmentId,
-          operation: request.operation.kind,
+          commitmentId: input.commitmentId,
+          operation: "github-issue-comment",
           provider: "github",
           status: "succeeded",
           evidence: [{
@@ -355,19 +353,16 @@ test("production adapter exposes typed Forge operations without provider command
           completedAt: "2026-08-19T20:00:01.000Z",
         };
       },
+      async inspectAzureSubscription() {
+        throw new Error("not expected");
+      },
     },
   });
 
   assert.deepEqual(executed, {
     commitmentId: "commitment-1",
-    operation: {
-      kind: "github-issue-comment",
-      repository: "berghtho/cmd-riker",
-      issueNumber: 36,
-      body: "Typed Forge proof.",
-      expectedAccount: "berghtho",
-    },
-    timeoutMs: 30_000,
+    issueNumber: 36,
+    body: "Typed Forge proof.",
   });
   assert.match(firstRequest, /comment_on_github_issue/);
   assert.match(firstRequest, /inspect_azure_subscription/);

@@ -36,7 +36,7 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import type { TargetProjectOperationResult } from "../target-project-operations/index.ts";
-import type { ForgeOperationRequest, ForgeOperationResult } from "../forge-operations/index.ts";
+import type { ForgeOperationResult } from "../forge-operations/index.ts";
 
 export type PiTurnRequest = {
   conversation: readonly ConversationMessage[];
@@ -69,10 +69,11 @@ export type PiTurnRequest = {
     ): Promise<TargetProjectOperationResult>;
   };
   forgeActions?: {
-    execute(
-      request: ForgeOperationRequest,
+    commentOnGitHubIssue(
+      input: { commitmentId: string; issueNumber: number; body: string },
       actingAuthorityEffect?: ActingAuthorityEffectRequest,
     ): Promise<ForgeOperationResult>;
+    inspectAzureSubscription(commitmentId: string): Promise<ForgeOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
   actingAuthority?: ActingAuthority;
@@ -563,34 +564,20 @@ function forgeTools(
         "Create one bounded GitHub issue comment through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back.",
       parameters: Type.Object({
         commitmentId: Type.String({ minLength: 1 }),
-        repository: Type.String({ minLength: 3 }),
         issueNumber: Type.Integer({ minimum: 1 }),
         body: Type.String({ minLength: 1, maxLength: 65_536 }),
-        expectedAccount: Type.String({ minLength: 1 }),
         actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, repository, issueNumber, body, expectedAccount, actingAuthorityEffect } = params as {
+        const { commitmentId, issueNumber, body, actingAuthorityEffect } = params as {
           commitmentId: string;
-          repository: string;
           issueNumber: number;
           body: string;
-          expectedAccount: string;
           actingAuthorityEffect?: ActingAuthorityEffectRequest;
         };
-        const result = await actions.execute(
-          {
-            commitmentId,
-            operation: {
-              kind: "github-issue-comment",
-              repository,
-              issueNumber,
-              body,
-              expectedAccount,
-            },
-            timeoutMs: 30_000,
-          },
+        const result = await actions.commentOnGitHubIssue(
+          { commitmentId, issueNumber, body },
           actingAuthorityEffect,
         );
         observer.onMutation();
@@ -607,25 +594,11 @@ function forgeTools(
         "Inspect one Azure subscription through the typed non-interactive adapter after proving executable, intended account, target, and read capability. No secret value is accepted or returned.",
       parameters: Type.Object({
         commitmentId: Type.String({ minLength: 1 }),
-        subscriptionId: Type.String({ minLength: 36, maxLength: 36 }),
-        expectedAccount: Type.String({ minLength: 1 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, subscriptionId, expectedAccount } = params as {
-          commitmentId: string;
-          subscriptionId: string;
-          expectedAccount: string;
-        };
-        const result = await actions.execute({
-          commitmentId,
-          operation: {
-            kind: "azure-subscription-inspection",
-            subscriptionId,
-            expectedAccount,
-          },
-          timeoutMs: 30_000,
-        });
+        const { commitmentId } = params as { commitmentId: string };
+        const result = await actions.inspectAzureSubscription(commitmentId);
         observer.onMutation();
         return {
           content: [{ type: "text", text: forgeResultText(result) }],

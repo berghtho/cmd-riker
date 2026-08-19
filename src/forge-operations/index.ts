@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 
-import type { Commitment } from "../orchestration-core/index.ts";
+import type { Commitment, OwnerConfiguration } from "../orchestration-core/index.ts";
 import type {
   ExternalEffectEvidence,
   ForgeOperationEffectIntent,
@@ -68,7 +68,7 @@ export type ForgeCapabilityProof = {
 };
 
 export type ForgeOwnerActionNotice = {
-  id: "github-cli" | "azure-cli";
+  id: string;
   provider: ForgeProvider;
   state: "active" | "cleared";
   fingerprint: string;
@@ -111,6 +111,7 @@ export type ForgeOperationAttempt = {
   target: ForgeOperationTarget;
   expectedAccount: string;
   timeoutMs: number;
+  capability?: ForgeCapabilityProof;
   status: "ready" | "running" | ForgeOperationStatus;
   startedAt: string;
   result?: ForgeOperationResult;
@@ -119,6 +120,7 @@ export type ForgeOperationAttempt = {
 export interface GitHubCli {
   inspect(input: {
     repository: string;
+    issueNumber: number;
     expectedAccount: string;
     timeoutMs: number;
   }): Promise<ForgeCapabilityProof>;
@@ -147,6 +149,7 @@ export interface AzureCli {
 }
 
 export interface ForgeOperationState {
+  readOwnerConversation(): OwnerConfiguration | undefined;
   readCommitment(commitmentId: string): Commitment | undefined;
   appendForgeOperationAttemptSnapshots(snapshots: ForgeOperationAttempt[]): void;
   startForgeMutation(
@@ -179,6 +182,7 @@ export function createForgeOperations(
   return {
     async execute(request) {
       assertRequest(request);
+      assertConfiguredAuthority(state.readOwnerConversation(), request);
       const commitment = state.readCommitment(request.commitmentId);
       if (!commitment || commitment.state !== "active" || commitment.condition) {
         throw new Error("Forge operations require one unblocked active Commitment.");
@@ -231,6 +235,7 @@ export class NativeGitHubCli implements GitHubCli {
 
   async inspect(input: {
     repository: string;
+    issueNumber: number;
     expectedAccount: string;
     timeoutMs: number;
   }): Promise<ForgeCapabilityProof> {
@@ -274,13 +279,22 @@ export class NativeGitHubCli implements GitHubCli {
     if (!new Set(["ADMIN", "MAINTAIN", "WRITE"]).has(permission)) {
       throw new ForgeAdapterError("capability", "The authenticated GitHub account cannot write issue comments in the target repository.");
     }
+    const issue = await runCli(
+      this.executable,
+      ["api", `repos/${input.repository}/issues/${input.issueNumber}`, "--jq", ".number"],
+      input.timeoutMs,
+      "github",
+    );
+    if (issue.exitCode !== 0 || Number(issue.stdout.trim()) !== input.issueNumber) {
+      throw new ForgeAdapterError("target", "The intended GitHub issue is unavailable to the authenticated account.");
+    }
     return {
       provider: "github",
       executable: this.executable,
       version: version.stdout.split(/\r?\n/, 1)[0]!.trim(),
       authentication: "verified",
       account,
-      target: parsed.nameWithOwner,
+      target: `${parsed.nameWithOwner}#${input.issueNumber}`,
       capability: `issue-comment:${permission}`,
       observedAt: new Date().toISOString(),
     };
@@ -380,9 +394,8 @@ export class NativeAzureCli implements AzureCli {
       this.executable,
       [
         "account",
-        "show",
-        "--subscription",
-        input.subscriptionId,
+        "list",
+        "--all",
         "--output",
         "json",
         "--only-show-errors",
@@ -391,18 +404,28 @@ export class NativeAzureCli implements AzureCli {
       "azure",
     );
     if (inspection.exitCode !== 0) {
-      throw new ForgeAdapterError("authentication", "Azure CLI authentication or subscription access is unavailable.");
+      throw new ForgeAdapterError("authentication", "Azure CLI authentication is unavailable.");
     }
-    const account = parseJson(inspection.stdout, "Azure subscription inspection") as {
+    const accounts = parseJson(inspection.stdout, "Azure subscription inspection");
+    if (!Array.isArray(accounts) || accounts.length === 0) {
+      throw new ForgeAdapterError("authentication", "Azure CLI has no authenticated account context.");
+    }
+    const account = accounts.find((candidate): candidate is {
       id?: unknown;
       name?: unknown;
       state?: unknown;
       tenantId?: unknown;
       user?: { name?: unknown };
-    };
-    if (typeof account.id !== "string" || account.id.toLowerCase() !== input.subscriptionId.toLowerCase()) {
-      throw new ForgeAdapterError("target", "Azure CLI resolved a different subscription target.");
+    } => Boolean(
+      candidate &&
+      typeof candidate === "object" &&
+      typeof (candidate as { id?: unknown }).id === "string" &&
+      (candidate as { id: string }).id.toLowerCase() === input.subscriptionId.toLowerCase(),
+    ));
+    if (!account) {
+      throw new ForgeAdapterError("target", "The intended Azure subscription is unavailable to the authenticated account.");
     }
+    const subscriptionId = account.id as string;
     const accountName = account.user?.name;
     if (typeof accountName !== "string") {
       throw new ForgeAdapterError("authentication", "Azure CLI did not identify its authenticated account.");
@@ -421,14 +444,14 @@ export class NativeAzureCli implements AzureCli {
         version: cliVersion,
         authentication: "verified",
         account: accountName,
-        target: account.id,
+        target: subscriptionId,
         capability: "subscription-inspection",
         observedAt,
       },
       evidence: {
         source: "provider-readback",
-        reference: `azure-subscription:${account.id}`,
-        summary: `Azure subscription ${String(account.name ?? account.id)} is enabled for the intended account.`,
+        reference: `azure-subscription:${subscriptionId}`,
+        summary: `Azure subscription ${String(account.name ?? subscriptionId)} is enabled for the intended account.`,
         observedAt,
       },
     };
@@ -454,6 +477,7 @@ async function executeGitHubMutation(
   try {
     capability = await github.inspect({
       repository: request.operation.repository,
+      issueNumber: request.operation.issueNumber,
       expectedAccount: request.operation.expectedAccount,
       timeoutMs: request.timeoutMs,
     });
@@ -470,7 +494,7 @@ async function executeGitHubMutation(
       error,
     });
   }
-  clearOwnerAction(state, "github-cli", capability, request.operation.expectedAccount);
+  clearOwnerActions(state, capability);
   const attempt: ForgeOperationAttempt = {
     id: operationAttemptId,
     commitmentId: request.commitmentId,
@@ -480,6 +504,7 @@ async function executeGitHubMutation(
     target,
     expectedAccount: request.operation.expectedAccount,
     timeoutMs: request.timeoutMs,
+    capability,
     status: "ready",
     startedAt,
   };
@@ -494,7 +519,10 @@ async function executeGitHubMutation(
     authorization: {
       kind: "lead-agent-command-authority",
       commitmentId: request.commitmentId,
-      targetProjectPath: request.operation.repository,
+      providerTarget: {
+        provider: "github",
+        resource: `${request.operation.repository}#${request.operation.issueNumber}`,
+      },
       validatedAt: startedAt,
       ...(request.actingAuthorityEffectAuthorization
         ? { actingAuthority: request.actingAuthorityEffectAuthorization }
@@ -607,7 +635,7 @@ async function executeAzureInspection(
       expectedAccount: request.operation.expectedAccount,
       timeoutMs: request.timeoutMs,
     });
-    clearOwnerAction(state, "azure-cli", inspected.capability, request.operation.expectedAccount);
+    clearOwnerActions(state, inspected.capability);
     const result: ForgeOperationResult = {
       operationAttemptId,
       commitmentId: request.commitmentId,
@@ -629,6 +657,7 @@ async function executeAzureInspection(
       target,
       expectedAccount: request.operation.expectedAccount,
       timeoutMs: request.timeoutMs,
+      capability: inspected.capability,
       status: "succeeded",
       startedAt,
       result,
@@ -734,7 +763,6 @@ function recordOwnerAction(
   state: ForgeOperationState,
   input: Omit<ForgeOwnerActionNotice, "id" | "state" | "fingerprint" | "observedAt">,
 ): NonNullable<ForgeOperationResult["ownerAction"]> {
-  const id = input.provider === "github" ? "github-cli" : "azure-cli";
   const fingerprint = sha256([
     input.provider,
     input.detail,
@@ -742,6 +770,7 @@ function recordOwnerAction(
     input.expectedAccount,
     input.target,
   ].join("|"));
+  const id = `forge-owner-action:${input.provider}:${fingerprint}`;
   const current = state.readForgeOwnerActionNotice(id);
   if (current?.state === "active" && current.fingerprint === fingerprint) {
     return { id, disposition: "deduplicated", nextAction: current.nextAction };
@@ -761,22 +790,27 @@ function recordOwnerAction(
   return { id, disposition: "recorded", nextAction: notice.nextAction };
 }
 
-function clearOwnerAction(
+function clearOwnerActions(
   state: ForgeOperationState,
-  id: ForgeOwnerActionNotice["id"],
   capability: ForgeCapabilityProof,
-  expectedAccount: string,
 ): void {
-  const current = state.readForgeOwnerActionNotice(id);
-  if (!current || current.state === "cleared") return;
-  state.appendForgeOwnerActionNotice({
-    ...current,
-    state: "cleared",
-    detail: `${capability.provider} capability was proven available for the intended account and target.`,
-    expectedAccount,
-    target: capability.target,
-    observedAt: capability.observedAt,
-  });
+  const target = capability.provider === "azure"
+    ? `subscription:${capability.target}`
+    : capability.target;
+  for (const current of state.readForgeOwnerActionNotices()) {
+    if (
+      current.state === "cleared" ||
+      current.provider !== capability.provider ||
+      current.expectedAccount.toLowerCase() !== capability.account.toLowerCase() ||
+      current.target.toLowerCase() !== target.toLowerCase()
+    ) continue;
+    state.appendForgeOwnerActionNotice({
+      ...current,
+      state: "cleared",
+      detail: `${capability.provider} capability was proven available for the intended account and target.`,
+      observedAt: capability.observedAt,
+    });
+  }
 }
 
 function classifyPreflightError(
@@ -828,6 +862,32 @@ function assertRequest(request: ForgeOperationRequest): void {
   }
 }
 
+function assertConfiguredAuthority(
+  configuration: OwnerConfiguration | undefined,
+  request: ForgeOperationRequest,
+): void {
+  if (!configuration) throw new Error("Forge operations require the persisted Owner configuration.");
+  if (request.operation.kind === "github-issue-comment") {
+    const authority = configuration.forgeAuthorities?.github;
+    if (!authority) throw new Error("GitHub Forge authority is not configured by the Owner.");
+    if (
+      authority.account.toLowerCase() !== request.operation.expectedAccount.toLowerCase() ||
+      authority.repository.toLowerCase() !== request.operation.repository.toLowerCase()
+    ) {
+      throw new Error("GitHub operation is outside the configured Owner authority.");
+    }
+    return;
+  }
+  const authority = configuration.forgeAuthorities?.azure;
+  if (!authority) throw new Error("Azure Forge authority is not configured by the Owner.");
+  if (
+    authority.account.toLowerCase() !== request.operation.expectedAccount.toLowerCase() ||
+    authority.subscriptionId.toLowerCase() !== request.operation.subscriptionId.toLowerCase()
+  ) {
+    throw new Error("Azure operation is outside the configured Owner authority.");
+  }
+}
+
 function targetLabel(target: ForgeOperationTarget): string {
   return target.kind === "github-issue"
     ? `${target.repository}#${target.issueNumber}`
@@ -857,7 +917,7 @@ async function runCli(
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...process.env,
+        ...nativeCliEnvironment(),
         GH_PROMPT_DISABLED: "1",
         GH_PAGER: "cat",
         AZURE_CORE_NO_COLOR: "1",
@@ -894,6 +954,29 @@ async function runCli(
       resolve({ stdout, stderr, exitCode: code ?? 1 });
     });
   });
+}
+
+export function nativeCliEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const names = [
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+  ] as const;
+  return Object.fromEntries(
+    names.flatMap((name) => environment[name] === undefined ? [] : [[name, environment[name]]]),
+  );
 }
 
 function boundedAppend(current: string, chunk: string): string {

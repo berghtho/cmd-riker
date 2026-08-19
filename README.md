@@ -25,6 +25,13 @@ An uninitialized state directory requires a secret-free `config.json`:
 ```json
 {
   "targetProject": { "path": "C:\\path\\to\\target-project" },
+  "forgeAuthorities": {
+    "github": { "account": "owner-login", "repository": "owner/repository" },
+    "azure": {
+      "account": "owner@example.com",
+      "subscriptionId": "00000000-0000-0000-0000-000000000000"
+    }
+  },
   "modelSelection": {
     "provider": "openai-codex",
     "model": "gpt-5.4-mini",

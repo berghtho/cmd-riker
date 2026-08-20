@@ -1434,7 +1434,7 @@ test("installed Codex technically denies a real out-of-root write", async (t) =>
   await proveCodexWorkspaceWriteIsolation(runtime, checkout);
 });
 
-test("native checkout inspection requires a clean isolated branch and observes its real diff", async (t) => {
+test("native checkout inspection isolates in place on a clean branch and plans a managed worktree otherwise", async (t) => {
   const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-isolated-checkout-test-"));
   t.after(() => rm(checkout, { recursive: true, force: true }));
   await execGit(checkout, ["init", "-b", "main"]);
@@ -1451,10 +1451,9 @@ test("native checkout inspection requires a clean isolated branch and observes i
   ]);
   const inspector = new NativeEffectfulCheckoutInspector();
 
-  await assert.rejects(
-    inspector.verify(checkout, 5_000),
-    /isolated non-default branch or secondary worktree/,
-  );
+  const defaultBranchPlan = await inspector.verify(checkout, 5_000, "commitment-default");
+  assert.equal(defaultBranchPlan.isolation.kind, "worktree");
+  assert.equal(defaultBranchPlan.managedExecutionCheckout?.targetProjectRoot, checkout);
   await execGit(checkout, ["switch", "-c", "feat/test"]);
   const isolated = await inspector.verify(checkout, 5_000);
   assert.equal(isolated.root, checkout);
@@ -1464,7 +1463,9 @@ test("native checkout inspection requires a clean isolated branch and observes i
   await writeFile(join(checkout, "tracked.txt"), "changed\n");
   await writeFile(join(checkout, "new.txt"), "new\n");
   assert.deepEqual(await inspector.observeChanges(isolated, 5_000), ["new.txt", "tracked.txt"]);
-  await assert.rejects(inspector.verify(checkout, 5_000), /contains unaccepted changes/);
+  const dirtyPlan = await inspector.verify(checkout, 5_000, "commitment-dirty");
+  assert.equal(dirtyPlan.isolation.kind, "worktree");
+  assert.equal(dirtyPlan.managedExecutionCheckout?.targetProjectRoot, checkout);
 });
 
 test("a local-only primary checkout is reconciled through one disposable Execution Checkout", async (t) => {
@@ -1494,15 +1495,18 @@ test("a local-only primary checkout is reconciled through one disposable Executi
 
   const ownerChange = join(checkout, "owner-note.txt");
   await writeFile(ownerChange, "preserve me\n");
+  await writeFile(join(checkout, "src", "tracked.txt"), "conflicting owner edit\n");
   await assert.rejects(
     inspector.advance(plan, "reconciled", changes, 5_000),
     MaterialExecutionCheckoutError,
   );
   assert.equal(await readFile(ownerChange, "utf8"), "preserve me\n");
   assert.equal(existsSync(plan.root), true);
-  await rm(ownerChange);
+  await execGit(checkout, ["checkout", "--", "src/tracked.txt"]);
 
+  // The unrelated Owner note stays in place while the Worker result reconciles.
   await inspector.advance(plan, "reconciled", changes, 5_000);
+  assert.equal(await readFile(ownerChange, "utf8"), "preserve me\n");
   assert.equal(
     (await readFile(join(checkout, "src", "tracked.txt"), "utf8")).replaceAll("\r\n", "\n"),
     "changed\n",

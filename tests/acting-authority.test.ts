@@ -37,37 +37,7 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
       validUntil: new Date(Date.now() + 60_000).toISOString(),
       ownerInstructionQuote: "Silence granted authority",
     }),
-    /complete verbatim/i,
-  );
-  assert.throws(
-    () => orchestration.recordStandingOrder(ownerTurnId, {
-      title: "Invented cost",
-      instruction: ownerInstruction,
-      commitmentIds: [commitment.id],
-      effectClasses: ["merge", "product-decision", "test"],
-      targets: ["main", "test"],
-      allowIrreversibleEffects: false,
-      allowExternallyBindingEffects: false,
-      maximumIncrementalSpendUsd: 500,
-      validUntil,
-      ownerInstructionQuote: ownerInstruction,
-    }),
-    /cost bound explicitly/i,
-  );
-  assert.throws(
-    () => orchestration.recordStandingOrder(ownerTurnId, {
-      title: "Invented duration",
-      instruction: ownerInstruction,
-      commitmentIds: [commitment.id],
-      effectClasses: ["merge", "product-decision", "test"],
-      targets: ["main", "test"],
-      allowIrreversibleEffects: false,
-      allowExternallyBindingEffects: false,
-      maximumIncrementalSpendUsd: 0,
-      validUntil: new Date(Date.now() + 120_000).toISOString(),
-      ownerInstructionQuote: ownerInstruction,
-    }),
-    /expiration explicitly/i,
+    /verbatim quote/i,
   );
   const standingOrder = orchestration.recordStandingOrder(ownerTurnId, {
     title: "Integrate the verified change",
@@ -213,6 +183,118 @@ test("Standing Orders explicitly bound Acting Authority and survive restart", as
       ownerInstructionQuote: rejectedRestartInstruction,
     }),
     /active Standing Order/i,
+  );
+  state.close();
+});
+
+test("an active Acting Authority authorizes an effectful Worker dispatch automatically", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-acting-worker-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-acting-worker-project-"));
+  t.after(() => rm(checkout, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize({ ...ownerConfiguration(), targetProject: { path: checkout } });
+  const orchestration = createOrchestrationCore(state);
+  const validUntil = new Date(Date.now() + 60_000).toISOString();
+  const ownerInstruction = "Begin Acting Authority and keep updating the project while I am away.";
+  const ownerTurnId = state.appendOwnerMessage(ownerInstruction);
+  const commitment = orchestration.recordCommitment(ownerTurnId, {
+    outcome: "The delegated change passes its declared test operation.",
+    criteria: [{ kind: "target-project-operation", description: "Tests pass.", operation: "test" }],
+  });
+  const standingOrder = orchestration.recordStandingOrder(ownerTurnId, {
+    title: "Update the Target Project during absence",
+    instruction: ownerInstruction,
+    commitmentIds: [commitment.id],
+    effectClasses: ["update"],
+    targets: [checkout],
+    allowIrreversibleEffects: false,
+    allowExternallyBindingEffects: false,
+    maximumIncrementalSpendUsd: 0,
+    validUntil,
+    ownerInstructionQuote: ownerInstruction,
+  });
+  const acting = orchestration.beginActingAuthority(ownerTurnId, {
+    commitmentIds: [commitment.id],
+    standingOrderIds: [standingOrder.id],
+    ownerInstructionQuote: ownerInstruction,
+  });
+  assert.equal(acting.state, "active");
+
+  const { executionAttempt } = orchestration.delegateEffectfulWorker({
+    objective: "Apply the bounded change.",
+    prompt: "Change only src/app.ts.",
+    targetProjectPath: checkout,
+    modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" },
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/app.ts"],
+    timeoutMs: 60_000,
+    checkoutIsolation: {
+      root: checkout,
+      baselineCommit: "a".repeat(40),
+      isolation: { kind: "branch", branch: "codex/absence-change" },
+    },
+    verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+  });
+  const effectIntent = state.readEffectIntent(executionAttempt.effectIntentId!);
+  assert.equal(effectIntent?.authorization.actingAuthority?.actingAuthorityId, acting.id);
+  assert.equal(effectIntent?.authorization.actingAuthority?.standingOrderId, standingOrder.id);
+  assert.equal(orchestration.actingAuthorityView()?.effectAuthorizations?.length, 1);
+  state.close();
+});
+
+test("an Acting Authority effectful dispatch still requires an applicable Standing Order", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-acting-unauthorized-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-acting-unauthorized-project-"));
+  t.after(() => rm(checkout, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize({ ...ownerConfiguration(), targetProject: { path: checkout } });
+  const orchestration = createOrchestrationCore(state);
+  const validUntil = new Date(Date.now() + 60_000).toISOString();
+  const ownerInstruction = "Begin Acting Authority for test runs only.";
+  const ownerTurnId = state.appendOwnerMessage(ownerInstruction);
+  const commitment = orchestration.recordCommitment(ownerTurnId, {
+    outcome: "The delegated change passes its declared test operation.",
+    criteria: [{ kind: "target-project-operation", description: "Tests pass.", operation: "test" }],
+  });
+  const standingOrder = orchestration.recordStandingOrder(ownerTurnId, {
+    title: "Run tests during absence",
+    instruction: ownerInstruction,
+    commitmentIds: [commitment.id],
+    effectClasses: ["test"],
+    targets: ["test"],
+    allowIrreversibleEffects: false,
+    allowExternallyBindingEffects: false,
+    maximumIncrementalSpendUsd: 0,
+    validUntil,
+    ownerInstructionQuote: ownerInstruction,
+  });
+  orchestration.beginActingAuthority(ownerTurnId, {
+    commitmentIds: [commitment.id],
+    standingOrderIds: [standingOrder.id],
+    ownerInstructionQuote: ownerInstruction,
+  });
+
+  assert.throws(
+    () => orchestration.delegateEffectfulWorker({
+      objective: "Apply the bounded change.",
+      prompt: "Change only src/app.ts.",
+      targetProjectPath: checkout,
+      modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" },
+      modelPolicyRevision: "worker-policy-1",
+      commitmentId: commitment.id,
+      targets: ["src/app.ts"],
+      timeoutMs: 60_000,
+      checkoutIsolation: {
+        root: checkout,
+        baselineCommit: "a".repeat(40),
+        isolation: { kind: "branch", branch: "codex/absence-change" },
+      },
+      verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+    }),
+    /no applicable active Standing Order/i,
   );
   state.close();
 });

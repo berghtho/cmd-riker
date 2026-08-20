@@ -29,7 +29,8 @@ CMD Riker installs per Windows user from an Owner-supplied local build. It does 
 start at boot or logon, install a service, require `SYSTEM`, or depend on a machine-wide Node runtime
 after installation.
 
-Build immutable Lead Agent and Recovery Actor bundles with official Node `24.17.0`:
+Build immutable Lead Agent and Recovery Actor bundles with an official Node `24.16.0` or newer
+Node 24 runtime:
 
 ```powershell
 npm ci
@@ -43,8 +44,8 @@ npm run build:local-release -- `
   --output release\riker-0.1.0-local.1
 ```
 
-The builder refuses another Node version, hashes every final file, and emits strict separate
-manifests. The Lead Agent carries its runtime dependencies; the Recovery Actor bundle cannot contain
+The builder refuses an unsupported Node runtime, records the exact supplied version, hashes every
+final file, and emits strict separate manifests. The Lead Agent carries its runtime dependencies; the Recovery Actor bundle cannot contain
 Pi, Codex, or another non-built-in dependency.
 
 Prepare the secret-free configuration below, then install without starting the product:
@@ -246,11 +247,14 @@ contains up to 32 checkout-relative file paths, each at most 16 MiB, whose SHA-2
 attributed to the operation result; use an empty array when the operation has no declared file
 artifact.
 
-With pinned Codex CLI `0.147.0` authenticated through ChatGPT, the Lead Agent can delegate an
-effectful assignment for an active Commitment that declares the `test` criterion. CMD Riker records
-the assignment's targets, effect classes, Authorized Write Root, Command Authority, time and cost
-bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. The
-checkout must be clean and use a non-default branch or secondary Git worktree. Immediately before
+With Codex CLI `0.147.0` or newer authenticated through ChatGPT, the Lead Agent can delegate an
+effectful assignment. When the Lead delegates without naming a Commitment, CMD Riker records the
+covering Commitment with its declared `test` criterion automatically. CMD Riker records the
+assignment's targets, effect classes, Authorized Write Root, Command Authority, time and cost
+bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. A
+clean secondary worktree or non-default branch executes in place; any other primary checkout —
+dirty, detached, on the default branch, or without a provable default branch — automatically gets a
+managed sibling Execution Checkout instead of a refusal. Immediately before
 `turn/start`, the production adapter requires Windows sandbox readiness and uses Codex `workspaceWrite`
 with no additional writable roots, no command network, no temporary-directory exception, and approval
 policy `never`. A real in-root/out-of-root probe runs under the same policy; failure to prove either
@@ -265,16 +269,26 @@ linked to the Worker effect; restart resumes a not-yet-dispatched Verification w
 Worker. Connection loss after dispatch leaves the effect unknown and reconciling; it is never
 automatically replayed.
 
-When a clean primary checkout lacks a provable default-branch identity, CMD Riker plans a detached,
-Commitment-attributed Execution Checkout beside it. The durable Worker authority and effect intent are
-recorded before `git worktree add`; the Worker receives only that worktree as its Authorized Write Root.
-After a settled Worker result, CMD Riker proves that the Owner-facing Target Project still matches the
-recorded baseline, reconciles the exact Git patch, disposes the worktree, and only then runs Verification.
-Each lifecycle step is read back before retry after restart. Conflicting Target Project changes or an
-ambiguous worktree identity stop automatic effects and surface one material Owner intervention while
-preserving both checkouts.
+For a managed Execution Checkout, the durable Worker authority and effect intent are recorded before
+`git worktree add`; the Worker receives only that detached, Commitment-attributed sibling worktree as
+its Authorized Write Root. After a settled Worker result, CMD Riker proves that the Target Project
+HEAD still matches the recorded baseline, reconciles the exact Git patch, disposes the worktree, and
+only then runs Verification. Unrelated uncommitted Owner changes in the Target Project are preserved
+and tolerated; only a change that touches the Worker's own paths differently stops automatic effects
+and surfaces one material Owner intervention while preserving both checkouts. Each lifecycle step is
+read back before retry after restart. Worker completion, failure, and required interventions are
+pushed to the Owner interface as they happen instead of waiting for the next Owner turn.
 
-## Workflow skills
+## Lead Agent tools and skills
+
+The Lead Agent holds its full native tool belt — read, bash, edit, write, grep, find, and ls —
+rooted in the Target Project under its own Command Authority. It acts directly when that serves the
+mission best; delegation to Worker Sessions is one option, never a prerequisite. The Owner's
+installed Pi skills and the Target Project's context files are part of the Lead's working context,
+and the Lead reads a skill's file itself when it uses one.
+
+The Pi Owner interface also loads the installed Pi skills normally. Invoking `/skill:<name>` in the
+`riker` terminal inlines that skill's content into the Owner turn.
 
 CMD Riker ships its generic `design-council` skill and locks the complete
 [`mattpocock/skills`](https://github.com/mattpocock/skills) package through APM. Materialize the

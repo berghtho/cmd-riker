@@ -211,7 +211,11 @@ async function main(): Promise<void> {
     if (!policyValidated && !activationProvisional) {
       await validatePolicy(adapter, conversation);
     }
-    const workerSupervisor = await availableWorkerSupervisor(state, conversation);
+    const ownerNotices: OwnerNoticeSink = {
+      deliver: (content) =>
+        process.stdout.write(`CMD_RIKER_WORKER_NOTICE: ${singleLine(content)}\n`),
+    };
+    const workerSupervisor = await availableWorkerSupervisor(state, conversation, ownerNotices);
     if (workerSupervisor) await workerSupervisor.recover();
     emitActivationReady();
 
@@ -221,6 +225,7 @@ async function main(): Promise<void> {
         adapter,
         conversation.targetProject.path,
         workerSupervisor,
+        ownerNotices,
       );
     } else {
       await runScriptableConversation(
@@ -273,6 +278,7 @@ function runInteractiveConversation(
   adapter: PiTurnAdapter,
   targetProjectPath: string,
   workerSupervisor: WorkerSupervisor | undefined,
+  ownerNotices: OwnerNoticeSink,
 ): Promise<void> {
   const conversation = state.readOwnerConversation();
   const transcript = (conversation?.messages ?? []).map((message) => ({
@@ -290,6 +296,13 @@ function runInteractiveConversation(
     completeOwnerInput: (ownerInput) =>
       completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor),
     readSessionView: () => currentSessionView(state, workerSupervisor),
+    subscribeNotices: (listener) => {
+      const previous = ownerNotices.deliver;
+      ownerNotices.deliver = listener;
+      return () => {
+        ownerNotices.deliver = previous;
+      };
+    },
   });
 }
 
@@ -398,9 +411,16 @@ function sessionViewSnapshot(
   });
 }
 
+type OwnerNoticeSink = { deliver: (content: string) => void };
+
+function singleLine(content: string): string {
+  return content.replaceAll(/\s*\r?\n\s*/g, " | ").trim();
+}
+
 async function availableWorkerSupervisor(
   state: AuthoritativeState,
   configuration: OwnerConfiguration,
+  ownerNotices: OwnerNoticeSink,
 ): Promise<WorkerSupervisor | undefined> {
   if (!configuration.workerModelPolicy) return undefined;
   const orchestration = createOrchestrationCore(state);
@@ -426,6 +446,8 @@ async function availableWorkerSupervisor(
       state,
       harness,
       createTargetProjectOperations(state),
+      undefined,
+      (notice) => ownerNotices.deliver(notice),
     );
   } catch (error) {
     orchestration.reconcileInterruptedWorkers(

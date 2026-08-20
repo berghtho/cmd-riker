@@ -1,5 +1,10 @@
+import { readFileSync } from "node:fs";
+
 import {
+  getAgentDir,
   getMarkdownTheme,
+  loadSkills,
+  stripFrontmatter,
   type Theme,
   type ExtensionAPI,
   type ExtensionContext,
@@ -27,6 +32,7 @@ export type PiOwnerInterfaceInput = {
   transcript: PiOwnerTranscriptEntry[];
   completeOwnerInput(ownerInput: string): Promise<PiOwnerResponse>;
   readSessionView(): string;
+  subscribeNotices?(listener: (content: string) => void): () => void;
 };
 
 export async function runPiOwnerInterface(input: PiOwnerInterfaceInput): Promise<void> {
@@ -37,7 +43,6 @@ export async function runPiOwnerInterface(input: PiOwnerInterfaceInput): Promise
       "--no-session",
       "--no-builtin-tools",
       "--no-context-files",
-      "--no-skills",
       "--no-prompt-templates",
       "--offline",
       "--tui-mode",
@@ -65,6 +70,7 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
   let footerTheme: Theme | undefined;
   let status: "available" | "responding" | "error" = "available";
   let refreshTimer: NodeJS.Timeout | undefined;
+  let unsubscribeNotices: (() => void) | undefined;
 
   pi.registerMessageRenderer("riker-owner", (message, { outputPad }, theme) => {
     const box = new Box(outputPad, 0, (text) => theme.bg("userMessageBg", text));
@@ -106,6 +112,10 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     for (const entry of input.transcript) {
       send(pi, entry.source === "owner" ? "riker-owner" : "riker-lead", entry.content);
     }
+    unsubscribeNotices = input.subscribeNotices?.((content) => {
+      send(pi, "riker-lead", content);
+      updateFooter(ctx);
+    });
     refreshTimer = setInterval(() => updateFooter(ctx), 500);
   });
 
@@ -121,7 +131,9 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     send(pi, "riker-owner", ownerInput);
     updateFooter(ctx, "responding");
     try {
-      const response = await input.completeOwnerInput(ownerInput);
+      const response = await input.completeOwnerInput(
+        expandSkillInvocation(ownerInput, input.targetProjectPath),
+      );
       send(pi, "riker-lead", response.content);
       updateFooter(ctx, "available");
     } catch (error) {
@@ -149,6 +161,8 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
   pi.on("session_shutdown", () => {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;
+    unsubscribeNotices?.();
+    unsubscribeNotices = undefined;
     footer = undefined;
     footerTheme = undefined;
   });
@@ -156,6 +170,37 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
 
 function send(pi: ExtensionAPI, customType: string, content: string): void {
   pi.sendMessage({ customType, content, display: true });
+}
+
+// Pi expands /skill: invocations only after the input event, so the Owner
+// extension resolves the same installed skills itself before the Lead turn.
+export function expandSkillInvocation(ownerInput: string, targetProjectPath: string): string {
+  if (!ownerInput.startsWith("/skill:")) return ownerInput;
+  const spaceIndex = ownerInput.indexOf(" ");
+  const skillName = spaceIndex === -1 ? ownerInput.slice(7) : ownerInput.slice(7, spaceIndex);
+  const args = spaceIndex === -1 ? "" : ownerInput.slice(spaceIndex + 1).trim();
+  let skills;
+  try {
+    skills = loadSkills({
+      cwd: targetProjectPath,
+      agentDir: getAgentDir(),
+      skillPaths: [],
+      includeDefaults: true,
+    }).skills;
+  } catch {
+    return ownerInput;
+  }
+  const skill = skills.find((candidate) => candidate.name === skillName);
+  if (!skill) return ownerInput;
+  try {
+    const body = stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+    const block =
+      `<skill name="${skill.name}" location="${skill.filePath}">\n` +
+      `References are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+    return args ? `${block}\n\n${args}` : block;
+  } catch {
+    return ownerInput;
+  }
 }
 
 function renderFooter(

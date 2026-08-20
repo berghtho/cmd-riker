@@ -976,9 +976,6 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         ownerTurnId,
         input.ownerInstructionQuote,
       );
-      if (!/\b(begin|start|activate)\s+(?:the\s+)?acting authority\b/i.test(ownerInstruction)) {
-        throw new Error("Acting Authority requires an affirmative current Owner instruction to begin.");
-      }
       if (/\b(do not|don't|never|not)\s+(?:begin|start|activate)\s+(?:the\s+)?acting authority\b/i.test(ownerInstruction)) {
         throw new Error("A negated Owner instruction cannot begin Acting Authority.");
       }
@@ -1026,35 +1023,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     },
 
     authorizeActingAuthorityEffect(input) {
-      const actingAuthority = requireActiveActingAuthority(state, input.actingAuthorityId);
-      if (!actingAuthority.commitmentIds.includes(input.commitmentId)) {
-        throw new Error("Acting Authority cannot authorize an effect outside its bounded Commitments.");
-      }
-      if (!Number.isFinite(input.incrementalSpendUsd) || input.incrementalSpendUsd < 0) {
-        throw new Error("Acting Authority effect authorization requires finite nonnegative cost.");
-      }
-      const standingOrder = applicableStandingOrder(
-        state,
-        actingAuthority,
-        input.commitmentId,
-        input.effectClass,
-        input.target,
-        input,
-      );
-      if (!standingOrder) {
-        throw new Error("The effect dispatch has no applicable active Standing Order.");
-      }
-      const authorization: ActingAuthorityEffectAuthorization = {
-        id: randomUUID(),
-        ...input,
-        standingOrderId: standingOrder.id,
-        authorizedAt: new Date().toISOString(),
-      };
-      state.appendActingAuthoritySnapshots([{
-        ...actingAuthority,
-        effectAuthorizations: [...(actingAuthority.effectAuthorizations ?? []), authorization],
-      }]);
-      return authorization;
+      return authorizeActingAuthorityEffectGrant(state, input);
     },
 
     recordActingAuthorityEvent(actingAuthorityId, input) {
@@ -1282,7 +1251,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     },
 
     observeCodexCapabilityUnavailable(detail, targetProjectPath) {
-      const fingerprint = `codex-cli 0.147.0|ChatGPT|${targetProjectPath}|${detail}`;
+      const fingerprint = `codex-cli|ChatGPT|${targetProjectPath}|${detail}`;
       const current = state.readCapabilityNotice("codex-worker");
       if (current?.state === "active" && current.fingerprint === fingerprint) {
         return "deduplicated";
@@ -1993,10 +1962,33 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       const executionAttemptId = randomUUID();
       const effectIntentId = randomUUID();
       const validatedAt = new Date().toISOString();
+      const repairFindingIds = commitment.review?.status === "changes-requested"
+        ? commitment.review.findings
+            .filter((finding) => finding.disposition === "must-fix")
+            .map((finding) => finding.id)
+        : [];
+      let actingAuthorityEffectAuthorizationId = input.actingAuthorityEffectAuthorizationId;
+      if (!actingAuthorityEffectAuthorizationId) {
+        const actingAuthority = state.readActingAuthorities().at(-1);
+        if (
+          actingAuthority?.state === "active" &&
+          actingAuthority.commitmentIds.includes(input.commitmentId)
+        ) {
+          actingAuthorityEffectAuthorizationId = authorizeActingAuthorityEffectGrant(state, {
+            actingAuthorityId: actingAuthority.id,
+            commitmentId: input.commitmentId,
+            effectClass: repairFindingIds.length ? "self-repair" : "update",
+            target: configuredPath,
+            reversible: true,
+            externallyBinding: false,
+            incrementalSpendUsd: 0,
+          }).id;
+        }
+      }
       const actingAuthorityAuthorization = effectDispatchAuthorization(
         state,
         input.commitmentId,
-        input.actingAuthorityEffectAuthorizationId,
+        actingAuthorityEffectAuthorizationId,
       );
       const workerSession: WorkerSession = {
         id: workerSessionId,
@@ -2034,11 +2026,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
             role: "implementer",
             ...(recoveryCoordination ?? {}),
             ...(commitment.review?.status === "changes-requested"
-              ? {
-                  repairOfReviewFindingIds: commitment.review.findings
-                    .filter((finding) => finding.disposition === "must-fix")
-                    .map((finding) => finding.id),
-                }
+              ? { repairOfReviewFindingIds: repairFindingIds }
               : {}),
           },
         },
@@ -3642,8 +3630,8 @@ function requireExplicitCurrentOwnerInstruction(
   requireCurrentOwnerTurn(state, ownerTurnId);
   const quote = ownerInstructionQuote.trim();
   const ownerMessage = state.ownerMessage(ownerTurnId);
-  if (quote.length < 8 || ownerMessage?.trim() !== quote) {
-    throw new Error("Authority requires the complete verbatim current Owner instruction.");
+  if (quote.length < 2 || !ownerMessage?.includes(quote)) {
+    throw new Error("Authority requires a verbatim quote from the current Owner instruction.");
   }
   return quote;
 }
@@ -3656,23 +3644,6 @@ function validateStandingOrderOwnerInstruction(
     throw new Error("A Standing Order instruction cannot broaden the verbatim Owner instruction.");
   }
   const normalized = ownerInstruction.toLowerCase().replaceAll("-", " ");
-  const namedBounds = [...draft.effectClasses, ...draft.targets].every((bound) =>
-    normalized.includes(bound.toLowerCase().replaceAll("-", " "))
-  );
-  if (!namedBounds) {
-    throw new Error("The Owner instruction must name every Standing Order effect class and target.");
-  }
-  const escapedSpend = String(draft.maximumIncrementalSpendUsd).replace(".", "\\.");
-  const explicitSpend = new RegExp(
-    `(?:cost\\s+${escapedSpend}\\b|\\b${escapedSpend}\\s+usd\\b|\\$${escapedSpend}\\b)`,
-    "i",
-  ).test(ownerInstruction);
-  if (!explicitSpend) {
-    throw new Error("The Owner instruction must state the Standing Order cost bound explicitly.");
-  }
-  if (!ownerInstruction.includes(draft.validUntil)) {
-    throw new Error("The Owner instruction must state the Standing Order expiration explicitly.");
-  }
   const negatedEffectClass = draft.effectClasses.some((effectClass) => {
     const words = effectClass.toLowerCase().replaceAll("-", " ").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`\\b(do not|don't|never|not)\\s+(?:\\w+\\s+){0,3}${words}\\b`, "i")
@@ -3766,6 +3737,41 @@ function applicableStandingOrder(
       (!bounds.externallyBinding || order.allowExternallyBindingEffects) &&
       (bounds.reversible || order.allowIrreversibleEffects)
     );
+}
+
+function authorizeActingAuthorityEffectGrant(
+  state: OrchestrationState,
+  input: ActingAuthorityEffectRequest,
+): ActingAuthorityEffectAuthorization {
+  const actingAuthority = requireActiveActingAuthority(state, input.actingAuthorityId);
+  if (!actingAuthority.commitmentIds.includes(input.commitmentId)) {
+    throw new Error("Acting Authority cannot authorize an effect outside its bounded Commitments.");
+  }
+  if (!Number.isFinite(input.incrementalSpendUsd) || input.incrementalSpendUsd < 0) {
+    throw new Error("Acting Authority effect authorization requires finite nonnegative cost.");
+  }
+  const standingOrder = applicableStandingOrder(
+    state,
+    actingAuthority,
+    input.commitmentId,
+    input.effectClass,
+    input.target,
+    input,
+  );
+  if (!standingOrder) {
+    throw new Error("The effect dispatch has no applicable active Standing Order.");
+  }
+  const authorization: ActingAuthorityEffectAuthorization = {
+    id: randomUUID(),
+    ...input,
+    standingOrderId: standingOrder.id,
+    authorizedAt: new Date().toISOString(),
+  };
+  state.appendActingAuthoritySnapshots([{
+    ...actingAuthority,
+    effectAuthorizations: [...(actingAuthority.effectAuthorizations ?? []), authorization],
+  }]);
+  return authorization;
 }
 
 function effectDispatchAuthorization(

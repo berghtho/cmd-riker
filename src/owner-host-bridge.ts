@@ -46,8 +46,8 @@ export async function completeHostedOwnerInput(
     completion.reject(new Error(`The Lead Agent stopped unexpectedly (${exit.kind}).`));
   });
   const timeout = setTimeout(() => {
-    completion.reject(new Error("The Lead Agent did not finish the Owner turn within ten minutes."));
-  }, 10 * 60_000);
+    completion.reject(new Error("The Lead Agent did not finish the Owner turn within one hour."));
+  }, 60 * 60_000);
   try {
     await client.sendOwnerLine(ownerInput);
     return await responsePromise;

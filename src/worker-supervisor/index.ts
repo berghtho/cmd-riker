@@ -168,9 +168,17 @@ export function createWorkerSupervisor(
   harness: NativeWorkerHarness,
   verificationOperations?: TargetProjectOperations,
   checkoutInspector: EffectfulCheckoutInspector = new NativeEffectfulCheckoutInspector(),
+  onOwnerNotice?: (notice: string) => void,
 ): WorkerSupervisor {
   const orchestration = createOrchestrationCore(state);
   const executions = new Map<string, NativeWorkerExecution>();
+  const notifyOwner = (notice: string): void => {
+    try {
+      onOwnerNotice?.(notice);
+    } catch {
+      // Notices are best-effort; durable state already carries the fact.
+    }
+  };
   const outputByAttempt = new Map<string, string>();
   const commandsByAttempt = new Map<string, string[]>();
   const deadlinesByAttempt = new Map<string, NodeJS.Timeout[]>();
@@ -207,6 +215,9 @@ export function createWorkerSupervisor(
     } catch (error) {
       if (error instanceof MaterialExecutionCheckoutError) {
         orchestration.blockExecutionCheckout(workerSessionId, executionAttemptId, error.message);
+        notifyOwner(
+          `Worker Session ${workerSessionId} needs an Owner intervention: ${error.message}`,
+        );
         return;
       }
       throw error;
@@ -272,6 +283,9 @@ export function createWorkerSupervisor(
             executionAttempt.id,
             error.message,
           );
+          notifyOwner(
+            `Worker Session ${workerSession.id} needs an Owner intervention: ${error.message}`,
+          );
           return;
         }
         throw error;
@@ -297,6 +311,9 @@ export function createWorkerSupervisor(
       orchestration.workerVerificationRequest(workerSession.id, executionAttempt.id),
     );
     orchestration.observeWorkerVerificationResult(workerSession.id, executionAttempt.id, result);
+    notifyOwner(
+      `Worker Session ${workerSession.id} finished; Verification ${result.status}.`,
+    );
   };
   const startExecution = async (
     workerSession: WorkerSession,
@@ -343,15 +360,20 @@ export function createWorkerSupervisor(
       } catch (error) {
         if (error instanceof MaterialExecutionCheckoutError) {
           orchestration.blockExecutionCheckout(workerSession.id, executionAttempt.id, error.message);
+          notifyOwner(
+            `Worker Session ${workerSession.id} needs an Owner intervention: ${error.message}`,
+          );
           return;
         }
+        const detail = error instanceof Error ? error.message : "Execution Checkout preparation failed.";
         orchestration.observeWorkerTerminal({
           workerSessionId: workerSession.id,
           executionAttemptId: executionAttempt.id,
           status: "failed",
           processGone: true,
-          detail: error instanceof Error ? error.message : "Execution Checkout preparation failed.",
+          detail,
         });
+        notifyOwner(`Worker Session ${workerSession.id} failed before launch: ${detail}`);
         await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
         return;
       }
@@ -465,13 +487,21 @@ export function createWorkerSupervisor(
             }
             outputByAttempt.delete(executionAttempt.id);
             commandsByAttempt.delete(executionAttempt.id);
-            if (terminal === "settled" && !workerSession.assignment.readOnly) {
-              const effect = executionAttempt.effectIntentId
-                ? state.readEffectIntent(executionAttempt.effectIntentId)
-                : undefined;
-              if (effect?.status === "succeeded") {
-                await verifySettledWorker(workerSession, executionAttempt);
-              }
+            const effect = !workerSession.assignment.readOnly && executionAttempt.effectIntentId
+              ? state.readEffectIntent(executionAttempt.effectIntentId)
+              : undefined;
+            const willVerify = terminal === "settled" &&
+              !workerSession.assignment.readOnly &&
+              effect?.status === "succeeded";
+            if (!willVerify) {
+              const summary = reportedOutcome?.summary ?? terminalDetail;
+              notifyOwner(
+                `Worker Session ${workerSession.id} ${status}` +
+                  (summary ? `: ${summary}` : "."),
+              );
+            }
+            if (willVerify) {
+              await verifySettledWorker(workerSession, executionAttempt);
             }
           },
           async failed(error) {
@@ -500,6 +530,9 @@ export function createWorkerSupervisor(
             if (recovery.kind === "restart") {
               await startExecution(recovery.workerSession, recovery.executionAttempt);
             } else {
+              notifyOwner(
+                `Worker Session ${workerSession.id} lost continuity and exhausted automatic recovery: ${error.message}`,
+              );
               await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
             }
           },
@@ -585,13 +618,15 @@ export function createWorkerSupervisor(
         }
         return;
       }
+      const startupDetail = error instanceof Error ? error.message : "Worker startup failed.";
       orchestration.observeWorkerTerminal({
         workerSessionId: workerSession.id,
         executionAttemptId: executionAttempt.id,
         status: "failed",
         processGone: !latestAttempt?.process,
-        detail: error instanceof Error ? error.message : "Worker startup failed.",
+        detail: startupDetail,
       });
+      notifyOwner(`Worker Session ${workerSession.id} failed to start: ${startupDetail}`);
       await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
       throw error;
     }

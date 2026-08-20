@@ -4,6 +4,7 @@ import {
   connectLocalLeadHost,
   localLeadHostAddress,
   type LeadHostTranscriptEntry,
+  type LocalLeadHostClient,
 } from "./local-host/index.ts";
 import {
   runPiOwnerInterface,
@@ -31,6 +32,13 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
       transcript: readTranscript(client.transcript),
       completeOwnerInput: (ownerInput) => completeHostedOwnerInput(client, ownerInput),
       readSessionView: () => readLatestSessionView(client.transcript),
+      subscribeNotices: (listener) =>
+        client.onTranscriptEntry((entry: LeadHostTranscriptEntry) => {
+          const prefix = "CMD_RIKER_WORKER_NOTICE: ";
+          if (entry.source === "lead" && entry.stream === "stdout" && entry.line.startsWith(prefix)) {
+            listener(entry.line.slice(prefix.length));
+          }
+        }),
     });
   } finally {
     await client.detach();

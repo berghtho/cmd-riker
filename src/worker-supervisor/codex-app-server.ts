@@ -13,9 +13,29 @@ import type {
   WorkerStartRequest,
 } from "./index.ts";
 
-const supportedVersion = "codex-cli 0.147.0";
+// Oldest Codex CLI whose app-server protocol passed the accepted lifecycle probe.
+// Newer releases are accepted; genuinely incompatible ones fail the protocol
+// identity, sandbox, and probe checks at launch instead of a version-string gate.
+const minimumVersion = [0, 147, 0] as const;
 // Digest of the generated 0.147.0 schema retained by the accepted lifecycle probe (66849d0).
 const supportedSchemaSha256 = "BABFD5C98CD978DD858B4762CDFBC9FBA941E1A0E4053DE0050E4082AE1F075A";
+
+function assertSupportedCodexVersion(version: string): string {
+  const match = /^codex-cli (\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  const observed = match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+  const supported = observed && (
+    observed[0]! > minimumVersion[0] ||
+    (observed[0] === minimumVersion[0] &&
+      (observed[1]! > minimumVersion[1] ||
+        (observed[1] === minimumVersion[1] && observed[2]! >= minimumVersion[2])))
+  );
+  if (!supported) {
+    throw new Error(
+      `Unsupported Codex version ${version}; expected codex-cli ${minimumVersion.join(".")} or newer.`,
+    );
+  }
+  return match![0]!.slice("codex-cli ".length);
+}
 const maxStdoutBuffer = 2 * 1024 * 1024;
 const maxQuestionBytes = 24 * 1024;
 
@@ -26,9 +46,7 @@ export type CodexRuntime = {
 };
 
 export function createCodexWorkerHarness(runtime: CodexRuntime): CodexWorkerHarness {
-  if (runtime.version !== supportedVersion) {
-    throw new Error(`Unsupported Codex version ${runtime.version}; expected ${supportedVersion}.`);
-  }
+  assertSupportedCodexVersion(runtime.version);
   return new CodexAppServerHarness(runtime);
 }
 
@@ -64,9 +82,7 @@ export async function resolveCodexRuntime(): Promise<CodexRuntime> {
     "codex.exe",
   );
   const version = (await execText(executable, ["--version"])).trim();
-  if (version !== supportedVersion) {
-    throw new Error(`Unsupported Codex version ${version}; expected ${supportedVersion}.`);
-  }
+  assertSupportedCodexVersion(version);
   const help = await execText(executable, ["app-server", "--help"]);
   if (!/stdio/i.test(help)) throw new Error("Codex app-server stdio support is unavailable.");
   const loginStatus = await execMerged(executable, ["login", "status"]);
@@ -221,7 +237,8 @@ class CodexAppServerHarness implements CodexWorkerHarness {
           capabilities: { experimentalApi: true },
         }),
       );
-      if (typeof initialized.userAgent !== "string" || !initialized.userAgent.includes("0.147.0")) {
+      const versionNumber = assertSupportedCodexVersion(this.runtime.version);
+      if (typeof initialized.userAgent !== "string" || !initialized.userAgent.includes(versionNumber)) {
         throw new Error("Codex app-server returned an unproven protocol identity.");
       }
       transport.notify("initialized", {});
@@ -524,9 +541,7 @@ export async function proveCodexWorkspaceWriteIsolation(
   if (process.platform !== "win32") {
     throw new Error("Codex workspace-write isolation is supported on Windows only.");
   }
-  if (runtime.version !== supportedVersion) {
-    throw new Error(`Unsupported Codex version ${runtime.version}; expected ${supportedVersion}.`);
-  }
+  const versionNumber = assertSupportedCodexVersion(runtime.version);
   const transport = new JsonlTransport(runtime, authorizedWriteRoot);
   let isolationFailure: string | undefined;
   transport.onMessage = (message) => {
@@ -546,7 +561,7 @@ export async function proveCodexWorkspaceWriteIsolation(
         capabilities: { experimentalApi: true },
       }),
     );
-    if (typeof initialized.userAgent !== "string" || !initialized.userAgent.includes("0.147.0")) {
+    if (typeof initialized.userAgent !== "string" || !initialized.userAgent.includes(versionNumber)) {
       throw new Error("Codex app-server returned an unproven protocol identity.");
     }
     transport.notify("initialized", {});

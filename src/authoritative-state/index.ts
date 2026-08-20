@@ -1589,9 +1589,7 @@ export function openAuthoritativeState(
               assignment.coordination.repairOfReviewFindingIds?.length
                 ? "self-repair"
                 : "update",
-            target: assignment.targets.length === 1
-              ? assignment.targets[0]!
-              : "",
+            target: assignment.targetProjectPath,
             reversible: true,
             externallyBinding: false,
             incrementalSpendUsd: assignment.costBound.maximumIncrementalSpendUsd,

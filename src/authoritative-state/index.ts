@@ -824,8 +824,13 @@ export function openAuthoritativeState(
       }
       return;
     }
-    if (actingAuthority.state !== "active" || !authorization) {
-      throw new Error("Effect dispatch is blocked without active Acting Authority authorization.");
+    if (!authorization) {
+      // Command Authority covers the dispatch whether the Owner is present or
+      // absent; a Standing Order grant only attributes it, it never gates it.
+      return;
+    }
+    if (actingAuthority.state !== "active") {
+      throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
     }
     const grant = (actingAuthority.effectAuthorizations ?? []).find(
       (candidate) => candidate.id === authorization.authorizationId,

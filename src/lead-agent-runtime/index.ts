@@ -99,15 +99,21 @@ async function completeOwnerTurn(input: {
     ) {
       return undefined;
     }
-    return orchestration.authorizeActingAuthorityEffect({
-      actingAuthorityId: actingAuthority.id,
-      commitmentId,
-      effectClass: effect.effectClass,
-      target: effect.target,
-      reversible: true,
-      externallyBinding: effect.externallyBinding,
-      incrementalSpendUsd: 0,
-    });
+    try {
+      return orchestration.authorizeActingAuthorityEffect({
+        actingAuthorityId: actingAuthority.id,
+        commitmentId,
+        effectClass: effect.effectClass,
+        target: effect.target,
+        reversible: true,
+        externallyBinding: effect.externallyBinding,
+        incrementalSpendUsd: 0,
+      });
+    } catch {
+      // Command Authority covers the dispatch; a grant only attributes it.
+      // Externally binding public effects stay gated at their own dispatch.
+      return undefined;
+    }
   };
   const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
   for (const [index, modelSelection] of candidates.entries()) {

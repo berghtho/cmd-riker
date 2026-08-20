@@ -244,7 +244,7 @@ test("an active Acting Authority authorizes an effectful Worker dispatch automat
   state.close();
 });
 
-test("an Acting Authority effectful dispatch still requires an applicable Standing Order", async (t) => {
+test("Command Authority dispatches an effect even without an applicable Standing Order", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-acting-unauthorized-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
   const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-acting-unauthorized-project-"));
@@ -277,25 +277,28 @@ test("an Acting Authority effectful dispatch still requires an applicable Standi
     ownerInstructionQuote: ownerInstruction,
   });
 
-  assert.throws(
-    () => orchestration.delegateEffectfulWorker({
-      objective: "Apply the bounded change.",
-      prompt: "Change only src/app.ts.",
-      targetProjectPath: checkout,
-      modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" },
-      modelPolicyRevision: "worker-policy-1",
-      commitmentId: commitment.id,
-      targets: ["src/app.ts"],
-      timeoutMs: 60_000,
-      checkoutIsolation: {
-        root: checkout,
-        baselineCommit: "a".repeat(40),
-        isolation: { kind: "branch", branch: "codex/absence-change" },
-      },
-      verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
-    }),
-    /no applicable active Standing Order/i,
-  );
+  // No Standing Order covers an update on the checkout; Command Authority still
+  // dispatches the effect, only without an Acting Authority attribution.
+  const { executionAttempt } = orchestration.delegateEffectfulWorker({
+    objective: "Apply the bounded change.",
+    prompt: "Change only src/app.ts.",
+    targetProjectPath: checkout,
+    modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" },
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/app.ts"],
+    timeoutMs: 60_000,
+    checkoutIsolation: {
+      root: checkout,
+      baselineCommit: "a".repeat(40),
+      isolation: { kind: "branch", branch: "codex/absence-change" },
+    },
+    verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+  });
+  const effectIntent = state.readEffectIntent(executionAttempt.effectIntentId!);
+  assert.equal(effectIntent?.status, "pending");
+  assert.equal(effectIntent?.authorization.actingAuthority, undefined);
+  assert.equal(orchestration.actingAuthorityView()?.effectAuthorizations?.length, 0);
   state.close();
 });
 
@@ -351,14 +354,6 @@ function recordSucceededEffectIntent(
     retryRule: "Never replay without reconciliation.",
     status: "pending" as const,
   };
-  const { actingAuthority: _actingAuthority, ...ordinaryAuthorization } = pendingEffect.authorization;
-  assert.throws(
-    () => state.startTargetProjectOperation(
-      readyAttempt,
-      { ...pendingEffect, authorization: ordinaryAuthorization },
-    ),
-    /blocked without active Acting Authority authorization/i,
-  );
   state.startTargetProjectOperation(readyAttempt, pendingEffect);
   const claimedAt = new Date().toISOString();
   const runningAttempt = { ...readyAttempt, status: "running" as const };

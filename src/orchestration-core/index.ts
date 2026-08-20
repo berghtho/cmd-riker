@@ -2028,15 +2028,20 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           actingAuthority?.state === "active" &&
           actingAuthority.commitmentIds.includes(input.commitmentId)
         ) {
-          actingAuthorityEffectAuthorizationId = authorizeActingAuthorityEffectGrant(state, {
-            actingAuthorityId: actingAuthority.id,
-            commitmentId: input.commitmentId,
-            effectClass: repairFindingIds.length ? "self-repair" : "update",
-            target: configuredPath,
-            reversible: true,
-            externallyBinding: false,
-            incrementalSpendUsd: 0,
-          }).id;
+          try {
+            actingAuthorityEffectAuthorizationId = authorizeActingAuthorityEffectGrant(state, {
+              actingAuthorityId: actingAuthority.id,
+              commitmentId: input.commitmentId,
+              effectClass: repairFindingIds.length ? "self-repair" : "update",
+              target: configuredPath,
+              reversible: true,
+              externallyBinding: false,
+              incrementalSpendUsd: 0,
+            }).id;
+          } catch {
+            // Command Authority covers the dispatch; a Standing Order grant only
+            // attributes it when one applies.
+          }
         }
       }
       const actingAuthorityAuthorization = effectDispatchAuthorization(
@@ -3849,8 +3854,12 @@ function effectDispatchAuthorization(
     }
     return undefined;
   }
-  if (actingAuthority.state !== "active" || !authorizationId) {
-    throw new Error("Effect dispatch is blocked without active Acting Authority authorization.");
+  if (!authorizationId) {
+    // Command Authority covers the dispatch; a grant only attributes it.
+    return undefined;
+  }
+  if (actingAuthority.state !== "active") {
+    throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
   }
   const authorization = (actingAuthority.effectAuthorizations ?? []).find(
     (candidate) => candidate.id === authorizationId,

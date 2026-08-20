@@ -9,12 +9,40 @@ import test from "node:test";
 import {
   createWindowsSupervision,
   generateWindowsTaskXml,
+  hiddenScriptHostCommand,
   inspectWindowsTaskXml,
   type CommandResult,
   type CommandRunner,
   type WindowsSupervisionConfig,
   WindowsSupervisionError,
 } from "../src/windows-supervision/index.ts";
+
+test("wraps console supervision in a GUI script host without a terminal", () => {
+  const command = hiddenScriptHostCommand({
+    scriptPath: "C:\\Users\\owner\\AppData\\Local\\CMD Riker\\launcher\\supervise-hidden.vbs",
+    executable: "C:\\Program Files\\CMD Riker\\node.exe",
+    arguments: [
+      "C:\\Program Files\\CMD Riker\\lifecycle-cli.js",
+      "supervise",
+      "--install-root",
+      "C:\\Users\\owner\\AppData\\Local\\CMD Riker",
+    ],
+    windowsDirectory: "C:\\Windows",
+  });
+
+  assert.equal(
+    command.executable,
+    "C:\\Windows\\System32\\wscript.exe",
+  );
+  assert.equal(
+    command.arguments,
+    '//B //NoLogo "C:\\Users\\owner\\AppData\\Local\\CMD Riker\\launcher\\supervise-hidden.vbs"',
+  );
+  assert.match(command.script, /CreateObject\("WScript\.Shell"\)/);
+  assert.match(command.script, /shell\.Run\(.+, 0, True\)/);
+  assert.match(command.script, /""C:\\Program Files\\CMD Riker\\node\.exe""/);
+  assert.match(command.script, /""C:\\Users\\owner\\AppData\\Local\\CMD Riker""/);
+});
 
 const config: WindowsSupervisionConfig = {
   taskName: "\\CMD Riker\\Recovery Actor",

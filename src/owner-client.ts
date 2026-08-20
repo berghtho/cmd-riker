@@ -4,13 +4,12 @@ import {
   connectLocalLeadHost,
   localLeadHostAddress,
   type LeadHostTranscriptEntry,
-  type LocalLeadHostClient,
 } from "./local-host/index.ts";
 import {
   runPiOwnerInterface,
-  type PiOwnerResponse,
   type PiOwnerTranscriptEntry,
 } from "./pi-owner-interface.ts";
+import { completeHostedOwnerInput } from "./owner-host-bridge.ts";
 
 const installRoot = requiredArgument("--install-root");
 
@@ -35,49 +34,6 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
     });
   } finally {
     await client.detach();
-  }
-}
-
-async function completeHostedOwnerInput(
-  client: LocalLeadHostClient,
-  ownerInput: string,
-): Promise<PiOwnerResponse> {
-  const completion = Promise.withResolvers<PiOwnerResponse>();
-  const responseLines: string[] = [];
-  let source: PiOwnerResponse["source"] = "Lead Agent";
-  const unsubscribeTranscript = client.onTranscriptEntry((entry) => {
-    if (entry.source !== "lead" || entry.stream !== "stdout") return;
-    if (/^Lead available\s+\|/.test(entry.line)) {
-      completion.resolve({ source, content: responseLines.join("\n").trim() });
-      return;
-    }
-    if (entry.line.startsWith("Lead Agent: ")) {
-      source = "Lead Agent";
-      responseLines.push(entry.line.slice("Lead Agent: ".length));
-      return;
-    }
-    if (entry.line.startsWith("Session View: ")) {
-      source = "Session View";
-      responseLines.push(entry.line.slice("Session View: ".length));
-      return;
-    }
-    if (!entry.line.startsWith("CMD_RIKER_") && responseLines.length > 0) {
-      responseLines.push(entry.line);
-    }
-  });
-  const unsubscribeExit = client.onExit((exit) => {
-    completion.reject(new Error(`The Lead Agent stopped unexpectedly (${exit.kind}).`));
-  });
-  const timeout = setTimeout(() => {
-    completion.reject(new Error("The Lead Agent did not finish the Owner turn within ten minutes."));
-  }, 10 * 60_000);
-  try {
-    await client.sendOwnerLine(ownerInput);
-    return await completion.promise;
-  } finally {
-    clearTimeout(timeout);
-    unsubscribeExit();
-    unsubscribeTranscript();
   }
 }
 

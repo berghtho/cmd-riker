@@ -60,15 +60,49 @@ $install = "$env:LOCALAPPDATA\CMD Riker"
   --config C:\path\to\config.json
 ```
 
-The registered Task Scheduler entry is per-user, on-demand, singleton, and has a bounded Recovery
-Actor restart policy. Running `riker.cmd` opens Pi as the single visible Owner interface and
-reconnects it to the same supervised Lead Agent. `stop` durably prevents new effects before
-supervision ends.
+### What the installation changes
+
+The installation is deliberately per-user and contained under `%LOCALAPPDATA%\CMD Riker`:
+
+- `launcher\riker.cmd` is the Owner-facing command. It opens Pi in the current terminal.
+- `launcher\supervise-hidden.vbs` starts the Recovery Actor without creating a console window.
+- `versions\` contains immutable Lead Agent releases, including their pinned Node runtime and Pi
+  dependencies.
+- `protected\recovery-actor\` contains the separately versioned Recovery Actor and its pinned Node
+  runtime.
+- `state\` contains the authoritative SQLite state.
+- `recovery\` contains activation journals, snapshots, and failed-candidate evidence.
+
+Installation also registers the per-user Windows Task Scheduler entry
+`\CMD Riker\Recovery Actor`. It has no boot or logon trigger and does not run until CMD Riker is
+started. It is an on-demand singleton with four one-minute restart attempts. Its GUI script-host
+wrapper remains invisible while the Recovery Actor supervises the Lead Agent. It is not a Windows
+service, does not run as `SYSTEM`, and does not require administrator privileges.
+
+The visible process chain is the current terminal, `riker.cmd`, and Pi. The background process chain
+is Windows Task Scheduler, `wscript.exe`, the Recovery Actor, and the hosted Lead Agent. The
+supervision layer does not hold provider credentials. Pi or a delegated native harness may access
+configured model providers and forges; their credentials remain in the provider-owned CLI or Pi
+credential store and are not copied into CMD Riker's SQLite state.
+
+To make the command available as `riker`, explicitly add its launcher directory to the current
+user's `PATH`, then open a new terminal:
 
 ```powershell
-& "$install\launcher\riker.cmd"
-& "$install\launcher\riker.cmd" inspect
-& "$install\launcher\riker.cmd" stop
+$launcher = "$env:LOCALAPPDATA\CMD Riker\launcher"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath -split ";") -notcontains $launcher) {
+  [Environment]::SetEnvironmentVariable("Path", "$userPath;$launcher", "User")
+}
+```
+
+Running `riker` opens Pi as the single visible Owner interface and reconnects it to the same
+supervised Lead Agent. `stop` durably prevents new effects before supervision ends.
+
+```powershell
+riker
+riker inspect
+riker stop
 ```
 
 Upgrade from another trusted local Lead Agent bundle. Compatibility and independent Review evidence
@@ -87,9 +121,10 @@ identity before cutover. A failed or interrupted candidate restores the immediat
 baseline under a fresh generation; stale writers are fenced on every Authoritative State transaction.
 Successful activation does not automatically promote the Recovery Baseline.
 
-Uninstall reaches a safe stop, unregisters supervision, and removes binaries and launcher material.
-It preserves Authoritative State, journals, snapshots, failed-state evidence, and unresolved attempts.
-Destructive state removal is a separate Owner action.
+Uninstall reaches a safe stop, unregisters `\CMD Riker\Recovery Actor`, and removes binaries and
+launcher material. It preserves Authoritative State, journals, snapshots, failed-state evidence,
+and unresolved attempts. Destructive state removal and removing the launcher directory from the
+user `PATH` are separate explicit Owner actions.
 
 ```powershell
 & "$install\launcher\riker.cmd" uninstall

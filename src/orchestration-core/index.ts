@@ -161,6 +161,10 @@ export type Commitment = {
         ownerTurnId: string;
         acceptedAt: string;
       };
+  outcomeAccount?: {
+    content: string;
+    deliveredAt?: string;
+  };
   review?: {
     required: true;
     reasons: ReviewReason[];
@@ -2048,7 +2052,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
             review: { ...commitment.review, status: "changes-requested", findings },
           }
         : commitment.verification?.passed
-          ? {
+          ? withOutcomeAccount({
               ...unblocked,
               state: "accepted",
               review: { ...commitment.review, status: "passed", findings },
@@ -2057,7 +2061,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
                 basis: "objective-criteria",
                 acceptedAt: decidedAt,
               },
-            }
+            })
           : {
               ...unblocked,
               state: "active",
@@ -2738,7 +2742,10 @@ function observeLeadResponse(
     (commitment) =>
       commitment.activeOwnerTurnId === ownerTurnId &&
       commitment.state === "active" &&
-      !commitment.condition,
+      !commitment.condition &&
+      commitment.criteria.every(
+        (criterion) => criterion.kind === "response-includes" || criterion.kind === "owner-judgment",
+      ),
   );
   for (const commitment of commitments) {
     const { condition: _condition, ...unconditioned } = commitment;
@@ -2906,7 +2913,7 @@ function buildTargetProjectOperationVerification(
           verification,
           review,
         }
-      : {
+      : withOutcomeAccount({
         ...verifying,
         state: "accepted",
         verification,
@@ -2915,7 +2922,7 @@ function buildTargetProjectOperationVerification(
           basis: "objective-criteria",
           acceptedAt: new Date().toISOString(),
         },
-        }
+        })
     : {
         ...verifying,
         state: "active",
@@ -2995,7 +3002,7 @@ function recordForgeOperationVerification(
     })),
   };
   const settled: Commitment = passed
-    ? {
+    ? withOutcomeAccount({
         ...verifying,
         state: "accepted",
         verification,
@@ -3004,7 +3011,7 @@ function recordForgeOperationVerification(
           basis: "objective-criteria",
           acceptedAt: new Date().toISOString(),
         },
-      }
+      })
     : {
         ...verifying,
         state: "active",
@@ -3028,6 +3035,30 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
+}
+
+function withOutcomeAccount(commitment: Commitment): Commitment {
+  const operationEvidence = commitment.verification?.evidence.find(
+    (evidence) =>
+      evidence.operationAttemptId &&
+      (evidence.source === "target-project-operation-result" ||
+        evidence.source === "forge-operation-result"),
+  );
+  if (commitment.acceptance?.authority !== "lead-agent" || !operationEvidence?.operationAttemptId) {
+    return commitment;
+  }
+  const source = operationEvidence.source === "target-project-operation-result"
+    ? "the declared Target Project operation"
+    : "the attributed Forge operation";
+  return {
+    ...commitment,
+    outcomeAccount: {
+      content:
+        `Commitment ${commitment.id} accepted by Lead Agent: ${commitment.outcome} ` +
+        `Verification attempt ${operationEvidence.operationAttemptId} passed via ${source}. ` +
+        "Residual uncertainty: none.",
+    },
+  };
 }
 
 function normalizedAuthorizedWriteRoot(path: string): string {

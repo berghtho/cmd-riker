@@ -201,10 +201,13 @@ export interface AuthoritativeState {
       selectionReason?: "fallback-after-ineligible-candidate";
     },
   ): void;
-  appendLeadAgentMessageWithSelfRepairAccounts(
+  appendLeadAgentMessageWithAccounts(
     turnId: string,
     content: string,
-    selfRepairs: SelfRepairRecord[],
+    accounts: {
+      selfRepairs: SelfRepairRecord[];
+      commitments: Commitment[];
+    },
     attribution?: {
       modelSelection: ModelSelection;
       modelPolicyRevision: string;
@@ -1309,7 +1312,7 @@ export function openAuthoritativeState(
       );
     },
 
-    appendLeadAgentMessageWithSelfRepairAccounts(turnId, content, selfRepairs, attribution) {
+    appendLeadAgentMessageWithAccounts(turnId, content, accounts, attribution) {
       const ownerTurn = database
         .prepare(`
           SELECT value_json
@@ -1364,7 +1367,7 @@ export function openAuthoritativeState(
             VALUES (?, 'owner-conversation.lead-agent-message-recorded', ?, ?)
           `)
           .run(randomUUID(), responseFactId, recordedAt);
-        for (const repair of selfRepairs) {
+        for (const repair of accounts.selfRepairs) {
           const current = readCurrentSnapshot<SelfRepairRecord>(
             "self-repair.snapshot",
             `self-repair:${repair.id}`,
@@ -1393,6 +1396,42 @@ export function openAuthoritativeState(
               VALUES (?, ?, ?, ?)
             `)
             .run(randomUUID(), `self-repair.${status}`, repairFactId, recordedAt);
+        }
+        for (const commitment of accounts.commitments) {
+          const current = readCommitmentRow(commitment.id);
+          const deliveredAt = commitment.outcomeAccount?.deliveredAt;
+          if (
+            !current?.value.outcomeAccount ||
+            current.value.outcomeAccount.deliveredAt ||
+            !deliveredAt ||
+            !Number.isFinite(Date.parse(deliveredAt)) ||
+            JSON.stringify(commitment) !== JSON.stringify({
+              ...current.value,
+              outcomeAccount: { ...current.value.outcomeAccount, deliveredAt },
+            })
+          ) {
+            throw new Error("Commitment outcome delivery requires the current pending account.");
+          }
+          const commitmentFactId = randomUUID();
+          database
+            .prepare(`
+              INSERT INTO facts (
+                id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+              ) VALUES (?, ?, 'commitment.snapshot', ?, ?, ?)
+            `)
+            .run(
+              commitmentFactId,
+              `commitment:${commitment.id}`,
+              JSON.stringify(commitment),
+              current.id,
+              recordedAt,
+            );
+          database
+            .prepare(`
+              INSERT INTO transitions (id, kind, fact_id, recorded_at)
+              VALUES (?, 'commitment.accepted', ?, ?)
+            `)
+            .run(randomUUID(), commitmentFactId, recordedAt);
         }
         database.exec("COMMIT");
       } catch (error) {

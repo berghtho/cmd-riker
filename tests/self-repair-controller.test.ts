@@ -227,10 +227,10 @@ test("failed Self-repair rolls back before a changed hypothesis activates a revi
     })),
   };
   const account = activated.attempts.map((attempt) => attempt.activation?.account).join("\n");
-  state.appendLeadAgentMessageWithSelfRepairAccounts(
+  state.appendLeadAgentMessageWithAccounts(
     reportTurnId,
     account,
-    [deliveredRepair],
+    { selfRepairs: [deliveredRepair], commitments: [] },
   );
   assert.match(state.leadAgentResponse(reportTurnId) ?? "", /rolled back before another attempt/);
   assert.match(state.leadAgentResponse(reportTurnId) ?? "", /Recovery Baseline promotion remains a later decision/);

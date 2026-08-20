@@ -10,9 +10,13 @@
     "typecheck": "tsc --noEmit",
     "test:focused": "node --test",
     "test": "node --test tests/*.test.ts",
-    "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/cli.js",
-    "live-smoke": "node dist/live-smoke.js"
+    "build:lead": "tsc -p tsconfig.build.json",
+    "build:recovery-actor": "tsc -p tsconfig.recovery-actor.json",
+    "build": "npm run build:lead && npm run build:recovery-actor",
+    "build:local-release": "node scripts/build-local-release.mjs",
+    "start": "node dist/lead-agent/cli.js",
+    "lifecycle": "node src/lifecycle-cli.ts",
+    "live-smoke": "node dist/lead-agent/live-smoke.js"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",

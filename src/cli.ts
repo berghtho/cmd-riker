@@ -16,6 +16,7 @@ import {
   openAuthoritativeStateSafely,
   reconcilePostBackupEffect,
   restoreAuthoritativeStateBackup,
+  StaleWriteGenerationError,
   type AuthoritativeState,
   type OwnerConfiguration,
   type PostBackupEffectInventory,
@@ -150,7 +151,14 @@ async function main(): Promise<void> {
     }
   }
 
-  const openedState = openAuthoritativeStateSafely(stateDirectory);
+  const writeGenerationArgument = argumentValue("--write-generation");
+  const writeGeneration = writeGenerationArgument === undefined
+    ? undefined
+    : positiveIntegerArgument("--write-generation", writeGenerationArgument);
+  const openedState = openAuthoritativeStateSafely(
+    stateDirectory,
+    writeGeneration === undefined ? {} : { writeGeneration },
+  );
   if (openedState.kind === "recovery-required") {
     throw new HostDiagnostic(
       "CMD_RIKER_STATE_RECOVERY_REQUIRED",
@@ -179,6 +187,7 @@ async function main(): Promise<void> {
   }
   const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
   try {
+    const activationProvisional = process.argv.includes("--activation-provisional");
     let policyValidated = false;
     let conversation = state.readOwnerConversation();
     const configuration = await readStartupConfiguration(stateDirectory, !conversation);
@@ -204,9 +213,12 @@ async function main(): Promise<void> {
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
     createOrchestrationCore(state).reconcileInterruptedCommitments();
-    if (!policyValidated) await validatePolicy(adapter, conversation);
+    if (!policyValidated && !activationProvisional) {
+      await validatePolicy(adapter, conversation);
+    }
     const workerSupervisor = await availableWorkerSupervisor(state, conversation);
     if (workerSupervisor) await workerSupervisor.recover();
+    emitActivationReady();
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
       await runInteractiveConversation(
@@ -239,12 +251,23 @@ async function runScriptableConversation(
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInput of lines) {
     if (!ownerInput.trim()) continue;
+    const hosted = process.argv.includes("--hosted");
+    let ownerTurnRecorded = false;
     const output = await completeOwnerInteraction(
       state,
       adapter,
       ownerInput,
       workerSupervisor,
+      hosted
+        ? (turnId) => {
+            ownerTurnRecorded = true;
+            process.stdout.write(`CMD_RIKER_OWNER_RECORDED:${turnId}\n`);
+          }
+        : undefined,
     );
+    if (hosted && !ownerTurnRecorded) {
+      process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
+    }
     process.stdout.write(`${output.source}: ${output.content}\n`);
     process.stdout.write(`${currentSessionView(state, workerSupervisor)}\n`);
   }
@@ -344,11 +367,18 @@ async function completeOwnerInteraction(
   adapter: PiTurnAdapter,
   ownerInput: string,
   workerSupervisor?: WorkerSupervisor,
+  onOwnerTurnRecorded?: (turnId: string) => void,
 ): Promise<OwnerInteractionOutput> {
   if (!/^\/session\s+/i.test(ownerInput)) {
     return {
       source: "Lead Agent",
-      content: await completeOwnerTurn(state, adapter, ownerInput, workerSupervisor),
+      content: await completeOwnerTurn(
+        state,
+        adapter,
+        ownerInput,
+        workerSupervisor,
+        onOwnerTurnRecorded,
+      ),
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisor);
@@ -386,6 +416,7 @@ async function completeOwnerInteraction(
     };
   }
   const ownerTurnId = state.appendOwnerMessage(ownerInput);
+  onOwnerTurnRecorded?.(ownerTurnId);
   if (action.kind === "pause") {
     createOrchestrationCore(state).pauseCommitment(
       action.targetId,
@@ -435,11 +466,13 @@ async function completeOwnerTurn(
   adapter: PiTurnAdapter,
   ownerInput: string,
   workerSupervisor?: WorkerSupervisor,
+  onOwnerTurnRecorded?: (turnId: string) => void,
 ): Promise<string> {
   const conversation = state.readOwnerConversation();
   if (!conversation) throw new Error("Authoritative state is not configured.");
   const orchestration = createOrchestrationCore(state);
   const turnId = state.appendOwnerMessage(ownerInput);
+  onOwnerTurnRecorded?.(turnId);
   const commitmentsBefore = new Map(
     state
       .readCommitments()
@@ -803,6 +836,35 @@ function argumentValue(name: string): string | undefined {
   return index >= 0 ? process.argv[index + 1] : undefined;
 }
 
+function positiveIntegerArgument(name: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new HostDiagnostic("CMD_RIKER_ARGUMENT_INVALID", `${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function requiredArgument(name: string): string {
+  const value = argumentValue(name);
+  if (!value) {
+    throw new HostDiagnostic("CMD_RIKER_ARGUMENT_INVALID", `${name} is required.`);
+  }
+  return value;
+}
+
+function emitActivationReady(): void {
+  const nonce = argumentValue("--activation-handshake-nonce");
+  if (!nonce) return;
+  process.stdout.write(`${JSON.stringify({
+    type: "CMD_RIKER_ACTIVATION_READY",
+    attemptId: requiredArgument("--activation-attempt-id"),
+    candidateRevision: requiredArgument("--candidate-revision"),
+    artifactDigest: requiredArgument("--artifact-digest"),
+    handshakeNonce: nonce,
+    pid: process.pid,
+  })}\n`);
+}
+
 class HostDiagnostic extends Error {
   readonly code: string;
 
@@ -1074,6 +1136,11 @@ try {
 } catch (error) {
   if (error instanceof HostDiagnostic) {
     process.stderr.write(`${error.code}: ${error.message}\n`);
+  } else if (error instanceof StaleWriteGenerationError) {
+    const activeGeneration = /active generation is (\d+)/.exec(error.message)?.[1] ?? "unknown";
+    process.stderr.write(
+      `CMD_RIKER_STALE_GENERATION: This Lead Agent process is fenced from Authoritative State generation ${activeGeneration}.\n`,
+    );
   } else {
     process.stderr.write("CMD_RIKER_HOST_FAILURE: The local host could not continue.\n");
   }

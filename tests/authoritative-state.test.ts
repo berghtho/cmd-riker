@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
+import { advanceWriteGeneration } from "../src/write-generation.ts";
 import {
   createOrchestrationCore,
   defaultLeadModelRequirements,
@@ -59,6 +60,70 @@ test("canonical Owner conversation and configuration survive close and reopen in
     ],
   });
   state.close();
+});
+
+test("generation transfer fences every stale Authoritative State writer", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-generation-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const configuration = {
+    targetProject: { path: "C:\\target-project" },
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions" as const,
+      baseUrl: "http://127.0.0.1:11434/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  };
+  const stale = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  stale.initialize(configuration);
+  const concurrentStale = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+
+  assert.equal(advanceWriteGeneration(stateDirectory, 1), 2);
+  assert.throws(
+    () => stale.appendOwnerMessage("This stale process must not commit."),
+    /write generation 1 is stale; active generation is 2/,
+  );
+  assert.throws(
+    () => concurrentStale.replaceOwnerConfiguration({
+      ...configuration,
+      modelPolicyRevision: "stale-policy",
+    }),
+    /write generation 1 is stale; active generation is 2/,
+  );
+  await assert.rejects(
+    stale.createBackup(join(stateDirectory, "stale-backup.sqlite")),
+    /write generation 1 is stale; active generation is 2/,
+  );
+  stale.close();
+  concurrentStale.close();
+
+  const active = openAuthoritativeState(stateDirectory, { writeGeneration: 2 });
+  assert.deepEqual(active.lifecycleStatus(), {
+    schemaRevision: 1,
+    writeGeneration: 2,
+    journalMode: "wal",
+    integrity: "passed",
+  });
+  assert.equal(active.readOwnerConversation()?.messages.length, 0);
+  active.appendOwnerMessage("The active generation can commit.");
+  const backup = await active.createBackup(join(stateDirectory, "generation-2-backup.sqlite"));
+  assert.equal(backup.writeGeneration, 2);
+  const backupDatabase = new DatabaseSync(backup.databasePath, { readOnly: true });
+  const backupLifecycle = backupDatabase
+    .prepare("SELECT write_generation FROM lifecycle_metadata WHERE singleton = 1")
+    .get() as { write_generation: number };
+  assert.equal(backupLifecycle.write_generation, 2);
+  backupDatabase.close();
+  active.close();
+
+  assert.throws(
+    () => advanceWriteGeneration(stateDirectory, 1),
+    /expected write generation 1; found 2/,
+  );
+  const reopened = openAuthoritativeState(stateDirectory, { writeGeneration: 2 });
+  assert.equal(reopened.readOwnerConversation()?.messages.length, 1);
+  reopened.close();
 });
 
 test("a validated Lead Model policy activates atomically and preserves its ordered fallbacks", async (t) => {

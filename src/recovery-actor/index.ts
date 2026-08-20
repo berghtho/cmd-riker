@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export type RecoveryActorIdentity = {
@@ -30,6 +30,30 @@ export type HealthAssessment = {
   observedAt: string;
   evidence: string[];
 };
+
+export type RecoveryPolicyIdentity = { revision: string; digest: string };
+
+export const protectedRecoveryPolicyIdentity: RecoveryPolicyIdentity = Object.freeze({
+  revision: "recovery-policy-v1",
+  digest: createHash("sha256")
+    .update("fixed-health-v1|single-cutover-v1|rollback-before-retry-v1|no-baseline-promotion-v1")
+    .digest("hex"),
+});
+
+export type ActivationAuthority =
+  | { kind: "owner-supplied-upgrade"; authorizedAt: string }
+  | {
+      kind: "lead-agent-self-repair";
+      selfRepairId: string;
+      selfRepairAttemptId: string;
+      commitmentId: string;
+      recoveryActorRevision: string;
+      recoveryActorDigest: string;
+      recoveryActorPath: string;
+      recoveryPolicyRevision: string;
+      recoveryPolicyDigest: string;
+      authorizedAt: string;
+    };
 
 export const requiredActivationHealthCriteria = [
   "exact-identity",
@@ -62,7 +86,7 @@ export type ActivationAttempt = {
   baseline: CodeStatePair;
   writeGeneration: number;
   phase: ActivationPhase;
-  authority: { kind: "owner-supplied-upgrade"; authorizedAt: string };
+  authority: ActivationAuthority;
   compatibility: { stateSchema: "lossless-return-proven"; evidence: string };
   verification: { verdict: "passed"; evidence: string[] };
   review: { verdict: "passed"; evidence: string[] };
@@ -149,6 +173,7 @@ export interface RecoveryActor {
     currentAttempt?: ActivationAttempt;
     leadRestartBudget?: Installation["leadRestartBudget"];
   };
+  inspectSelfRepairAttempt(selfRepairId: string, selfRepairAttemptId: string): ActivationAttempt | undefined;
   close(): void;
 }
 
@@ -298,6 +323,16 @@ export function openRecoveryActor(
         throw new Error("The active Recovery Actor identity does not match its protected journal.");
       }
       validateActivationInput(input, actorIdentity);
+      if (
+        input.authority.kind === "lead-agent-self-repair" &&
+        (!input.baseline ||
+          !sameCode(input.baseline.code, installation.recoveryBaseline.code) ||
+          JSON.stringify(input.baseline.state) !== JSON.stringify(input.candidate.state))
+      ) {
+        throw new Error(
+          "Self-repair requires protected Recovery Baseline code with the fresh candidate state snapshot.",
+        );
+      }
       await effects.verifyCandidate(input.candidate, actorIdentity);
       const recoveryBaselineHealth = await effects.verifyRecoveryBaseline(
         input.baseline ?? installation.active,
@@ -367,6 +402,9 @@ export function openRecoveryActor(
         });
         if (probation.verdict !== "healthy") {
           throw new Error(`Candidate probation health is ${probation.verdict}.`);
+        }
+        if (Date.parse(attempt.budget.deadline) <= Date.now()) {
+          throw new Error("Candidate probation exceeded its fixed activation deadline.");
         }
         attempt = transition(
           attempt,
@@ -591,6 +629,21 @@ export function openRecoveryActor(
       };
     },
 
+    inspectSelfRepairAttempt(selfRepairId, selfRepairAttemptId) {
+      const row = database
+        .prepare(`
+          SELECT value_json
+            FROM activation_attempts
+           WHERE json_extract(value_json, '$.authority.kind') = 'lead-agent-self-repair'
+             AND json_extract(value_json, '$.authority.selfRepairId') = ?
+             AND json_extract(value_json, '$.authority.selfRepairAttemptId') = ?
+           ORDER BY updated_at DESC
+           LIMIT 1
+        `)
+        .get(selfRepairId, selfRepairAttemptId) as { value_json: string } | undefined;
+      return row ? JSON.parse(row.value_json) as ActivationAttempt : undefined;
+    },
+
     close() {
       database.close();
     },
@@ -631,14 +684,30 @@ function validateActivationInput(
 ): void {
   validatePair(input.candidate);
   if (input.baseline) validatePair(input.baseline);
-  if (resolve(input.candidate.code.path) === resolve(actor.path)) {
+  if (pathsOverlap(input.candidate.code.path, actor.path)) {
     throw new Error("A Lead Agent candidate cannot replace the protected Recovery Actor.");
+  }
+  if (
+    input.authority.kind === "lead-agent-self-repair" &&
+    (!input.authority.selfRepairId.trim() ||
+      !input.authority.selfRepairAttemptId.trim() ||
+      !input.authority.commitmentId.trim() ||
+      input.authority.recoveryActorRevision !== actor.revision ||
+      input.authority.recoveryActorDigest !== actor.digest ||
+      !samePath(input.authority.recoveryActorPath, actor.path) ||
+      input.authority.recoveryPolicyRevision !== protectedRecoveryPolicyIdentity.revision ||
+      input.authority.recoveryPolicyDigest !== protectedRecoveryPolicyIdentity.digest)
+  ) {
+    throw new Error("Self-repair activation requires exact repair, Recovery Actor, and protected policy identity.");
   }
   const criteria = new Set(input.healthCriteria);
   if (
     criteria.size !== requiredActivationHealthCriteria.length ||
     requiredActivationHealthCriteria.some((criterion) => !criteria.has(criterion)) ||
-    input.budget.probationChecks < 1
+    !Number.isSafeInteger(input.budget.probationChecks) ||
+    input.budget.probationChecks < 1 ||
+    !Number.isFinite(Date.parse(input.budget.deadline)) ||
+    Date.parse(input.budget.deadline) <= Date.now()
   ) {
     throw new Error("Activation requires fixed health criteria and a bounded probation budget.");
   }
@@ -669,5 +738,25 @@ function isDigest(value: string): boolean {
 }
 
 function sameActor(left: RecoveryActorIdentity, right: RecoveryActorIdentity): boolean {
-  return left.revision === right.revision && left.digest === right.digest && resolve(left.path) === resolve(right.path);
+  return left.revision === right.revision && left.digest === right.digest && samePath(left.path, right.path);
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return samePath(left, right) || isWithin(left, right) || isWithin(right, left);
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const path = relative(resolve(root), resolve(candidate));
+  return path !== "" && path !== ".." && !path.startsWith("../") && !path.startsWith("..\\") && !isAbsolute(path);
+}
+
+function sameCode(left: CodeStatePair["code"], right: CodeStatePair["code"]): boolean {
+  return left.revision === right.revision &&
+    left.digest === right.digest &&
+    samePath(left.path, right.path) &&
+    JSON.stringify(left.runtime) === JSON.stringify(right.runtime);
 }

@@ -36,6 +36,7 @@ import {
   assertEffectEvidenceSupportsDisposition,
   assertExternalEffectEvidence,
 } from "../target-project-operations/index.ts";
+import type { SelfRepairRecord } from "../self-repair-controller/index.ts";
 import type {
   ForgeOperationAttempt,
   ForgeOwnerActionNotice,
@@ -61,6 +62,7 @@ import {
 export { StaleWriteGenerationError };
 
 export type { ModelSelection } from "../model-selection.ts";
+export type { SelfRepairRecord } from "../self-repair-controller/index.ts";
 export type {
   ActingAuthority,
   ActingAuthorityEffectRequest,
@@ -199,6 +201,16 @@ export interface AuthoritativeState {
       selectionReason?: "fallback-after-ineligible-candidate";
     },
   ): void;
+  appendLeadAgentMessageWithSelfRepairAccounts(
+    turnId: string,
+    content: string,
+    selfRepairs: SelfRepairRecord[],
+    attribution?: {
+      modelSelection: ModelSelection;
+      modelPolicyRevision: string;
+      selectionReason?: "fallback-after-ineligible-candidate";
+    },
+  ): void;
   ownerTurnSequence(turnId: string): number | undefined;
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
@@ -238,6 +250,9 @@ export interface AuthoritativeState {
   readActingAuthority(actingAuthorityId: string): ActingAuthority | undefined;
   readActingAuthorities(): ActingAuthority[];
   appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
+  appendSelfRepairSnapshots(snapshots: SelfRepairRecord[]): void;
+  readSelfRepair(selfRepairId: string): SelfRepairRecord | undefined;
+  readSelfRepairs(): SelfRepairRecord[];
   appendCoordinationMessage(message: CoordinationMessage): void;
   readCoordinationMessages(): CoordinationMessage[];
   appendForgeOperationAttemptSnapshots(snapshots: ForgeOperationAttempt[]): void;
@@ -312,6 +327,7 @@ type FactDraft =
   | { kind: "capability-notice.snapshot"; value: CapabilityNotice }
   | { kind: "standing-order.snapshot"; value: StandingOrder }
   | { kind: "acting-authority.snapshot"; value: ActingAuthority }
+  | { kind: "self-repair.snapshot"; value: SelfRepairRecord }
   | { kind: "coordination-message.recorded"; value: CoordinationMessage }
   | { kind: "forge-operation-attempt.snapshot"; value: ForgeOperationAttempt }
   | { kind: "forge-owner-action-notice.snapshot"; value: ForgeOwnerActionNotice }
@@ -339,6 +355,7 @@ type TransitionKind =
   | `capability-notice.${CapabilityNotice["state"]}`
   | `standing-order.${StandingOrder["state"]}`
   | `acting-authority.${ActingAuthority["state"]}`
+  | `self-repair.${SelfRepairRecord["attempts"][number]["status"]}`
   | "coordination-message.recorded"
   | `forge-operation-attempt.${ForgeOperationAttempt["status"]}`
   | `forge-owner-action-notice.${ForgeOwnerActionNotice["state"]}`
@@ -597,6 +614,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
       | "effect-intent.snapshot",
@@ -624,6 +642,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
   ): T[] => {
@@ -648,6 +667,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
       | "effect-intent.snapshot";
@@ -657,6 +677,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
       | "effect-intent";
@@ -666,6 +687,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
       | "effect-intent";
@@ -728,6 +750,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "acting-authority.snapshot"
+      | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
     subjectPrefix:
@@ -736,6 +759,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
     transitionPrefix:
@@ -744,6 +768,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "acting-authority"
+      | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
     snapshots: T[],
@@ -1284,6 +1309,98 @@ export function openAuthoritativeState(
       );
     },
 
+    appendLeadAgentMessageWithSelfRepairAccounts(turnId, content, selfRepairs, attribution) {
+      const ownerTurn = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'owner-conversation.owner-message'
+             AND json_extract(value_json, '$.turnId') = ?
+           LIMIT 1
+        `)
+        .get(turnId) as { value_json: string } | undefined;
+      if (!ownerTurn) throw new Error(`Unknown Lead turn ${turnId}.`);
+      const originalAttribution = JSON.parse(ownerTurn.value_json) as {
+        modelSelection: ModelSelection;
+        modelPolicyRevision: string;
+      };
+      beginWrite();
+      try {
+        const existingResponse = database
+          .prepare(`
+            SELECT 1
+              FROM facts
+             WHERE kind = 'owner-conversation.lead-agent-message'
+               AND json_extract(value_json, '$.turnId') = ?
+             LIMIT 1
+          `)
+          .get(turnId);
+        if (existingResponse) throw new Error(`Lead turn ${turnId} already has a response.`);
+        const recordedAt = new Date().toISOString();
+        const responseFactId = randomUUID();
+        database
+          .prepare(`
+            INSERT INTO facts (
+              id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+            ) VALUES (?, 'owner-conversation:primary', 'owner-conversation.lead-agent-message', ?, NULL, ?)
+          `)
+          .run(
+            responseFactId,
+            JSON.stringify({
+              content,
+              turnId,
+              modelSelection: attribution?.modelSelection ?? originalAttribution.modelSelection,
+              modelPolicyRevision:
+                attribution?.modelPolicyRevision ?? originalAttribution.modelPolicyRevision,
+              ...(attribution?.selectionReason
+                ? { selectionReason: attribution.selectionReason }
+                : {}),
+            }),
+            recordedAt,
+          );
+        database
+          .prepare(`
+            INSERT INTO transitions (id, kind, fact_id, recorded_at)
+            VALUES (?, 'owner-conversation.lead-agent-message-recorded', ?, ?)
+          `)
+          .run(randomUUID(), responseFactId, recordedAt);
+        for (const repair of selfRepairs) {
+          const current = readCurrentSnapshot<SelfRepairRecord>(
+            "self-repair.snapshot",
+            `self-repair:${repair.id}`,
+          );
+          const status = repair.attempts.at(-1)?.status;
+          if (!current || !status) {
+            throw new Error("Self-repair account delivery requires current durable repair state.");
+          }
+          const repairFactId = randomUUID();
+          database
+            .prepare(`
+              INSERT INTO facts (
+                id, subject_id, kind, value_json, supersedes_fact_id, recorded_at
+              ) VALUES (?, ?, 'self-repair.snapshot', ?, ?, ?)
+            `)
+            .run(
+              repairFactId,
+              `self-repair:${repair.id}`,
+              JSON.stringify(repair),
+              current.id,
+              recordedAt,
+            );
+          database
+            .prepare(`
+              INSERT INTO transitions (id, kind, fact_id, recorded_at)
+              VALUES (?, ?, ?, ?)
+            `)
+            .run(randomUUID(), `self-repair.${status}`, repairFactId, recordedAt);
+        }
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+
     ownerTurnSequence(turnId) {
       const row = database
         .prepare(`
@@ -1690,6 +1807,38 @@ export function openAuthoritativeState(
 
     readActingAuthorities() {
       return readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot");
+    },
+
+    appendSelfRepairSnapshots(snapshots) {
+      if (snapshots.length === 0) return;
+      const selfRepairId = snapshots[0]!.id;
+      if (snapshots.some((snapshot) => snapshot.id !== selfRepairId)) {
+        throw new Error("One Self-repair snapshot batch cannot contain multiple identities.");
+      }
+      let predecessorId = readCurrentSnapshot<SelfRepairRecord>(
+        "self-repair.snapshot",
+        `self-repair:${selfRepairId}`,
+      )?.id;
+      for (const snapshot of snapshots) {
+        const status = snapshot.attempts.at(-1)?.status;
+        if (!status) throw new Error("A Self-repair snapshot requires one repair attempt.");
+        predecessorId = appendFact(
+          { kind: "self-repair.snapshot", value: snapshot },
+          `self-repair.${status}`,
+          predecessorId,
+        );
+      }
+    },
+
+    readSelfRepair(selfRepairId) {
+      return readCurrentSnapshot<SelfRepairRecord>(
+        "self-repair.snapshot",
+        `self-repair:${selfRepairId}`,
+      )?.value;
+    },
+
+    readSelfRepairs() {
+      return readCurrentSnapshots<SelfRepairRecord>("self-repair.snapshot");
     },
 
     appendCoordinationMessage(message) {
@@ -2693,6 +2842,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
         'capability-notice.snapshot',
         'standing-order.snapshot',
         'acting-authority.snapshot',
+        'self-repair.snapshot',
         'coordination-message.recorded',
         'forge-operation-attempt.snapshot',
         'forge-owner-action-notice.snapshot',
@@ -2756,6 +2906,14 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
         'acting-authority.active',
         'acting-authority.handoff-pending',
         'acting-authority.ended',
+        'self-repair.candidate-delegation-pending',
+        'self-repair.candidate-delegated',
+        'self-repair.review-delegation-pending',
+        'self-repair.review-delegated',
+        'self-repair.activation-pending',
+        'self-repair.activated',
+        'self-repair.rolled-back',
+        'self-repair.blocked',
         'coordination-message.recorded',
         'forge-operation-attempt.ready',
         'forge-operation-attempt.running',
@@ -2833,12 +2991,14 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
     row.sql.includes("'capability-notice.snapshot'") &&
     row.sql.includes("'standing-order.snapshot'") &&
     row.sql.includes("'acting-authority.snapshot'") &&
+    row.sql.includes("'self-repair.snapshot'") &&
     row.sql.includes("'coordination-message.recorded'") &&
     row.sql.includes("'forge-operation-attempt.snapshot'") &&
     row.sql.includes("'forge-owner-action-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
+    transitionsRow.sql.includes("'self-repair.activation-pending'") &&
     transitionsRow.sql.includes("'owner.forge-authorities-reconfigured'") &&
     transitionsRow.sql.includes("'forge-owner-action-notice.cleared'") &&
     transitionsRow.sql.includes("'effect-intent.reconciled'")
@@ -2868,6 +3028,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
           'capability-notice.snapshot',
           'standing-order.snapshot',
           'acting-authority.snapshot',
+          'self-repair.snapshot',
           'coordination-message.recorded',
           'forge-operation-attempt.snapshot',
           'forge-owner-action-notice.snapshot',
@@ -2929,6 +3090,14 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
           'acting-authority.active',
           'acting-authority.handoff-pending',
           'acting-authority.ended',
+          'self-repair.candidate-delegation-pending',
+          'self-repair.candidate-delegated',
+          'self-repair.review-delegation-pending',
+          'self-repair.review-delegated',
+          'self-repair.activation-pending',
+          'self-repair.activated',
+          'self-repair.rolled-back',
+          'self-repair.blocked',
           'coordination-message.recorded',
           'forge-operation-attempt.ready',
           'forge-operation-attempt.running',
@@ -3095,6 +3264,8 @@ function factSubject(input: FactDraft): string {
       return `standing-order:${input.value.id}`;
     case "acting-authority.snapshot":
       return `acting-authority:${input.value.id}`;
+    case "self-repair.snapshot":
+      return `self-repair:${input.value.id}`;
     case "coordination-message.recorded":
       return `coordination-message:${input.value.id}`;
     case "forge-operation-attempt.snapshot":

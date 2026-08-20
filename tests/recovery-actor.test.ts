@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   openRecoveryActor,
+  protectedRecoveryPolicyIdentity,
   type ActivationEffects,
   type CodeStatePair,
   type HealthAssessment,
@@ -84,7 +85,7 @@ test("activation durably identifies the exact cutover before transferring the wr
       "write-read-probe",
       "recovery-handshake",
     ],
-    budget: { deadline: "2026-08-20T10:05:00.000Z", probationChecks: 2 },
+    budget: { deadline: "2099-08-20T10:05:00.000Z", probationChecks: 2 },
     recoveryPath: "restore-exact-baseline-pair",
   });
 
@@ -137,6 +138,84 @@ test("failed candidate health restores the exact protected pair under a fresh ge
     "health:riker-1:3",
     "terminate:42",
   ]);
+  actor.close();
+});
+
+test("Self-repair activation preserves protected actor and recovery policy identity", async (t) => {
+  const installRoot = await mkdtemp(join(tmpdir(), "cmd-riker-self-repair-authority-test-"));
+  t.after(() => rm(installRoot, { recursive: true, force: true }));
+  const actor = openRecoveryActor(installRoot, actorIdentity, activationEffects({}, []));
+  actor.initialize({ active: baseline, recoveryBaseline: baseline, writeGeneration: 1 });
+  const authority = {
+    kind: "lead-agent-self-repair" as const,
+    selfRepairId: "repair-1",
+    selfRepairAttemptId: "repair-attempt-1",
+    commitmentId: "commitment-1",
+    recoveryActorRevision: actorIdentity.revision,
+    recoveryActorDigest: actorIdentity.digest,
+    recoveryActorPath: actorIdentity.path,
+    recoveryPolicyRevision: protectedRecoveryPolicyIdentity.revision,
+    recoveryPolicyDigest: protectedRecoveryPolicyIdentity.digest,
+    authorizedAt: "2026-08-20T10:00:00.000Z",
+  };
+
+  await assert.rejects(
+    actor.activate({
+      ...activationRequest(),
+      authority,
+      candidate: { ...candidate, code: { ...candidate.code, path: actorIdentity.path } },
+    }),
+    /cannot replace the protected Recovery Actor/i,
+  );
+  await assert.rejects(
+    actor.activate({
+      ...activationRequest(),
+      authority: { ...authority, recoveryPolicyDigest: "not-an-exact-digest" },
+    }),
+    /protected policy identity/i,
+  );
+  assert.equal(actor.inspect().currentAttempt, undefined);
+  actor.close();
+});
+
+test("Self-repair reconciliation retains its exact attempt after a later activation", async (t) => {
+  const installRoot = await mkdtemp(join(tmpdir(), "cmd-riker-self-repair-history-test-"));
+  t.after(() => rm(installRoot, { recursive: true, force: true }));
+  const actor = openRecoveryActor(installRoot, actorIdentity, activationEffects({}, []));
+  actor.initialize({ active: baseline, recoveryBaseline: baseline, writeGeneration: 1 });
+  const authority = {
+    kind: "lead-agent-self-repair" as const,
+    selfRepairId: "repair-history",
+    selfRepairAttemptId: "repair-attempt-history",
+    commitmentId: "commitment-history",
+    recoveryActorRevision: actorIdentity.revision,
+    recoveryActorDigest: actorIdentity.digest,
+    recoveryActorPath: actorIdentity.path,
+    recoveryPolicyRevision: protectedRecoveryPolicyIdentity.revision,
+    recoveryPolicyDigest: protectedRecoveryPolicyIdentity.digest,
+    authorizedAt: "2026-08-20T10:00:00.000Z",
+  };
+  const selfRepair = await actor.activate({
+    ...activationRequest(),
+    authority,
+    baseline: { code: baseline.code, state: candidate.state },
+  });
+  const laterCandidate: CodeStatePair = {
+    ...candidate,
+    code: {
+      ...candidate.code,
+      revision: "riker-3",
+      digest: "f".repeat(64),
+      path: "C:\\Riker\\versions\\riker-3",
+    },
+  };
+  await actor.activate({ ...activationRequest(), candidate: laterCandidate });
+
+  assert.notEqual(actor.inspect().currentAttempt?.id, selfRepair.attemptId);
+  assert.equal(
+    actor.inspectSelfRepairAttempt(authority.selfRepairId, authority.selfRepairAttemptId)?.id,
+    selfRepair.attemptId,
+  );
   actor.close();
 });
 
@@ -235,7 +314,7 @@ function activationRequest() {
       "write-read-probe",
       "recovery-handshake",
     ],
-    budget: { deadline: "2026-08-20T10:05:00.000Z", probationChecks: 2 },
+    budget: { deadline: "2099-08-20T10:05:00.000Z", probationChecks: 2 },
     recoveryPath: "restore-exact-baseline-pair" as const,
   };
 }

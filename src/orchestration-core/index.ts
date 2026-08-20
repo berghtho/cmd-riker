@@ -13,6 +13,7 @@ import type {
   TargetProjectOperationRequest,
   TargetProjectOperationResult,
 } from "../target-project-operations/index.ts";
+import type { SelfRepairWorkerCandidate } from "../self-repair-controller/index.ts";
 
 export type OwnerConfiguration = {
   targetProject: { path: string };
@@ -299,6 +300,7 @@ type WorkerAssignmentBase = {
     targetProjectPath: string;
     modelPolicyRevision: string;
     commitmentId?: string;
+    selfRepair?: { selfRepairId: string; attemptId: string };
     coordination?:
       | { role: "implementer"; repairOfReviewFindingIds?: string[] }
       | { role: "reviewer"; reviewOfWorkerSessionId: string }
@@ -355,6 +357,7 @@ export type WorkerOutcome = {
   verificationResults: string[];
   reviewFindings?: ReviewFinding[];
   unresolvedUncertainty?: string;
+  selfRepairCandidate?: SelfRepairWorkerCandidate;
   evidence: {
     providerSessionId?: string;
     nativeExecutionId?: string;
@@ -369,6 +372,7 @@ export type WorkerReportedOutcome = {
   affectedArtifacts: string[];
   verificationResults: string[];
   reviewFindings?: Array<Omit<ReviewFinding, "id">>;
+  selfRepairCandidate?: SelfRepairWorkerCandidate;
   unresolvedUncertainty?: string;
 };
 
@@ -2450,6 +2454,9 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
               ? [`Observed ${observedChanges.length} change(s) against the isolated checkout baseline.`]
               : []),
           ],
+          ...(input.reportedOutcome?.selfRepairCandidate
+            ? { selfRepairCandidate: input.reportedOutcome.selfRepairCandidate }
+            : {}),
           ...(uncertainty ? { unresolvedUncertainty: uncertainty } : {}),
           evidence: {
             ...(attempt.providerSessionId ? { providerSessionId: attempt.providerSessionId } : {}),

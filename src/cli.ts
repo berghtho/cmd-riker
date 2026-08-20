@@ -682,14 +682,37 @@ async function completeOwnerTurn(
           } } : {}),
         },
       });
-      state.appendLeadAgentMessage(turnId, response.content, {
+      const pendingSelfRepairAccounts = state.readSelfRepairs().flatMap((repair) =>
+        repair.attempts.flatMap((attempt) =>
+          attempt.activation && !attempt.activation.deliveredAt
+            ? [{ repair, attempt, account: attempt.activation.account }]
+            : []
+        )
+      );
+      const durableResponse = pendingSelfRepairAccounts.length
+        ? `${response.content}\n\n${pendingSelfRepairAccounts.map(({ account }) => account).join("\n")}`
+        : response.content;
+      const deliveredAt = new Date().toISOString();
+      const deliveredRepairs = [...new Set(pendingSelfRepairAccounts.map(({ repair }) => repair.id))]
+        .map((repairId) => {
+          const repair = pendingSelfRepairAccounts.find((candidate) => candidate.repair.id === repairId)!.repair;
+          return {
+            ...repair,
+            attempts: repair.attempts.map((attempt) =>
+              attempt.activation && !attempt.activation.deliveredAt
+                ? { ...attempt, activation: { ...attempt.activation, deliveredAt } }
+                : attempt
+            ),
+          };
+        });
+      state.appendLeadAgentMessageWithSelfRepairAccounts(turnId, durableResponse, deliveredRepairs, {
         modelSelection,
         modelPolicyRevision: conversation.modelPolicyRevision,
         ...(index > 0
           ? { selectionReason: "fallback-after-ineligible-candidate" as const }
           : {}),
       });
-      orchestration.observeLeadResponse(turnId, response.content);
+      orchestration.observeLeadResponse(turnId, durableResponse);
       const notices = state
         .readCommitments()
         .filter(
@@ -698,8 +721,8 @@ async function completeOwnerTurn(
         )
         .map(commitmentNotice);
       const content = notices.length
-        ? `${response.content}\n\n${notices.join("\n")}`
-        : response.content;
+        ? `${durableResponse}\n\n${notices.join("\n")}`
+        : durableResponse;
       orchestration.settleLeadTurnAttempt(attempt.id, "completed");
       const pendingHandoff = orchestration.actingAuthorityView();
       if (
@@ -709,7 +732,7 @@ async function completeOwnerTurn(
         orchestration.observeActingAuthorityHandoffDelivered(
           pendingHandoff.id,
           turnId,
-          response.content,
+          durableResponse,
         );
       }
       return content;

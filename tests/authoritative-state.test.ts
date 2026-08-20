@@ -278,6 +278,37 @@ test("an objective Commitment follows the evidence-gated lifecycle and survives 
   state.close();
 });
 
+test("a Lead response leaves an asynchronous Target Project Commitment active for operation evidence", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-state-async-commitment-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize({
+    targetProject: { path: "C:\\target-project" },
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:11434/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  const orchestration = createOrchestrationCore(state);
+  const turnId = state.appendOwnerMessage("Implement and verify the requested change.");
+  const commitment = orchestration.recordCommitment(turnId, {
+    outcome: "The Target Project change passes its declared tests.",
+    criteria: [{
+      kind: "target-project-operation",
+      description: "The declared Target Project tests pass.",
+      operation: "test",
+    }],
+  });
+
+  orchestration.observeLeadResponse(turnId, "The Worker Session has started.");
+
+  assert.deepEqual(state.readCommitment(commitment.id), commitment);
+  state.close();
+});
+
 test("a reserved Commitment waits for a later Owner Acceptance", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-state-owner-acceptance-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));

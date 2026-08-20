@@ -129,24 +129,41 @@ test("an implementing Worker hands one bounded assignment to an independent revi
       summary: "Independent Review completed.",
       affectedArtifacts: [],
       verificationResults: ["Reviewed the public interface and test evidence."],
-      reviewFindings: [{
-        basis: "criterion",
-        disposition: "must-fix",
-        summary: "The public contract is incomplete.",
-        evidence: "The required export is absent.",
-      }],
+      reviewFindings: [
+        {
+          basis: "criterion",
+          disposition: "must-fix",
+          summary: "The public contract is incomplete.",
+          evidence: "The required export is absent.",
+        },
+        {
+          basis: "risk",
+          disposition: "follow-up",
+          summary: "A broader compatibility check remains.",
+          evidence: "The bounded Verification covers only the declared platform.",
+        },
+      ],
     },
   });
   assert.equal(state.readCommitment(commitment.id)?.review?.status, "awaiting-adjudication");
   assert.equal(state.readCommitment(commitment.id)?.state, "active");
   assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "blocked");
   assert.equal(orchestration.coordinationMessagesView()[1]?.kind, "review-finding");
-  const mustFixFindingId = state.readCommitment(commitment.id)!.review!.findings[0]!.id;
-  orchestration.adjudicateReview(commitment.id, [{
-    reviewFindingId: mustFixFindingId,
-    disposition: "must-fix",
-    rationale: "The missing public export violates the accepted criterion and must be repaired.",
-  }]);
+  const reviewFindings = state.readCommitment(commitment.id)!.review!.findings;
+  const mustFixFindingId = reviewFindings.find((finding) => finding.disposition === "must-fix")!.id;
+  const followUpFindingId = reviewFindings.find((finding) => finding.disposition === "follow-up")!.id;
+  orchestration.adjudicateReview(commitment.id, [
+    {
+      reviewFindingId: mustFixFindingId,
+      disposition: "must-fix",
+      rationale: "The missing public export violates the accepted criterion and must be repaired.",
+    },
+    {
+      reviewFindingId: followUpFindingId,
+      disposition: "follow-up",
+      rationale: "The broader compatibility check is useful but does not block this bounded outcome.",
+    },
+  ]);
   assert.equal(state.readCommitment(commitment.id)?.review?.status, "changes-requested");
   assert.equal(
     state.readCommitment(commitment.id)?.review?.findings[0]?.leadDisposition?.kind,
@@ -233,6 +250,10 @@ test("an implementing Worker hands one bounded assignment to an independent revi
     },
   });
   assert.equal(state.readCommitment(commitment.id)?.state, "accepted", JSON.stringify(state.readCommitment(commitment.id)));
+  assert.match(
+    state.readCommitment(commitment.id)?.outcomeAccount?.content ?? "",
+    /Residual uncertainty: A broader compatibility check remains\./,
+  );
   assert.throws(
     () => orchestration.recordCoordinationMessage({
       fromWorkerSessionId: repair.workerSession.id,
@@ -274,8 +295,8 @@ test("an implementing Worker hands one bounded assignment to an independent revi
 
   state.close();
   state = openAuthoritativeState(stateDirectory);
-  assert.equal(state.readCoordinationMessages().length, 3);
-  assert.equal(state.readCommitment(commitment.id)?.review?.findings.length, 1);
+  assert.equal(state.readCoordinationMessages().length, 4);
+  assert.equal(state.readCommitment(commitment.id)?.review?.findings.length, 2);
   state.close();
 });
 

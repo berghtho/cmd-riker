@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import { writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let initialized = false;
@@ -7,6 +7,8 @@ let threadStarted = false;
 let effectful = false;
 let sandboxProbeCount = 0;
 const sandboxReadiness = process.argv[2] ?? "ready";
+const effectMode = process.argv[3] ?? "report-only";
+const releasePath = process.argv[4];
 
 for await (const line of lines) {
   const message = JSON.parse(line) as {
@@ -93,6 +95,14 @@ for await (const line of lines) {
     const turnId = effectful ? "turn-workspace-write-1" : "turn-read-only-1";
     respond(message.id!, { turn: { id: turnId, status: "inProgress" } });
     if (effectful) {
+      if (effectMode === "wait-and-write") {
+        if (!releasePath) process.exit(27);
+        while (!(await stat(releasePath).catch(() => undefined))) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        await mkdir("src", { recursive: true });
+        await writeFile("src/index.ts", "export const answer = 42;\n");
+      }
       notify("item/agentMessage/delta", {
         threadId,
         turnId,

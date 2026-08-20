@@ -24,7 +24,6 @@ import {
 } from "./authoritative-state/index.ts";
 import {
   PiAgentTurnAdapter,
-  PiTurnFailure,
   type PiTurnAdapter,
 } from "./conversation-runtime/index.ts";
 import {
@@ -38,7 +37,6 @@ import {
   defaultLeadModelRequirements,
   type LeadModelRequirements,
   type LeadModelPolicy,
-  type ActingAuthorityEffectRequest,
 } from "./orchestration-core/index.ts";
 import {
   createClaudeWorkerHarness,
@@ -52,7 +50,11 @@ import {
   type WorkerSupervisor,
 } from "./worker-supervisor/index.ts";
 import { createTargetProjectOperations } from "./target-project-operations/index.ts";
-import { createForgeOperations } from "./forge-operations/index.ts";
+import {
+  commitmentNotice,
+  createLeadAgentRuntime,
+  LeadAgentRuntimeDiagnostic,
+} from "./lead-agent-runtime/index.ts";
 import {
   parseSessionViewControl,
   parseSessionViewInspection,
@@ -372,13 +374,12 @@ async function completeOwnerInteraction(
   if (!/^\/session\s+/i.test(ownerInput)) {
     return {
       source: "Lead Agent",
-      content: await completeOwnerTurn(
+      content: await createLeadAgentRuntime({
         state,
         adapter,
-        ownerInput,
-        workerSupervisor,
-        onOwnerTurnRecorded,
-      ),
+        ...(workerSupervisor ? { workerSupervisor } : {}),
+      })
+        .completeOwnerTurn(ownerInput, onOwnerTurnRecorded),
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisor);
@@ -463,278 +464,6 @@ function sessionViewSnapshot(
   });
 }
 
-async function completeOwnerTurn(
-  state: AuthoritativeState,
-  adapter: PiTurnAdapter,
-  ownerInput: string,
-  workerSupervisor?: WorkerSupervisor,
-  onOwnerTurnRecorded?: (turnId: string) => void,
-): Promise<string> {
-  const conversation = state.readOwnerConversation();
-  if (!conversation) throw new Error("Authoritative state is not configured.");
-  const orchestration = createOrchestrationCore(state);
-  const turnId = state.appendOwnerMessage(ownerInput);
-  onOwnerTurnRecorded?.(turnId);
-  const commitmentsBefore = new Map(
-    state
-      .readCommitments()
-      .map((commitment) => [commitment.id, commitmentFingerprint(commitment)]),
-  );
-  const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
-  for (const [index, modelSelection] of candidates.entries()) {
-    const validation = await adapter.validateSelection(
-      modelSelection,
-      conversation.modelRequirements ?? defaultLeadModelRequirements,
-    );
-    if (orchestration.modelCandidateDecision(validation) === "skip") continue;
-    const attempt = orchestration.startLeadTurnAttempt({
-      ownerTurnId: turnId,
-      modelSelection,
-      modelPolicyRevision: conversation.modelPolicyRevision,
-      ...(index > 0
-        ? { selectionReason: "fallback-after-ineligible-candidate" as const }
-        : {}),
-    });
-    try {
-      const workerCapabilities = workerSupervisor?.capabilities();
-      const response = await adapter.completeTurn({
-        conversation: conversation.messages,
-        ownerInput,
-        modelSelection,
-        commitments: state.readCommitments(),
-        standingOrders: orchestration.standingOrdersView(),
-        ...(orchestration.actingAuthorityView()
-          ? { actingAuthority: orchestration.actingAuthorityView()! }
-          : {}),
-        authorityActions: {
-          recordStandingOrder: (draft) => orchestration.recordStandingOrder(turnId, draft),
-          revokeStandingOrder: (standingOrderId, reason) =>
-            orchestration.revokeStandingOrder(standingOrderId, turnId, reason),
-          beginActingAuthority: (input) => orchestration.beginActingAuthority(turnId, input),
-          recordActingAuthorityEvent: (actingAuthorityId, input) =>
-            orchestration.recordActingAuthorityEvent(actingAuthorityId, input),
-          prepareActingAuthorityHandoff: (actingAuthorityId) =>
-            orchestration.prepareActingAuthorityHandoff(actingAuthorityId, turnId),
-        },
-        workers: orchestration.workerSessionsView(),
-        workerQuestions: orchestration.workerQuestionsView(),
-        ...(workerSupervisor
-          ? {
-              workerActions: {
-                capabilities: {
-                  nativeHarness: workerCapabilities!.nativeHarness,
-                  effectful: workerCapabilities!.effectful,
-                  nativeQuestions: workerCapabilities!.nativeQuestions,
-                  cancellation: workerCapabilities!.cancellation,
-                },
-                delegate: (input: {
-                  objective: string;
-                  prompt: string;
-                  commitmentId?: string;
-                  recoveryOfWorkerSessionId?: string;
-                  recoveryReason?: string;
-                }) =>
-                  workerSupervisor.delegate({
-                    ...input,
-                    targetProjectPath: conversation.targetProject.path,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
-                  }),
-                delegateReview: (input: {
-                  implementationWorkerSessionId: string;
-                  prompt: string;
-                }) =>
-                  workerSupervisor.delegateReview({
-                    ...input,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
-                  }),
-                adjudicateReview: (input) =>
-                  orchestration.adjudicateReview(input.commitmentId, input.decisions),
-                reserveOwnerDecision: (questionId: string, reason: string) => {
-                  orchestration.reserveWorkerQuestionForOwner(questionId, reason);
-                },
-                ...(workerCapabilities!.effectful
-                  ? {
-                      delegateEffectful: (input: {
-                        objective: string;
-                        prompt: string;
-                        commitmentId: string;
-                        targets: string[];
-                        actingAuthorityEffect?: ActingAuthorityEffectRequest;
-                      }) => {
-                        const { actingAuthorityEffect, ...assignment } = input;
-                        const authorization = actingAuthorityEffect
-                          ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
-                          : undefined;
-                        return workerSupervisor.delegateEffectful({
-                          ...assignment,
-                          targetProjectPath: conversation.targetProject.path,
-                          model: conversation.workerModelPolicy!.selection.model,
-                          modelPolicyRevision: conversation.workerModelPolicy!.revision,
-                          timeoutMs: 20 * 60_000,
-                          verification: {
-                            operation: "test" as const,
-                            workingDirectory: conversation.targetProject.path,
-                            timeoutMs: 120_000,
-                          },
-                          ...(authorization
-                            ? { actingAuthorityEffectAuthorizationId: authorization.id }
-                            : {}),
-                        });
-                      },
-                      answer: (questionId: string, answers: Record<string, string[]>) =>
-                        workerSupervisor.answer(questionId, turnId, answers),
-                    }
-                  : {}),
-                ...(workerCapabilities!.cancellation
-                  ? {
-                      cancel: (workerSessionId: string, reason: string) =>
-                        workerSupervisor.cancel(workerSessionId, turnId, reason),
-                    }
-                  : {}),
-              },
-            }
-          : {}),
-        commitmentActions: {
-          record: (draft) => orchestration.recordCommitment(turnId, draft),
-          recordOwnerAttention: (commitmentId, input) => {
-            orchestration.recordCommitmentOwnerAttention(commitmentId, input);
-          },
-          accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
-          resume: (commitmentId) => orchestration.resumeCommitment(commitmentId, turnId),
-          control: (commitmentId, action, reason, replacementCommitmentId) => {
-            if (action === "pause") orchestration.pauseCommitment(commitmentId, turnId, reason);
-            else if (action === "cancel") {
-              orchestration.cancelCommitment(commitmentId, turnId, reason);
-            } else {
-              if (!replacementCommitmentId) {
-                throw new Error("Supersession requires a replacement Commitment.");
-              }
-              orchestration.supersedeCommitment(
-                commitmentId,
-                turnId,
-                reason,
-                replacementCommitmentId,
-              );
-            }
-          },
-          executeOperation: async (commitmentId, operation, actingAuthorityEffect) => {
-            const authorization = actingAuthorityEffect
-              ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
-              : undefined;
-            const result = await createTargetProjectOperations(state).execute({
-              commitmentId,
-              operation: { kind: operation, inputs: {} },
-              checkout: conversation.targetProject.path,
-              workingDirectory: conversation.targetProject.path,
-              timeoutMs: 120_000,
-              ...(authorization
-                ? {
-                    actingAuthorityEffectAuthorization: {
-                      actingAuthorityId: authorization.actingAuthorityId,
-                      authorizationId: authorization.id,
-                      standingOrderId: authorization.standingOrderId,
-                    },
-                  }
-                : {}),
-            });
-            orchestration.observeTargetProjectOperationResult(commitmentId, result);
-            return result;
-          },
-        },
-        forgeActions: {
-          ...(conversation.forgeAuthorities?.github ? { commentOnGitHubIssue: async (input, actingAuthorityEffect) => {
-            const authority = conversation.forgeAuthorities!.github!;
-            const authorization = orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect);
-            const result = await createForgeOperations(state).execute({
-              commitmentId: input.commitmentId,
-              operation: {
-                kind: "github-issue-comment",
-                repository: authority.repository,
-                issueNumber: input.issueNumber,
-                body: input.body,
-                expectedAccount: authority.account,
-              },
-              timeoutMs: 30_000,
-              actingAuthorityEffectAuthorization: {
-                actingAuthorityId: authorization.actingAuthorityId,
-                authorizationId: authorization.id,
-                standingOrderId: authorization.standingOrderId,
-              },
-            });
-            orchestration.observeForgeOperationResult(input.commitmentId, result);
-            return result;
-          } } : {}),
-          ...(conversation.forgeAuthorities?.azure ? { inspectAzureSubscription: async (commitmentId) => {
-            const authority = conversation.forgeAuthorities!.azure!;
-            const result = await createForgeOperations(state).execute({
-              commitmentId,
-              operation: {
-                kind: "azure-subscription-inspection",
-                subscriptionId: authority.subscriptionId,
-                expectedAccount: authority.account,
-              },
-              timeoutMs: 30_000,
-            });
-            orchestration.observeForgeOperationResult(commitmentId, result);
-            return result;
-          } } : {}),
-        },
-      });
-      state.appendLeadAgentMessage(turnId, response.content, {
-        modelSelection,
-        modelPolicyRevision: conversation.modelPolicyRevision,
-        ...(index > 0
-          ? { selectionReason: "fallback-after-ineligible-candidate" as const }
-          : {}),
-      });
-      orchestration.observeLeadResponse(turnId, response.content);
-      const notices = state
-        .readCommitments()
-        .filter(
-          (commitment) =>
-            commitmentsBefore.get(commitment.id) !== commitmentFingerprint(commitment),
-        )
-        .map(commitmentNotice);
-      const content = notices.length
-        ? `${response.content}\n\n${notices.join("\n")}`
-        : response.content;
-      orchestration.settleLeadTurnAttempt(attempt.id, "completed");
-      const pendingHandoff = orchestration.actingAuthorityView();
-      if (
-        pendingHandoff?.state === "handoff-pending" &&
-        pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
-      ) {
-        orchestration.observeActingAuthorityHandoffDelivered(
-          pendingHandoff.id,
-          turnId,
-          response.content,
-        );
-      }
-      return content;
-    } catch (error) {
-      if (!(error instanceof PiTurnFailure)) throw error;
-      orchestration.settleLeadTurnAttempt(attempt.id, "failed", error.kind);
-      const decision = orchestration.modelFailureDecision(error);
-      if (decision === "fallback") continue;
-      if (decision === "revalidate") {
-        const updatedValidation = await adapter.validateSelection(
-          modelSelection,
-          conversation.modelRequirements ?? defaultLeadModelRequirements,
-        );
-        if (orchestration.modelCandidateDecision(updatedValidation) === "skip") continue;
-      }
-      orchestration.observeLeadTurnFailure(turnId, `Lead Model turn failed: ${error.kind}.`);
-      break;
-    }
-  }
-  throw new HostDiagnostic(
-    "CMD_RIKER_MODEL_UNAVAILABLE",
-    "The configured Model did not complete the turn.",
-  );
-}
-
 async function availableWorkerSupervisor(
   state: AuthoritativeState,
   configuration: OwnerConfiguration,
@@ -790,26 +519,6 @@ async function availableWorkerSupervisor(
 
 function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {
   return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
-}
-
-function commitmentFingerprint(commitment: {
-  state: string;
-  condition?: { kind: string };
-}): string {
-  return `${commitment.state}:${commitment.condition?.kind ?? "none"}`;
-}
-
-function commitmentNotice(commitment: {
-  id: string;
-  outcome: string;
-  state: string;
-  condition?: { kind: string };
-}): string {
-  const status =
-    commitment.state === "awaiting-acceptance"
-      ? "awaiting Owner Acceptance"
-      : commitment.condition?.kind ?? commitment.state;
-  return `Commitment ${commitment.id} ${status}: ${commitment.outcome}`;
 }
 
 async function validatePolicy(
@@ -1136,7 +845,7 @@ function isRecordWithKeys(value: unknown, keys: readonly string[]): value is Rec
 try {
   await main();
 } catch (error) {
-  if (error instanceof HostDiagnostic) {
+  if (error instanceof HostDiagnostic || error instanceof LeadAgentRuntimeDiagnostic) {
     process.stderr.write(`${error.code}: ${error.message}\n`);
   } else if (error instanceof StaleWriteGenerationError) {
     const activeGeneration = /active generation is (\d+)/.exec(error.message)?.[1] ?? "unknown";

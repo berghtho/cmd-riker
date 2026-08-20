@@ -713,6 +713,7 @@ export function parseWorkerReportedOutcome(output: string): {
     !isStringArray(reported.affectedArtifacts) ||
     !isStringArray(reported.verificationResults) ||
     (reported.reviewFindings !== undefined && !isReportedReviewFindings(reported.reviewFindings)) ||
+    (reported.selfRepairCandidate !== undefined && !isSelfRepairCandidate(reported.selfRepairCandidate)) ||
     (reported.unresolvedUncertainty !== undefined &&
       typeof reported.unresolvedUncertainty !== "string")
   ) {
@@ -727,6 +728,9 @@ export function parseWorkerReportedOutcome(output: string): {
       verificationResults: reported.verificationResults,
       ...(isReportedReviewFindings(reported.reviewFindings)
         ? { reviewFindings: reported.reviewFindings }
+        : {}),
+      ...(isSelfRepairCandidate(reported.selfRepairCandidate)
+        ? { selfRepairCandidate: reported.selfRepairCandidate }
         : {}),
       ...(typeof reported.unresolvedUncertainty === "string"
         ? { unresolvedUncertainty: reported.unresolvedUncertainty }
@@ -753,6 +757,23 @@ function isReportedReviewFindings(
       finding.evidence.trim().length > 0
     );
   });
+}
+
+function isSelfRepairCandidate(
+  value: unknown,
+): value is NonNullable<WorkerReportedOutcome["selfRepairCandidate"]> {
+  const candidate = asRecord(value);
+  const code = asRecord(candidate.code);
+  const runtime = asRecord(code.runtime);
+  return (
+    candidate.candidateKind === "lead-agent" &&
+    isStringArray(candidate.changedTargets) &&
+    typeof code.revision === "string" &&
+    typeof code.digest === "string" &&
+    typeof code.path === "string" &&
+    typeof runtime.version === "string" &&
+    (runtime.architecture === "x64" || runtime.architecture === "arm64")
+  );
 }
 
 export async function inspectProcess(pid: number): Promise<{ pid: number; startedAt: string | null } | null> {

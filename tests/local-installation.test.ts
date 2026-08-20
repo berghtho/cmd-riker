@@ -460,7 +460,7 @@ function activationRequest() {
       "write-read-probe",
       "recovery-handshake",
     ],
-    budget: { deadline: "2026-08-20T12:05:00.000Z", probationChecks: 2 },
+    budget: { deadline: "2099-08-20T12:05:00.000Z", probationChecks: 2 },
     recoveryPath: "restore-exact-baseline-pair" as const,
   };
 }

@@ -118,6 +118,8 @@ export type PiTurnRequest = {
       commitmentId: string;
       targets: string[];
       actingAuthorityEffect?: ActingAuthorityEffectRequest;
+      recoveryOfWorkerSessionId?: string;
+      recoveryReason?: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     delegateReview?(input: {
       implementationWorkerSessionId: string;
@@ -1060,6 +1062,8 @@ function workerTools(
         commitmentId: Type.String({ minLength: 1 }),
         targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
         actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
+        recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
+        recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -1070,6 +1074,8 @@ function workerTools(
             commitmentId: string;
             targets: string[];
             actingAuthorityEffect?: ActingAuthorityEffectRequest;
+            recoveryOfWorkerSessionId?: string;
+            recoveryReason?: string;
           },
         );
         observer.onMutation();

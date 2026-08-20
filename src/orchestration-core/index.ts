@@ -13,6 +13,7 @@ import type {
   TargetProjectOperationRequest,
   TargetProjectOperationResult,
 } from "../target-project-operations/index.ts";
+import type { SelfRepairWorkerCandidate } from "../self-repair-controller/index.ts";
 
 export type OwnerConfiguration = {
   targetProject: { path: string };
@@ -160,6 +161,10 @@ export type Commitment = {
         ownerTurnId: string;
         acceptedAt: string;
       };
+  outcomeAccount?: {
+    content: string;
+    deliveredAt?: string;
+  };
   review?: {
     required: true;
     reasons: ReviewReason[];
@@ -299,8 +304,14 @@ type WorkerAssignmentBase = {
     targetProjectPath: string;
     modelPolicyRevision: string;
     commitmentId?: string;
+    selfRepair?: { selfRepairId: string; attemptId: string };
     coordination?:
-      | { role: "implementer"; repairOfReviewFindingIds?: string[] }
+      | {
+          role: "implementer";
+          repairOfReviewFindingIds?: string[];
+          recoveryOfWorkerSessionId?: string;
+          recoveryReason?: string;
+        }
       | { role: "reviewer"; reviewOfWorkerSessionId: string }
       | { role: "recovery"; recoveryOfWorkerSessionId: string; reason: string };
 };
@@ -355,6 +366,7 @@ export type WorkerOutcome = {
   verificationResults: string[];
   reviewFindings?: ReviewFinding[];
   unresolvedUncertainty?: string;
+  selfRepairCandidate?: SelfRepairWorkerCandidate;
   evidence: {
     providerSessionId?: string;
     nativeExecutionId?: string;
@@ -369,6 +381,7 @@ export type WorkerReportedOutcome = {
   affectedArtifacts: string[];
   verificationResults: string[];
   reviewFindings?: Array<Omit<ReviewFinding, "id">>;
+  selfRepairCandidate?: SelfRepairWorkerCandidate;
   unresolvedUncertainty?: string;
 };
 
@@ -768,6 +781,8 @@ export interface OrchestrationCore {
     };
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
     actingAuthorityEffectAuthorizationId?: string;
+    recoveryOfWorkerSessionId?: string;
+    recoveryReason?: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
   delegateReviewWorker(input: {
     implementationWorkerSessionId: string;
@@ -1846,6 +1861,42 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       ) {
         throw new Error("Effectful Worker targets must be bounded checkout-relative paths.");
       }
+      const hasRecoveryTarget = Boolean(input.recoveryOfWorkerSessionId);
+      const hasRecoveryReason = Boolean(input.recoveryReason?.trim());
+      if (hasRecoveryTarget !== hasRecoveryReason) {
+        throw new Error("An effectful recovery Worker requires its prior Worker and changed hypothesis.");
+      }
+      let recoveryCoordination:
+        | { recoveryOfWorkerSessionId: string; recoveryReason: string }
+        | undefined;
+      if (input.recoveryOfWorkerSessionId && input.recoveryReason) {
+        const priorWorker = requireWorkerSession(state, input.recoveryOfWorkerSessionId);
+        const priorAttempt = requireCurrentWorkerAttempt(
+          state,
+          priorWorker,
+          priorWorker.currentExecutionAttemptId,
+        );
+        const priorEffect = priorAttempt.effectIntentId
+          ? state.readEffectIntent(priorAttempt.effectIntentId)
+          : undefined;
+        if (
+          priorWorker.assignment.readOnly ||
+          priorWorker.assignment.commitmentId !== input.commitmentId ||
+          !samePath(priorWorker.assignment.targetProjectPath, configuredPath) ||
+          priorWorker.state !== "failed" ||
+          priorEffect?.kind !== "worker-assignment" ||
+          priorEffect.status !== "rejected"
+        ) {
+          throw new Error("Effectful recovery requires a failed same-scope Worker with proven no effect.");
+        }
+        if (priorWorker.assignment.prompt === input.prompt) {
+          throw new Error("Effectful recovery requires a changed implementation hypothesis.");
+        }
+        recoveryCoordination = {
+          recoveryOfWorkerSessionId: priorWorker.id,
+          recoveryReason: input.recoveryReason,
+        };
+      }
       const workerSessionId = randomUUID();
       const executionAttemptId = randomUUID();
       const effectIntentId = randomUUID();
@@ -1879,6 +1930,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           verification: input.verification,
           coordination: {
             role: "implementer",
+            ...(recoveryCoordination ?? {}),
             ...(commitment.review?.status === "changes-requested"
               ? {
                   repairOfReviewFindingIds: commitment.review.findings
@@ -2044,7 +2096,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
             review: { ...commitment.review, status: "changes-requested", findings },
           }
         : commitment.verification?.passed
-          ? {
+          ? withOutcomeAccount({
               ...unblocked,
               state: "accepted",
               review: { ...commitment.review, status: "passed", findings },
@@ -2053,7 +2105,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
                 basis: "objective-criteria",
                 acceptedAt: decidedAt,
               },
-            }
+            })
           : {
               ...unblocked,
               state: "active",
@@ -2450,6 +2502,9 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
               ? [`Observed ${observedChanges.length} change(s) against the isolated checkout baseline.`]
               : []),
           ],
+          ...(input.reportedOutcome?.selfRepairCandidate
+            ? { selfRepairCandidate: input.reportedOutcome.selfRepairCandidate }
+            : {}),
           ...(uncertainty ? { unresolvedUncertainty: uncertainty } : {}),
           evidence: {
             ...(attempt.providerSessionId ? { providerSessionId: attempt.providerSessionId } : {}),
@@ -2731,7 +2786,10 @@ function observeLeadResponse(
     (commitment) =>
       commitment.activeOwnerTurnId === ownerTurnId &&
       commitment.state === "active" &&
-      !commitment.condition,
+      !commitment.condition &&
+      commitment.criteria.every(
+        (criterion) => criterion.kind === "response-includes" || criterion.kind === "owner-judgment",
+      ),
   );
   for (const commitment of commitments) {
     const { condition: _condition, ...unconditioned } = commitment;
@@ -2899,7 +2957,7 @@ function buildTargetProjectOperationVerification(
           verification,
           review,
         }
-      : {
+      : withOutcomeAccount({
         ...verifying,
         state: "accepted",
         verification,
@@ -2908,7 +2966,7 @@ function buildTargetProjectOperationVerification(
           basis: "objective-criteria",
           acceptedAt: new Date().toISOString(),
         },
-        }
+        })
     : {
         ...verifying,
         state: "active",
@@ -2988,7 +3046,7 @@ function recordForgeOperationVerification(
     })),
   };
   const settled: Commitment = passed
-    ? {
+    ? withOutcomeAccount({
         ...verifying,
         state: "accepted",
         verification,
@@ -2997,7 +3055,7 @@ function recordForgeOperationVerification(
           basis: "objective-criteria",
           acceptedAt: new Date().toISOString(),
         },
-      }
+      })
     : {
         ...verifying,
         state: "active",
@@ -3021,6 +3079,38 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
+}
+
+function withOutcomeAccount(commitment: Commitment): Commitment {
+  const operationEvidence = commitment.verification?.evidence.find(
+    (evidence) =>
+      evidence.operationAttemptId &&
+      (evidence.source === "target-project-operation-result" ||
+        evidence.source === "forge-operation-result"),
+  );
+  if (commitment.acceptance?.authority !== "lead-agent" || !operationEvidence?.operationAttemptId) {
+    return commitment;
+  }
+  const source = operationEvidence.source === "target-project-operation-result"
+    ? "the declared Target Project operation"
+    : "the attributed Forge operation";
+  const residualFindings = commitment.review?.findings.filter(
+    (finding) =>
+      finding.leadDisposition?.kind === "follow-up" ||
+      finding.leadDisposition?.kind === "documented-exception",
+  ) ?? [];
+  const residualUncertainty = residualFindings.length
+    ? residualFindings.map((finding) => finding.summary).join("; ")
+    : "none";
+  return {
+    ...commitment,
+    outcomeAccount: {
+      content:
+        `Commitment ${commitment.id} accepted by Lead Agent: ${commitment.outcome} ` +
+        `Verification attempt ${operationEvidence.operationAttemptId} passed via ${source}. ` +
+        `Residual uncertainty: ${residualUncertainty}.`,
+    },
+  };
 }
 
 function normalizedAuthorizedWriteRoot(path: string): string {
@@ -3122,7 +3212,7 @@ function settleIndependentReview(
         review: { ...commitment.review, status: "awaiting-adjudication", findings: reviewFindings },
       }
     : commitment.verification?.passed
-      ? {
+      ? withOutcomeAccount({
           ...commitment,
           state: "accepted",
           review: { ...commitment.review, status: "passed", findings: reviewFindings },
@@ -3131,7 +3221,7 @@ function settleIndependentReview(
             basis: "objective-criteria",
             acceptedAt: new Date().toISOString(),
           },
-        }
+        })
       : {
           ...commitment,
           state: "active",

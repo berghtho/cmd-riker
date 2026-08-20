@@ -255,15 +255,6 @@ test("production adapter exposes explicit authority controls and independent Rev
         };
       },
       revokeStandingOrder() {},
-      beginActingAuthority() {
-        throw new Error("Not called.");
-      },
-      recordActingAuthorityEvent() {
-        throw new Error("Not called.");
-      },
-      prepareActingAuthorityHandoff() {
-        throw new Error("Not called.");
-      },
     },
     workerActions: {
       async delegate() {
@@ -277,9 +268,7 @@ test("production adapter exposes explicit authority controls and independent Rev
 
   assert.equal(recordedTitle, "Integrate while absent");
   assert.match(firstRequest, /record_standing_order/);
-  assert.match(firstRequest, /begin_acting_authority/);
-  assert.match(firstRequest, /record_acting_authority_event/);
-  assert.match(firstRequest, /prepare_acting_authority_handoff/);
+  assert.doesNotMatch(firstRequest, /acting_authority/);
   assert.match(firstRequest, /delegate_independent_review/);
   assert.equal(result.content, "The bounded Standing Order is recorded.");
 });
@@ -345,15 +334,6 @@ test("production adapter exposes typed Forge operations without provider command
             commitmentId: "commitment-1",
             issueNumber: 36,
             body: "Typed Forge proof.",
-            actingAuthorityEffect: {
-              actingAuthorityId: "acting-1",
-              commitmentId: "commitment-1",
-              effectClass: "update",
-              target: "berghtho/cmd-riker#36",
-              reversible: true,
-              externallyBinding: true,
-              incrementalSpendUsd: 0,
-            },
           },
         },
       };
@@ -372,7 +352,7 @@ test("production adapter exposes typed Forge operations without provider command
         return {
           operationAttemptId: "forge-attempt-1",
           effectIntentId: "forge-effect-1",
-          commitmentId: input.commitmentId,
+          commitmentId: input.commitmentId ?? "commitment-1",
           operation: "github-issue-comment",
           provider: "github",
           status: "succeeded",

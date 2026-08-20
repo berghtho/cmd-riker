@@ -144,7 +144,6 @@ export interface WorkerSupervisor {
     targets: string[];
     timeoutMs: number;
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
-    actingAuthorityEffectAuthorizationId?: string;
     recoveryOfWorkerSessionId?: string;
     recoveryReason?: string;
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
@@ -216,7 +215,7 @@ export function createWorkerSupervisor(
       if (error instanceof MaterialExecutionCheckoutError) {
         orchestration.blockExecutionCheckout(workerSessionId, executionAttemptId, error.message);
         notifyOwner(
-          `Worker Session ${workerSessionId} needs an Owner intervention: ${error.message}`,
+          `Worker (${orchestration.workerSessionView(workerSessionId)?.assignment.objective ?? "unknown assignment"}) needs you: ${error.message}`,
         );
         return;
       }
@@ -302,7 +301,7 @@ export function createWorkerSupervisor(
             error.message,
           );
           notifyOwner(
-            `Worker Session ${workerSession.id} needs an Owner intervention: ${error.message}`,
+            `Worker (${workerSession.assignment.objective}) needs you: ${error.message}`,
           );
           return;
         }
@@ -330,7 +329,7 @@ export function createWorkerSupervisor(
     );
     orchestration.observeWorkerVerificationResult(workerSession.id, executionAttempt.id, result);
     notifyOwner(
-      `Worker Session ${workerSession.id} finished; Verification ${result.status}.`,
+      `Worker (${workerSession.assignment.objective}) finished; Verification ${result.status}.`,
     );
   };
   const startExecution = async (
@@ -379,7 +378,7 @@ export function createWorkerSupervisor(
         if (error instanceof MaterialExecutionCheckoutError) {
           orchestration.blockExecutionCheckout(workerSession.id, executionAttempt.id, error.message);
           notifyOwner(
-            `Worker Session ${workerSession.id} needs an Owner intervention: ${error.message}`,
+            `Worker (${workerSession.assignment.objective}) needs you: ${error.message}`,
           );
           return;
         }
@@ -391,7 +390,7 @@ export function createWorkerSupervisor(
           processGone: true,
           detail,
         });
-        notifyOwner(`Worker Session ${workerSession.id} failed before launch: ${detail}`);
+        notifyOwner(`Worker (${workerSession.assignment.objective}) failed before launch: ${detail}`);
         await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
         return;
       }
@@ -514,7 +513,7 @@ export function createWorkerSupervisor(
             if (!willVerify) {
               const summary = reportedOutcome?.summary ?? terminalDetail;
               notifyOwner(
-                `Worker Session ${workerSession.id} ${status}` +
+                `Worker (${workerSession.assignment.objective}) ${status}` +
                   (summary ? `: ${summary}` : "."),
               );
             }
@@ -549,7 +548,7 @@ export function createWorkerSupervisor(
               await startExecution(recovery.workerSession, recovery.executionAttempt);
             } else {
               notifyOwner(
-                `Worker Session ${workerSession.id} lost continuity and exhausted automatic recovery: ${error.message}`,
+                `Worker (${workerSession.assignment.objective}) lost continuity and exhausted automatic recovery: ${error.message}`,
               );
               await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
             }
@@ -644,7 +643,7 @@ export function createWorkerSupervisor(
         processGone: !latestAttempt?.process,
         detail: startupDetail,
       });
-      notifyOwner(`Worker Session ${workerSession.id} failed to start: ${startupDetail}`);
+      notifyOwner(`Worker (${workerSession.assignment.objective}) failed to start: ${startupDetail}`);
       await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
       throw error;
     }

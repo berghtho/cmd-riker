@@ -986,19 +986,6 @@ test("orchestration blocks startup recovery after its bounded read-only attempts
     reason: "Automatic Worker recovery exhausted its bounded attempts.",
     nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
   });
-  orchestration.recordCommitmentOwnerAttention(commitment.id, {
-    kind: "recovery-exhausted",
-    reason: "The linked Worker exhausted automatic recovery.",
-    nextAction: "The Owner must choose a changed recovery strategy.",
-    cause: {
-      kind: "worker-recovery-exhausted",
-      workerSessionId: started.workerSessionId,
-    },
-  });
-  assert.deepEqual(state.readCommitment(commitment.id)?.condition?.ownerAttentionCause, {
-    kind: "worker-recovery-exhausted",
-    workerSessionId: started.workerSessionId,
-  });
   const recovery = await supervisor.delegate({
     ...assignment,
     recoveryOfWorkerSessionId: started.workerSessionId,

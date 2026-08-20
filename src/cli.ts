@@ -50,8 +50,6 @@ import {
 import { runPiOwnerInterface } from "./pi-owner-interface.ts";
 import {
   parseSessionViewControl,
-  parseSessionViewInspection,
-  parseSessionViewWorkerInspection,
   projectSessionView,
   renderSessionItems,
   renderSessionView,
@@ -343,57 +341,25 @@ async function completeOwnerInteraction(
       content: renderSessionWorkers(snapshot),
     };
   }
-  const workerInspection = parseSessionViewWorkerInspection(snapshot, ownerInput);
-  if (workerInspection) {
-    return {
-      source: "Session View",
-      content: renderSessionWorkers(snapshot, workerInspection.id),
-    };
-  }
-  const inspection = parseSessionViewInspection(snapshot, ownerInput);
-  if (inspection) {
-    const detailedSnapshot = sessionViewSnapshot(
-      state,
-      workerSupervisor,
-      "available",
-      true,
-    );
-    return {
-      source: "Session View",
-      content: renderSessionView(detailedSnapshot, inspection.id),
-    };
-  }
   const action = parseSessionViewControl(snapshot, ownerInput);
   if (!action) {
     return {
       source: "Session View",
-      content: "That intervention is not available for the current authoritative state.",
+      content: "That control is not available right now.",
     };
   }
   const ownerTurnId = state.appendOwnerMessage(ownerInput);
   onOwnerTurnRecorded?.(ownerTurnId);
-  if (action.kind === "pause") {
-    createOrchestrationCore(state).pauseCommitment(
-      action.targetId,
-      ownerTurnId,
-      "Owner requested a pause from the Session View.",
-    );
-    state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
-    return {
-      source: "Session View",
-      content: "Pause recorded. Linked Worker activity and any effects remain separate facts.",
-    };
-  }
   if (!workerSupervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
   await workerSupervisor.cancel(
-    action.targetId,
+    action.workerSessionId,
     ownerTurnId,
     "Owner requested cancellation from the Session View.",
   );
   state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
   return {
     source: "Session View",
-    content: "Cancellation intent recorded and sent. Existing effects are not rolled back.",
+    content: "Cancellation requested. Changes already made are not rolled back.",
   };
 }
 
@@ -409,12 +375,10 @@ function sessionViewSnapshot(
   state: AuthoritativeState,
   workerSupervisor?: WorkerSupervisor,
   leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
-  includeHealthAssessments = false,
 ): SessionViewSnapshot {
   return projectSessionView(state, {
     leadAvailability,
     cancellationAvailable: Boolean(workerSupervisor),
-    includeHealthAssessments,
   });
 }
 

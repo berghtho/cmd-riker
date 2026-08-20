@@ -335,22 +335,12 @@ test("a reserved Commitment waits for a later Owner Acceptance", async (t) => {
     ],
   });
   orchestration.observeLeadResponse(creationTurnId, "How about Riker?");
-  assert.equal(state.readCommitments()[0]?.state, "awaiting-acceptance");
-  assert.throws(
-    () => orchestration.acceptCommitment(commitment.id, creationTurnId),
-    /later Owner turn/,
-  );
-  assert.throws(
-    () => orchestration.acceptCommitment(commitment.id, earlierTurnId),
-    /later Owner turn/,
-  );
-
-  const acceptanceTurnId = state.appendOwnerMessage("I accept that name.");
-  orchestration.acceptCommitment(commitment.id, acceptanceTurnId);
-  const accepted = state.readCommitments()[0];
-  assert.equal(accepted?.state, "accepted");
-  assert.equal(accepted?.acceptance?.authority, "owner");
-  assert.equal(accepted?.acceptance?.ownerTurnId, acceptanceTurnId);
+  // Delivery needs no Owner Acceptance gate; objections would be new work.
+  const delivered = state.readCommitments()[0];
+  assert.equal(delivered?.state, "accepted");
+  assert.equal(delivered?.acceptance?.authority, "lead-agent");
+  assert.equal(commitment.id, delivered?.id);
+  assert.equal(typeof earlierTurnId, "string");
   state.close();
 });
 
@@ -388,15 +378,6 @@ test("a failed Lead turn leaves its active Commitment blocked with a recovery ac
     reason: "Lead Model turn failed: unavailable.",
     nextAction: "Reconcile the failed Lead turn before continuing this Commitment.",
   });
-  orchestration.recordCommitmentOwnerAttention(commitment.id, {
-    kind: "mission-critical-impairment",
-    reason: "The failed Lead turn now blocks the mission-critical outcome.",
-    nextAction: "The Owner must choose whether to retry with a different Model.",
-  });
-  assert.equal(
-    state.readCommitment(commitment.id)?.condition?.ownerAttention,
-    "mission-critical-impairment",
-  );
   const recoveryTurnId = state.appendOwnerMessage("Resume that Commitment now.");
   orchestration.resumeCommitment(commitment.id, recoveryTurnId);
   orchestration.observeLeadResponse(recoveryTurnId, "Recovered result");
@@ -404,7 +385,7 @@ test("a failed Lead turn leaves its active Commitment blocked with a recovery ac
   state.close();
 });
 
-test("Owner controls can pause, resume, and cancel a nonterminal Commitment", async (t) => {
+test("Owner controls can resume and cancel a nonterminal Work Item", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-state-control-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
   const state = openAuthoritativeState(stateDirectory);
@@ -430,9 +411,8 @@ test("Owner controls can pause, resume, and cancel a nonterminal Commitment", as
       },
     ],
   });
-  const pauseTurnId = state.appendOwnerMessage("Pause it.");
-  orchestration.pauseCommitment(commitment.id, pauseTurnId, "Owner requested a pause.");
-  assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "paused");
+  orchestration.observeLeadTurnFailure(creationTurnId, "Lead Model turn failed: unavailable.");
+  assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "blocked");
   const resumeTurnId = state.appendOwnerMessage("Resume it.");
   orchestration.resumeCommitment(commitment.id, resumeTurnId);
   assert.equal(state.readCommitment(commitment.id)?.condition, undefined);

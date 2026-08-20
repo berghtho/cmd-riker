@@ -19,8 +19,6 @@ import {
   type ModelSelection,
 } from "../model-selection.ts";
 import {
-  type ActingAuthority,
-  type ActingAuthorityEffectRequest,
   assertSupportedWorkerModelSelection,
   type CapabilityNotice,
   type Commitment,
@@ -64,10 +62,6 @@ export { StaleWriteGenerationError };
 export type { ModelSelection } from "../model-selection.ts";
 export type { SelfRepairRecord } from "../self-repair-controller/index.ts";
 export type {
-  ActingAuthority,
-  ActingAuthorityEffectRequest,
-  ActingAuthorityEvent,
-  ActingAuthorityHandoff,
   CapabilityNotice,
   Commitment,
   CommitmentCriterion,
@@ -255,9 +249,6 @@ export interface AuthoritativeState {
   readStandingOrder(standingOrderId: string): StandingOrder | undefined;
   readStandingOrders(): StandingOrder[];
   appendStandingOrderSnapshots(snapshots: StandingOrder[]): void;
-  readActingAuthority(actingAuthorityId: string): ActingAuthority | undefined;
-  readActingAuthorities(): ActingAuthority[];
-  appendActingAuthoritySnapshots(snapshots: ActingAuthority[]): void;
   appendSelfRepairSnapshots(snapshots: SelfRepairRecord[]): void;
   readSelfRepair(selfRepairId: string): SelfRepairRecord | undefined;
   readSelfRepairs(): SelfRepairRecord[];
@@ -334,7 +325,6 @@ type FactDraft =
   | { kind: "worker-question.snapshot"; value: WorkerQuestion }
   | { kind: "capability-notice.snapshot"; value: CapabilityNotice }
   | { kind: "standing-order.snapshot"; value: StandingOrder }
-  | { kind: "acting-authority.snapshot"; value: ActingAuthority }
   | { kind: "self-repair.snapshot"; value: SelfRepairRecord }
   | { kind: "coordination-message.recorded"; value: CoordinationMessage }
   | { kind: "forge-operation-attempt.snapshot"; value: ForgeOperationAttempt }
@@ -362,7 +352,6 @@ type TransitionKind =
   | `worker-question.${WorkerQuestion["status"]}`
   | `capability-notice.${CapabilityNotice["state"]}`
   | `standing-order.${StandingOrder["state"]}`
-  | `acting-authority.${ActingAuthority["state"]}`
   | `self-repair.${SelfRepairRecord["attempts"][number]["status"]}`
   | "coordination-message.recorded"
   | `forge-operation-attempt.${ForgeOperationAttempt["status"]}`
@@ -621,7 +610,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot"
+
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
@@ -650,7 +639,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot"
+
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
@@ -675,7 +664,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot"
+
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
@@ -686,7 +675,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority"
+
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
@@ -697,7 +686,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority"
+
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
@@ -761,7 +750,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-      | "acting-authority.snapshot"
+
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
@@ -770,7 +759,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority"
+
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
@@ -779,7 +768,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-      | "acting-authority"
+
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
@@ -800,83 +789,6 @@ export function openAuthoritativeState(
     );
   };
 
-  const assertActingAuthorityDispatch = (
-    effectIntent: EffectIntent,
-    actualEffect: {
-      effectClass: StandingOrder["effectClasses"][number];
-      target: string;
-      reversible: boolean;
-      externallyBinding: boolean;
-      incrementalSpendUsd: number;
-    },
-  ): void => {
-    const actingAuthority = readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot").at(-1);
-    const authorization = effectIntent.authorization.actingAuthority;
-    if (!actingAuthority || actingAuthority.state === "ended") {
-      if (authorization) {
-        throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
-      }
-      return;
-    }
-    if (!actingAuthority.commitmentIds.includes(effectIntent.commitmentId)) {
-      if (authorization) {
-        throw new Error("Acting Authority cannot authorize an unrelated Commitment effect.");
-      }
-      return;
-    }
-    if (!authorization) {
-      // Command Authority covers the dispatch whether the Owner is present or
-      // absent; a Standing Order grant only attributes it, it never gates it.
-      return;
-    }
-    if (actingAuthority.state !== "active") {
-      throw new Error("An Acting Authority effect authorization cannot outlive command authority.");
-    }
-    const grant = (actingAuthority.effectAuthorizations ?? []).find(
-      (candidate) => candidate.id === authorization.authorizationId,
-    );
-    const standingOrder = authorization.standingOrderId
-      ? readCurrentSnapshot<StandingOrder>(
-          "standing-order.snapshot",
-          `standing-order:${authorization.standingOrderId}`,
-        )?.value
-      : undefined;
-    if (
-      !grant ||
-      grant.actingAuthorityId !== actingAuthority.id ||
-      authorization.actingAuthorityId !== actingAuthority.id ||
-      grant.standingOrderId !== authorization.standingOrderId ||
-      grant.commitmentId !== effectIntent.commitmentId ||
-      grant.effectClass !== actualEffect.effectClass ||
-      grant.target !== actualEffect.target ||
-      grant.reversible !== actualEffect.reversible ||
-      grant.externallyBinding !== actualEffect.externallyBinding ||
-      grant.incrementalSpendUsd !== actualEffect.incrementalSpendUsd ||
-      !standingOrder ||
-      standingOrder.state !== "active" ||
-      Date.parse(standingOrder.validUntil) <= Date.now() ||
-      !standingOrder.commitmentIds.includes(grant.commitmentId) ||
-      !standingOrder.effectClasses.includes(grant.effectClass) ||
-      !standingOrder.targets.includes(grant.target) ||
-      grant.incrementalSpendUsd > standingOrder.maximumIncrementalSpendUsd ||
-      (!grant.reversible && !standingOrder.allowIrreversibleEffects) ||
-      (grant.externallyBinding && !standingOrder.allowExternallyBindingEffects)
-    ) {
-      throw new Error("Effect dispatch does not match its durable Acting Authority authorization.");
-    }
-    const reused = database
-      .prepare(`
-        SELECT 1
-          FROM facts
-         WHERE kind = 'effect-intent.snapshot'
-           AND json_extract(value_json, '$.authorization.actingAuthority.authorizationId') = ?
-         LIMIT 1
-      `)
-      .get(authorization.authorizationId);
-    if (reused) {
-      throw new Error("An Acting Authority effect authorization can dispatch only one effect intent.");
-    }
-  };
 
   const readTargetProjectOperationAttemptRow = (
     attemptId: string,
@@ -929,21 +841,18 @@ export function openAuthoritativeState(
         SELECT 1
           FROM facts current
          WHERE current.kind = 'effect-intent.snapshot'
-           AND (
-             COALESCE(
-               json_extract(current.value_json, '$.effectScopeKey'),
-               json_extract(current.value_json, '$.authorizedWriteRootKey'),
-               lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
-             ) = ?
-             OR json_extract(current.value_json, '$.commitmentId') = ?
-           )
+           AND COALESCE(
+             json_extract(current.value_json, '$.effectScopeKey'),
+             json_extract(current.value_json, '$.authorizedWriteRootKey'),
+             lower(json_extract(current.value_json, '$.authorization.targetProjectPath'))
+           ) = ?
            AND json_extract(current.value_json, '$.status') IN ('pending', 'dispatching', 'unknown')
            AND NOT EXISTS (
              SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
            )
          LIMIT 1
       `)
-      .get(effectScopeKey(effectIntent), effectIntent.commitmentId);
+      .get(effectScopeKey(effectIntent));
     if (conflict) throw new Error(message);
   };
 
@@ -1039,16 +948,9 @@ export function openAuthoritativeState(
       effectIntent,
       ...(predecessors ? { predecessors } : {}),
       ...(rejectConflictingCommitmentEffect ? { beforeWrite: () => {
-        assertActingAuthorityDispatch(effectIntent, {
-          effectClass: "test",
-          target: attempt.operation,
-          reversible: true,
-          externallyBinding: false,
-          incrementalSpendUsd: 0,
-        });
         assertNoConflictingOpenEffect(
           effectIntent,
-          "A conflicting Target Project effect is already open for this Commitment.",
+          "A conflicting Target Project effect is already open for this operation scope.",
         );
       } } : {}),
     });
@@ -1079,19 +981,9 @@ export function openAuthoritativeState(
         if (attempt.target.kind !== "github-issue") {
           throw new Error("Only a typed GitHub target can dispatch a Forge mutation.");
         }
-        if (!effectIntent.authorization.actingAuthority) {
-          throw new Error("Public GitHub effects require a bounded Standing Order authorization.");
-        }
-        assertActingAuthorityDispatch(effectIntent, {
-          effectClass: "update",
-          target: `${attempt.target.repository}#${attempt.target.issueNumber}`,
-          reversible: true,
-          externallyBinding: true,
-          incrementalSpendUsd: 0,
-        });
         assertNoConflictingOpenEffect(
           effectIntent,
-          "A conflicting effect is already open for this Forge target or Commitment.",
+          "A conflicting effect is already open for this Forge target.",
         );
       } } : {}),
     });
@@ -1588,17 +1480,6 @@ export function openAuthoritativeState(
           if (assignment.readOnly) {
             throw new Error("An effect intent cannot dispatch a read-only Worker assignment.");
           }
-          assertActingAuthorityDispatch(effectIntent, {
-            effectClass:
-              assignment.coordination?.role === "implementer" &&
-              assignment.coordination.repairOfReviewFindingIds?.length
-                ? "self-repair"
-                : "update",
-            target: assignment.targetProjectPath,
-            reversible: true,
-            externallyBinding: false,
-            incrementalSpendUsd: assignment.costBound.maximumIncrementalSpendUsd,
-          });
           const conflict = database
             .prepare(`
               SELECT 1
@@ -1865,26 +1746,6 @@ export function openAuthoritativeState(
 
     readStandingOrders() {
       return readCurrentSnapshots<StandingOrder>("standing-order.snapshot");
-    },
-
-    appendActingAuthoritySnapshots(snapshots) {
-      appendSnapshots(
-        "acting-authority.snapshot",
-        "acting-authority",
-        "acting-authority",
-        snapshots,
-      );
-    },
-
-    readActingAuthority(actingAuthorityId) {
-      return readCurrentSnapshot<ActingAuthority>(
-        "acting-authority.snapshot",
-        `acting-authority:${actingAuthorityId}`,
-      )?.value;
-    },
-
-    readActingAuthorities() {
-      return readCurrentSnapshots<ActingAuthority>("acting-authority.snapshot");
     },
 
     appendSelfRepairSnapshots(snapshots) {
@@ -3354,8 +3215,6 @@ function factSubject(input: FactDraft): string {
       return `capability-notice:${input.value.id}`;
     case "standing-order.snapshot":
       return `standing-order:${input.value.id}`;
-    case "acting-authority.snapshot":
-      return `acting-authority:${input.value.id}`;
     case "self-repair.snapshot":
       return `self-repair:${input.value.id}`;
     case "coordination-message.recorded":

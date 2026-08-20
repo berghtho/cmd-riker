@@ -79,29 +79,14 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
   state.close();
 });
 
-test("Owner CLI carries one attributed Commitment to objective Acceptance", async (t) => {
+test("Owner CLI answers without commitment ceremony or paperwork tools", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-commitment-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
-  const localModel = await startLocalModel((call, requestBody) => {
-    if (call === 1) {
-      assert.match(JSON.stringify(requestBody), /record_commitment/);
-      return {
-        toolCall: {
-          id: "commitment-call-1",
-          name: "record_commitment",
-          arguments: {
-            outcome: "Reply with the exact requested phrase.",
-            criteria: [
-              {
-                kind: "response-includes",
-                description: "The response includes Engage.",
-                expectedText: "Engage.",
-              },
-            ],
-          },
-        },
-      };
-    }
+  const localModel = await startLocalModel((_call, requestBody) => {
+    const request = JSON.stringify(requestBody);
+    assert.doesNotMatch(request, /record_commitment/);
+    assert.doesNotMatch(request, /accept_commitment/);
+    assert.doesNotMatch(request, /acting_authority/);
     return "Engage.";
   });
   t.after(() => localModel.close());
@@ -124,90 +109,15 @@ test("Owner CLI carries one attributed Commitment to objective Acceptance", asyn
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /Lead Agent: Engage\./);
-  assert.match(result.stdout, /Commitment [0-9a-f-]{36} accepted:/);
+  assert.doesNotMatch(result.stdout, /Commitment [0-9a-f-]{36}/);
   const state = openAuthoritativeState(stateDirectory);
-  const commitment = state.readCommitments()[0];
-  assert.equal(commitment?.state, "accepted");
-  assert.equal(commitment?.acceptance?.authority, "lead-agent");
+  assert.equal(state.readCommitments().length, 0);
   assert.deepEqual(state.readOwnerConversation()?.messages.at(-1)?.modelSelection, {
     provider: "local-openai",
     model: "owner-model",
     api: "openai-completions",
     baseUrl: localModel.baseUrl,
   });
-  state.close();
-});
-
-test("Owner CLI leaves subjective work for a later explicit Owner Acceptance", async (t) => {
-  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-owner-acceptance-test-"));
-  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
-  const localModel = await startLocalModel((call, requestBody) => {
-    if (call === 1) {
-      return {
-        toolCall: {
-          id: "commitment-call-subjective",
-          name: "record_commitment",
-          arguments: {
-            outcome: "Propose a product name for Owner judgment.",
-            criteria: [
-              {
-                kind: "owner-judgment",
-              },
-            ],
-          },
-        },
-      };
-    }
-    if (call === 2) return "I propose Riker.";
-    if (call === 3) {
-      const commitmentId = JSON.stringify(requestBody).match(
-        /([0-9a-f-]{36}): awaiting-acceptance/,
-      )?.[1];
-      assert(commitmentId);
-      return {
-        toolCall: {
-          id: "commitment-call-accept",
-          name: "accept_commitment",
-          arguments: { commitmentId },
-        },
-      };
-    }
-    return "Owner Acceptance recorded.";
-  });
-  t.after(() => localModel.close());
-  await writeFile(
-    join(stateDirectory, "config.json"),
-    JSON.stringify({
-      targetProject: { path: "C:\\target-project" },
-      modelSelection: {
-        provider: "local-openai",
-        model: "owner-model",
-        api: "openai-completions",
-        baseUrl: localModel.baseUrl,
-      },
-      modelFallbacks: [],
-      modelPolicyRevision: "owner-policy-1",
-    }),
-  );
-
-  const result = await runCli(
-    stateDirectory,
-    "Propose a product name and let me judge it.\nI explicitly accept that proposal.\n",
-  );
-
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /awaiting Owner Acceptance/);
-  assert.match(result.stdout, /Commitment [0-9a-f-]{36} accepted:/);
-  const state = openAuthoritativeState(stateDirectory);
-  const commitment = state.readCommitments()[0];
-  assert.equal(commitment?.state, "accepted");
-  assert.equal(commitment?.acceptance?.authority, "owner");
-  assert.equal(
-    commitment?.acceptance?.authority === "owner"
-      ? commitment.acceptance.ownerTurnId
-      : undefined,
-    state.readOwnerConversation()?.messages[2]?.turnId,
-  );
   state.close();
 });
 

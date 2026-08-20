@@ -61,10 +61,10 @@ export function commitmentNotice(commitment: {
   state: string;
   condition?: { kind: string };
 }): string {
-  const status = commitment.state === "awaiting-acceptance"
-    ? "awaiting Owner Acceptance"
+  const status = commitment.state === "accepted" || commitment.state === "awaiting-acceptance"
+    ? "delivered"
     : commitment.condition?.kind ?? commitment.state;
-  return `Commitment ${commitment.id} ${status}: ${commitment.outcome}`;
+  return `Work item ${status}: ${commitment.outcome}`;
 }
 
 async function completeOwnerTurn(input: {
@@ -86,35 +86,30 @@ async function completeOwnerTurn(input: {
       .readCommitments()
       .map((commitment) => [commitment.id, commitmentFingerprint(commitment)]),
   );
-  // Durable Acting Authority paperwork is resolved here, never composed by the
-  // model or requested from the Owner.
-  const actingAuthorityGrant = (
-    commitmentId: string,
-    effect: { effectClass: "test" | "update"; target: string; externallyBinding: boolean },
-  ) => {
-    const actingAuthority = orchestration.actingAuthorityView();
-    if (
-      actingAuthority?.state !== "active" ||
-      !actingAuthority.commitmentIds.includes(commitmentId)
-    ) {
-      return undefined;
-    }
-    try {
-      return orchestration.authorizeActingAuthorityEffect({
-        actingAuthorityId: actingAuthority.id,
-        commitmentId,
-        effectClass: effect.effectClass,
-        target: effect.target,
-        reversible: true,
-        externallyBinding: effect.externallyBinding,
-        incrementalSpendUsd: 0,
-      });
-    } catch {
-      // Command Authority covers the dispatch; a grant only attributes it.
-      // Externally binding public effects stay gated at their own dispatch.
-      return undefined;
-    }
-  };
+  // Work Items are durable internal tracking; the model never fills forms for
+  // them. A missing Work Item is minted from the objective at hand.
+  const workItemFor = (
+    workItemId: string | undefined,
+    outcome: string,
+    criterion?:
+      | { kind: "target-project-operation"; operation: "test"; description: string }
+      | {
+          kind: "forge-operation";
+          operation: "github-issue-comment" | "azure-subscription-inspection";
+          description: string;
+        },
+  ): string =>
+    workItemId ??
+    orchestration.recordCommitment(turnId, {
+      outcome,
+      criteria: [
+        criterion ?? {
+          kind: "target-project-operation",
+          operation: "test",
+          description: "The declared Target Project test operation verifies the outcome.",
+        },
+      ],
+    }).id;
   const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
   for (const [index, modelSelection] of candidates.entries()) {
     const validation = await input.adapter.validateSelection(
@@ -150,19 +145,10 @@ async function completeOwnerTurn(input: {
         commitments: input.state.readCommitments(),
         nativeTools: { cwd: conversation.targetProject.path },
         standingOrders: orchestration.standingOrdersView(),
-        ...(orchestration.actingAuthorityView()
-          ? { actingAuthority: orchestration.actingAuthorityView()! }
-          : {}),
         authorityActions: {
           recordStandingOrder: (draft) => orchestration.recordStandingOrder(turnId, draft),
           revokeStandingOrder: (standingOrderId, reason) =>
             orchestration.revokeStandingOrder(standingOrderId, turnId, reason),
-          beginActingAuthority: (authorityInput) =>
-            orchestration.beginActingAuthority(turnId, authorityInput),
-          recordActingAuthorityEvent: (actingAuthorityId, eventInput) =>
-            orchestration.recordActingAuthorityEvent(actingAuthorityId, eventInput),
-          prepareActingAuthorityHandoff: (actingAuthorityId) =>
-            orchestration.prepareActingAuthorityHandoff(actingAuthorityId, turnId),
         },
         workers: orchestration.workerSessionsView(),
         workerQuestions: orchestration.workerQuestionsView(),
@@ -269,48 +255,20 @@ async function completeOwnerTurn(input: {
             }
           : {}),
         commitmentActions: {
-          record: (draft) => orchestration.recordCommitment(turnId, draft),
-          recordOwnerAttention: (commitmentId, attentionInput) => {
-            orchestration.recordCommitmentOwnerAttention(commitmentId, attentionInput);
-          },
-          accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
-          resume: (commitmentId) => orchestration.resumeCommitment(commitmentId, turnId),
-          control: (commitmentId, action, reason, replacementCommitmentId) => {
-            if (action === "pause") orchestration.pauseCommitment(commitmentId, turnId, reason);
-            else if (action === "cancel") orchestration.cancelCommitment(commitmentId, turnId, reason);
-            else {
-              if (!replacementCommitmentId) {
-                throw new Error("Supersession requires a replacement Commitment.");
-              }
-              orchestration.supersedeCommitment(
-                commitmentId,
-                turnId,
-                reason,
-                replacementCommitmentId,
-              );
-            }
-          },
-          executeOperation: async (commitmentId, operation) => {
-            const authorization = actingAuthorityGrant(commitmentId, {
-              effectClass: "test",
-              target: operation,
-              externallyBinding: false,
-            });
+          resume: (workItemId) => orchestration.resumeCommitment(workItemId, turnId),
+          cancel: (workItemId, reason) =>
+            orchestration.cancelCommitment(workItemId, turnId, reason),
+          executeOperation: async (workItemId, operation) => {
+            const commitmentId = workItemFor(
+              workItemId,
+              "The declared Target Project test operation passes.",
+            );
             const result = await input.targetProjectOperations.execute({
               commitmentId,
               operation: { kind: operation, inputs: {} },
               checkout: conversation.targetProject.path,
               workingDirectory: conversation.targetProject.path,
               timeoutMs: 120_000,
-              ...(authorization
-                ? {
-                    actingAuthorityEffectAuthorization: {
-                      actingAuthorityId: authorization.actingAuthorityId,
-                      authorizationId: authorization.id,
-                      standingOrderId: authorization.standingOrderId,
-                    },
-                  }
-                : {}),
             });
             orchestration.observeTargetProjectOperationResult(commitmentId, result);
             return result;
@@ -321,13 +279,17 @@ async function completeOwnerTurn(input: {
             ? {
                 commentOnGitHubIssue: async (operationInput) => {
                   const authority = conversation.forgeAuthorities!.github!;
-                  const authorization = actingAuthorityGrant(operationInput.commitmentId, {
-                    effectClass: "update",
-                    target: `${authority.repository}#${operationInput.issueNumber}`,
-                    externallyBinding: true,
-                  });
+                  const commitmentId = workItemFor(
+                    operationInput.commitmentId,
+                    `A bounded comment is published on ${authority.repository}#${operationInput.issueNumber}.`,
+                    {
+                      kind: "forge-operation",
+                      operation: "github-issue-comment",
+                      description: "The typed GitHub adapter proves the exact published comment.",
+                    },
+                  );
                   const result = await input.forgeOperations.execute({
-                    commitmentId: operationInput.commitmentId,
+                    commitmentId,
                     operation: {
                       kind: "github-issue-comment",
                       repository: authority.repository,
@@ -336,25 +298,25 @@ async function completeOwnerTurn(input: {
                       expectedAccount: authority.account,
                     },
                     timeoutMs: 30_000,
-                    ...(authorization
-                      ? {
-                          actingAuthorityEffectAuthorization: {
-                            actingAuthorityId: authorization.actingAuthorityId,
-                            authorizationId: authorization.id,
-                            standingOrderId: authorization.standingOrderId,
-                          },
-                        }
-                      : {}),
                   });
-                  orchestration.observeForgeOperationResult(operationInput.commitmentId, result);
+                  orchestration.observeForgeOperationResult(commitmentId, result);
                   return result;
                 },
               }
             : {}),
           ...(conversation.forgeAuthorities?.azure
             ? {
-                inspectAzureSubscription: async (commitmentId) => {
+                inspectAzureSubscription: async (workItemId) => {
                   const authority = conversation.forgeAuthorities!.azure!;
+                  const commitmentId = workItemFor(
+                    workItemId,
+                    "The Azure subscription inspection completes.",
+                    {
+                      kind: "forge-operation",
+                      operation: "azure-subscription-inspection",
+                      description: "The typed Azure adapter proves the read-only inspection.",
+                    },
+                  );
                   const result = await input.forgeOperations.execute({
                     commitmentId,
                     operation: {
@@ -434,17 +396,6 @@ async function completeOwnerTurn(input: {
         ? `${durableResponse}\n\n${notices.join("\n")}`
         : durableResponse;
       orchestration.settleLeadTurnAttempt(attempt.id, "completed");
-      const pendingHandoff = orchestration.actingAuthorityView();
-      if (
-        pendingHandoff?.state === "handoff-pending" &&
-        pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
-      ) {
-        orchestration.observeActingAuthorityHandoffDelivered(
-          pendingHandoff.id,
-          turnId,
-          durableResponse,
-        );
-      }
       return content;
     } catch (error) {
       if (!(error instanceof PiTurnFailure)) throw error;

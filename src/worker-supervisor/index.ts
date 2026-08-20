@@ -10,6 +10,7 @@ import {
 } from "../orchestration-core/index.ts";
 import type { TargetProjectOperations } from "../target-project-operations/index.ts";
 import {
+  MaterialExecutionCheckoutError,
   NativeEffectfulCheckoutInspector,
   type EffectfulCheckoutInspector,
 } from "./checkout-isolation.ts";
@@ -32,6 +33,7 @@ export {
 } from "./copilot-acp.ts";
 export {
   NativeEffectfulCheckoutInspector,
+  MaterialExecutionCheckoutError,
   type EffectfulCheckoutInspector,
   type IsolatedCheckout,
 } from "./checkout-isolation.ts";
@@ -176,12 +178,104 @@ export function createWorkerSupervisor(
     for (const timer of deadlinesByAttempt.get(executionAttemptId) ?? []) clearTimeout(timer);
     deadlinesByAttempt.delete(executionAttemptId);
   };
+  const disposeRejectedExecutionCheckout = async (
+    workerSessionId: string,
+    executionAttemptId: string,
+  ): Promise<void> => {
+    const current = orchestration.workerSessionView(workerSessionId);
+    if (
+      !current ||
+      current.assignment.readOnly ||
+      !current.assignment.executionCheckout ||
+      !checkoutInspector.advance
+    ) return;
+    const attempt = orchestration.workerExecutionAttemptView(executionAttemptId);
+    const effect = attempt?.effectIntentId ? state.readEffectIntent(attempt.effectIntentId) : undefined;
+    if (effect?.status !== "rejected") return;
+    try {
+      const disposing = current.assignment.executionCheckout.phase === "disposing"
+        ? current
+        : orchestration.claimExecutionCheckoutDisposal(workerSessionId, executionAttemptId);
+      if (disposing.assignment.readOnly) return;
+      await checkoutInspector.advance(
+        disposing.assignment.checkoutIsolation,
+        "disposed",
+        [],
+        disposing.assignment.timeoutMs,
+      );
+      orchestration.observeExecutionCheckoutDisposed(workerSessionId, executionAttemptId);
+    } catch (error) {
+      if (error instanceof MaterialExecutionCheckoutError) {
+        orchestration.blockExecutionCheckout(workerSessionId, executionAttemptId, error.message);
+        return;
+      }
+      throw error;
+    }
+  };
   const verifySettledWorker = async (
     workerSession: WorkerSession,
     executionAttempt: WorkerExecutionAttempt,
   ): Promise<void> => {
+    workerSession = orchestration.workerSessionView(workerSession.id) ?? workerSession;
     if (workerSession.assignment.readOnly || !verificationOperations) {
       throw new Error("Effectful Worker Verification operations are unavailable.");
+    }
+    if (workerSession.assignment.executionCheckout) {
+      if (!checkoutInspector.advance) {
+        throw new Error("Managed Execution Checkout lifecycle operations are unavailable.");
+      }
+      try {
+        let current = orchestration.workerSessionView(workerSession.id)!;
+        let phase = current.assignment.readOnly
+          ? undefined
+          : current.assignment.executionCheckout?.phase;
+        if (phase === "prepared") {
+          current = orchestration.claimExecutionCheckoutReconciliation(
+            workerSession.id,
+            executionAttempt.id,
+          );
+          phase = current.assignment.readOnly ? undefined : current.assignment.executionCheckout?.phase;
+        }
+        if (phase === "reconciling") {
+          await checkoutInspector.advance(
+            workerSession.assignment.checkoutIsolation,
+            "reconciled",
+            workerSession.outcome?.affectedArtifacts ?? [],
+            workerSession.assignment.timeoutMs,
+          );
+          current = orchestration.observeExecutionCheckoutReconciled(
+            workerSession.id,
+            executionAttempt.id,
+          );
+          phase = current.assignment.readOnly ? undefined : current.assignment.executionCheckout?.phase;
+        }
+        if (phase === "reconciled") {
+          current = orchestration.claimExecutionCheckoutDisposal(
+            workerSession.id,
+            executionAttempt.id,
+          );
+          phase = current.assignment.readOnly ? undefined : current.assignment.executionCheckout?.phase;
+        }
+        if (phase === "disposing") {
+          await checkoutInspector.advance(
+            workerSession.assignment.checkoutIsolation,
+            "disposed",
+            workerSession.outcome?.affectedArtifacts ?? [],
+            workerSession.assignment.timeoutMs,
+          );
+          orchestration.observeExecutionCheckoutDisposed(workerSession.id, executionAttempt.id);
+        }
+      } catch (error) {
+        if (error instanceof MaterialExecutionCheckoutError) {
+          orchestration.blockExecutionCheckout(
+            workerSession.id,
+            executionAttempt.id,
+            error.message,
+          );
+          return;
+        }
+        throw error;
+      }
     }
     const existingAttempt = state.readTargetProjectOperationAttempts().find(
       (attempt) =>
@@ -213,6 +307,58 @@ export function createWorkerSupervisor(
         `${nativeHarnessName(executionAttempt.modelSelection.nativeHarness)} continuity is unavailable because the configured Native Harness changed.`,
       );
     }
+    const executionCheckout = workerSession.assignment.readOnly
+      ? undefined
+      : workerSession.assignment.executionCheckout;
+    if (executionCheckout) {
+      if (!checkoutInspector.advance) {
+        throw new Error("Managed Execution Checkout lifecycle operations are unavailable.");
+      }
+      try {
+        let phase = executionCheckout.phase;
+        if (phase === "planned") {
+          workerSession = orchestration.claimExecutionCheckoutPreparation(
+            workerSession.id,
+            executionAttempt.id,
+          );
+          phase = workerSession.assignment.readOnly
+            ? phase
+            : workerSession.assignment.executionCheckout!.phase;
+        }
+        if (phase === "preparing") {
+          if (workerSession.assignment.readOnly) {
+            throw new Error("A read-only Worker cannot prepare an Execution Checkout.");
+          }
+          await checkoutInspector.advance(
+            workerSession.assignment.checkoutIsolation,
+            "prepared",
+            [],
+            workerSession.assignment.timeoutMs,
+          );
+          workerSession = orchestration.observeExecutionCheckoutPrepared(
+            workerSession.id,
+            executionAttempt.id,
+          );
+        }
+      } catch (error) {
+        if (error instanceof MaterialExecutionCheckoutError) {
+          orchestration.blockExecutionCheckout(workerSession.id, executionAttempt.id, error.message);
+          return;
+        }
+        orchestration.observeWorkerTerminal({
+          workerSessionId: workerSession.id,
+          executionAttemptId: executionAttempt.id,
+          status: "failed",
+          processGone: true,
+          detail: error instanceof Error ? error.message : "Execution Checkout preparation failed.",
+        });
+        await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
+        return;
+      }
+      if (workerSession.assignment.readOnly || workerSession.assignment.executionCheckout?.phase !== "prepared") {
+        throw new Error("Managed Execution Checkout is not ready for Worker launch.");
+      }
+    }
     orchestration.claimWorkerLaunch(workerSession.id, executionAttempt.id);
     const ready = Promise.withResolvers<NativeWorkerExecution>();
     void ready.promise.catch(() => {});
@@ -236,7 +382,9 @@ export function createWorkerSupervisor(
           executionAttemptId: executionAttempt.id,
           objective: workerSession.assignment.objective,
           prompt: workerSession.assignment.prompt,
-          targetProjectPath: workerSession.assignment.targetProjectPath,
+          targetProjectPath: workerSession.assignment.readOnly
+            ? workerSession.assignment.targetProjectPath
+            : workerSession.assignment.authorizedWriteRoots[0],
           model: executionAttempt.modelSelection.model,
           ...(retainedAnswers.length ? { priorAnswers: retainedAnswers } : {}),
         };
@@ -351,6 +499,8 @@ export function createWorkerSupervisor(
             commandsByAttempt.delete(executionAttempt.id);
             if (recovery.kind === "restart") {
               await startExecution(recovery.workerSession, recovery.executionAttempt);
+            } else {
+              await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
             }
           },
         },
@@ -442,6 +592,7 @@ export function createWorkerSupervisor(
         processGone: !latestAttempt?.process,
         detail: error instanceof Error ? error.message : "Worker startup failed.",
       });
+      await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
       throw error;
     }
   };
@@ -488,6 +639,7 @@ export function createWorkerSupervisor(
       const checkoutIsolation = await checkoutInspector.verify(
         input.targetProjectPath,
         input.timeoutMs,
+        input.commitmentId,
       );
       const { model, ...assignment } = input;
       const modelSelection: WorkerModelSelection = { ...harness.selection, model };
@@ -581,7 +733,25 @@ export function createWorkerSupervisor(
     },
 
     async recover() {
+      for (const worker of orchestration.workerSessionsView()) {
+        if (
+          !worker.assignment.readOnly &&
+          worker.state === "failed" &&
+          worker.assignment.executionCheckout?.phase === "disposing"
+        ) {
+          await disposeRejectedExecutionCheckout(worker.id, worker.currentExecutionAttemptId);
+        }
+      }
       for (const { workerSession: worker, executionAttempt: attempt } of orchestration.workerRecoveryView()) {
+        if (
+          !worker.assignment.readOnly &&
+          worker.assignment.executionCheckout &&
+          attempt.status === "launch-intent-recorded" &&
+          ["planned", "preparing", "prepared"].includes(worker.assignment.executionCheckout.phase)
+        ) {
+          await startExecution(worker, attempt);
+          continue;
+        }
         const abandoned = attempt.process
           ? await harness.abandon(attempt.process)
           : { gone: true };
@@ -605,6 +775,8 @@ export function createWorkerSupervisor(
         const recovery = orchestration.recoverWorker(worker.id, abandoned.gone);
         if (recovery.kind === "restart") {
           await startExecution(recovery.workerSession, recovery.executionAttempt);
+        } else {
+          await disposeRejectedExecutionCheckout(worker.id, attempt.id);
         }
       }
       for (const { workerSession, executionAttempt } of orchestration.workerVerificationRecoveryView()) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,6 +21,7 @@ import {
   createClaudeWorkerHarness,
   createCopilotWorkerHarness,
   createWorkerSupervisor,
+  MaterialExecutionCheckoutError,
   NativeEffectfulCheckoutInspector,
   proveCodexWorkspaceWriteIsolation,
   resolveCodexRuntime,
@@ -1464,6 +1465,316 @@ test("native checkout inspection requires a clean isolated branch and observes i
   await writeFile(join(checkout, "new.txt"), "new\n");
   assert.deepEqual(await inspector.observeChanges(isolated, 5_000), ["new.txt", "tracked.txt"]);
   await assert.rejects(inspector.verify(checkout, 5_000), /contains unaccepted changes/);
+});
+
+test("a local-only primary checkout is reconciled through one disposable Execution Checkout", async (t) => {
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-managed-checkout-test-"));
+  t.after(() => rm(checkout, { recursive: true, force: true }));
+  await execGit(checkout, ["init", "-b", "main"]);
+  await execGit(checkout, ["config", "user.name", "CMD Riker Test"]);
+  await execGit(checkout, ["config", "user.email", "cmd-riker@example.invalid"]);
+  await mkdir(join(checkout, "src"));
+  await writeFile(join(checkout, "src", "tracked.txt"), "baseline\n");
+  await execGit(checkout, ["add", "src/tracked.txt"]);
+  await execGit(checkout, ["commit", "-m", "baseline"]);
+  const inspector = new NativeEffectfulCheckoutInspector();
+
+  const plan = await inspector.verify(checkout, 5_000, "commitment-local-only");
+  assert.equal(plan.isolation.kind, "worktree");
+  assert.equal(plan.managedExecutionCheckout?.targetProjectRoot, checkout);
+  assert.equal(existsSync(plan.root), false);
+
+  await inspector.advance(plan, "prepared", [], 5_000);
+  assert.equal(existsSync(plan.root), true);
+  assert.equal(await readFile(join(checkout, "src", "tracked.txt"), "utf8"), "baseline\n");
+  await writeFile(join(plan.root, "src", "tracked.txt"), "changed\n");
+  await writeFile(join(plan.root, "src", "new.txt"), "new\n");
+  const changes = await inspector.observeChanges(plan, 5_000);
+  assert.deepEqual(changes, ["src/new.txt", "src/tracked.txt"]);
+
+  const ownerChange = join(checkout, "owner-note.txt");
+  await writeFile(ownerChange, "preserve me\n");
+  await assert.rejects(
+    inspector.advance(plan, "reconciled", changes, 5_000),
+    MaterialExecutionCheckoutError,
+  );
+  assert.equal(await readFile(ownerChange, "utf8"), "preserve me\n");
+  assert.equal(existsSync(plan.root), true);
+  await rm(ownerChange);
+
+  await inspector.advance(plan, "reconciled", changes, 5_000);
+  assert.equal(
+    (await readFile(join(checkout, "src", "tracked.txt"), "utf8")).replaceAll("\r\n", "\n"),
+    "changed\n",
+  );
+  assert.equal(
+    (await readFile(join(checkout, "src", "new.txt"), "utf8")).replaceAll("\r\n", "\n"),
+    "new\n",
+  );
+  await inspector.advance(plan, "reconciled", changes, 5_000);
+
+  await inspector.advance(plan, "disposed", changes, 5_000);
+  assert.equal(existsSync(plan.root), false);
+  await inspector.advance(plan, "disposed", changes, 5_000);
+  const worktrees = (await execFileAsync("git", ["worktree", "list", "--porcelain"], {
+    cwd: checkout,
+    windowsHide: true,
+  })).stdout;
+  assert.equal((worktrees.match(/^worktree /gm) ?? []).length, 1);
+});
+
+test("one managed Execution Checkout owns preparation through Verification and cleanup", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-managed-lifecycle-state-"));
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-managed-lifecycle-project-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(checkout, { recursive: true, force: true }));
+  const executionRoot = join(tmpdir(), `cmd-riker-managed-lifecycle-execution-${Date.now()}`);
+  await mkdir(join(checkout, ".git"));
+  const taskfile = join(checkout, "Taskfile.yml");
+  await writeFile(taskfile, "version: '3'\ntasks:\n  test:\n    cmds: []\n");
+  await writeFile(
+    join(checkout, "cmd-riker.operations.json"),
+    JSON.stringify({
+      version: 1,
+      operations: { test: { task: "test", platforms: [declaredPlatform()], artifacts: [] } },
+    }),
+  );
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize({ ...ownerConfiguration(), targetProject: { path: checkout } });
+  const orchestration = createOrchestrationCore(state);
+  const turnId = state.appendOwnerMessage("Implement and verify through automatic isolation.");
+  const commitment = orchestration.recordCommitment(turnId, {
+    outcome: "The automatically isolated change is reconciled and passes tests.",
+    criteria: [{ kind: "target-project-operation", description: "Tests pass.", operation: "test" }],
+  });
+  const lifecycle: string[] = [];
+  let disposalAttempts = 0;
+  const inspector: EffectfulCheckoutInspector = {
+    async verify() {
+      return {
+        root: executionRoot,
+        baselineCommit: "d".repeat(40),
+        isolation: { kind: "worktree" },
+        managedExecutionCheckout: { kind: "managed-worktree", targetProjectRoot: checkout },
+      };
+    },
+    async advance(_checkout, target) {
+      lifecycle.push(target);
+      const worker = state.readWorkerSessions()[0]!;
+      assert.equal(worker.assignment.readOnly, false);
+      const expectedPhase =
+        target === "prepared" ? "preparing" : target === "reconciled" ? "reconciling" : "disposing";
+      assert.equal(worker.assignment.readOnly ? undefined : worker.assignment.executionCheckout?.phase, expectedPhase);
+      const attempt = state.readWorkerExecutionAttempt(worker.currentExecutionAttemptId)!;
+      assert.equal(state.readEffectIntent(attempt.effectIntentId!)?.commitmentId, commitment.id);
+      if (target === "disposed" && ++disposalAttempts === 1) {
+        throw new Error("host stopped during Execution Checkout cleanup");
+      }
+    },
+    async observeChanges() { return ["src/index.ts"]; },
+  };
+  const operations = createTargetProjectOperations(
+    state,
+    {
+      async inspect() {
+        return { version: "Task version: v3.53.1", taskfile, tasks: ["test"] };
+      },
+      async run() { return { exitCode: 0, timedOut: false }; },
+    },
+    { async verify() { return { root: checkout }; } },
+  );
+  const harness = new FakeCodexHarness();
+  const supervisor = createWorkerSupervisor(state, harness, operations, inspector);
+  const started = await supervisor.delegateEffectful({
+    objective: "Implement the isolated change.",
+    prompt: "Change src/index.ts.",
+    targetProjectPath: checkout,
+    model: "gpt-5.6-sol",
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/index.ts"],
+    timeoutMs: 120_000,
+    verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+  });
+  await waitFor(() => state.readWorkerExecutionAttempt(started.executionAttemptId)?.status === "running");
+  assert.equal(harness.starts[0]?.request.targetProjectPath, executionRoot);
+  await assert.rejects(
+    harness.starts[0]!.execution.emitCompleted("completed", undefined, {
+      status: "completed",
+      summary: "Implemented the isolated change.",
+      affectedArtifacts: ["src/index.ts"],
+      verificationResults: ["Ready for host Verification."],
+    }),
+    /host stopped during Execution Checkout cleanup/,
+  );
+  assert.equal(state.readCommitment(commitment.id)?.state, "active");
+  await supervisor.recover();
+
+  const worker = state.readWorkerSession(started.workerSessionId)!;
+  assert.equal(worker.assignment.readOnly, false);
+  assert.equal(worker.assignment.readOnly ? undefined : worker.assignment.executionCheckout?.phase, "disposed");
+  assert.deepEqual(lifecycle, ["prepared", "reconciled", "disposed", "disposed"]);
+  assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
+  const attempt = state.readWorkerExecutionAttempt(started.executionAttemptId)!;
+  const effect = state.readEffectIntent(attempt.effectIntentId!);
+  assert.equal(effect?.status, "succeeded");
+  assert.match(
+    effect?.kind === "worker-assignment" ? effect.verificationOperationAttemptId ?? "" : "",
+    /^[0-9a-f-]{36}$/,
+  );
+  state.close();
+});
+
+test("managed worktree preparation is durably attributed before Git and survives restart", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-managed-checkout-state-"));
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-managed-checkout-project-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(checkout, { recursive: true, force: true }));
+  const executionRoot = join(tmpdir(), `cmd-riker-execution-${Date.now()}`);
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize({ ...ownerConfiguration(), targetProject: { path: checkout } });
+  const orchestration = createOrchestrationCore(state);
+  const turnId = state.appendOwnerMessage("Implement through automatic isolation.");
+  const commitment = orchestration.recordCommitment(turnId, {
+    outcome: "The automatically isolated change passes tests.",
+    criteria: [{ kind: "target-project-operation", description: "Tests pass.", operation: "test" }],
+  });
+  const firstPreparation = Promise.withResolvers<void>();
+  const abandonedPreparation = Promise.withResolvers<void>();
+  let preparationAttempts = 0;
+  const inspector: EffectfulCheckoutInspector = {
+    async verify() {
+      return {
+        root: executionRoot,
+        baselineCommit: "b".repeat(40),
+        isolation: { kind: "worktree" },
+        managedExecutionCheckout: { kind: "managed-worktree", targetProjectRoot: checkout },
+      };
+    },
+    async advance(_checkout, target) {
+      if (target !== "prepared") return;
+      preparationAttempts += 1;
+      const worker = state.readWorkerSessions()[0]!;
+      const attempt = state.readWorkerExecutionAttempt(worker.currentExecutionAttemptId)!;
+      assert.equal(worker.assignment.readOnly, false);
+      assert.equal(worker.assignment.readOnly ? undefined : worker.assignment.executionCheckout?.phase, "preparing");
+      assert.equal(state.readEffectIntent(attempt.effectIntentId!)?.status, "dispatching");
+      firstPreparation.resolve();
+      if (preparationAttempts === 1) await abandonedPreparation.promise;
+    },
+    async observeChanges() {
+      return ["src/index.ts"];
+    },
+  };
+  const harness = new FakeCodexHarness();
+  const firstSupervisor = createWorkerSupervisor(
+    state,
+    harness,
+    { async execute() { assert.fail("Verification is not reached in this recovery proof."); } },
+    inspector,
+  );
+  const started = await firstSupervisor.delegateEffectful({
+    objective: "Implement the isolated change.",
+    prompt: "Change src/index.ts.",
+    targetProjectPath: checkout,
+    model: "gpt-5.6-sol",
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/index.ts"],
+    timeoutMs: 120_000,
+    verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+  });
+  await firstPreparation.promise;
+  assert.equal(harness.starts.length, 0);
+  assert.equal(state.readWorkerSession(started.workerSessionId)?.assignment.readOnly, false);
+
+  const recoveredSupervisor = createWorkerSupervisor(
+    state,
+    harness,
+    { async execute() { assert.fail("Verification is not reached in this recovery proof."); } },
+    inspector,
+  );
+  await recoveredSupervisor.recover();
+  await waitFor(() => state.readWorkerExecutionAttempt(started.executionAttemptId)?.status === "running");
+  assert.equal(preparationAttempts, 2);
+  assert.equal(harness.starts.length, 1);
+  assert.equal(harness.starts[0]?.request.targetProjectPath, executionRoot);
+  assert.equal(harness.starts[0]?.request.readOnly, false);
+  state.close();
+});
+
+test("a material automatic-isolation conflict reaches the Owner without Worker dispatch", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-managed-conflict-state-"));
+  const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-managed-conflict-project-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(checkout, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize({ ...ownerConfiguration(), targetProject: { path: checkout } });
+  const orchestration = createOrchestrationCore(state);
+  const turnId = state.appendOwnerMessage("Implement through automatic isolation.");
+  const commitment = orchestration.recordCommitment(turnId, {
+    outcome: "The automatically isolated change passes tests.",
+    criteria: [{ kind: "target-project-operation", description: "Tests pass.", operation: "test" }],
+  });
+  const harness = new FakeCodexHarness();
+  let conflictPresent = true;
+  const supervisor = createWorkerSupervisor(
+    state,
+    harness,
+    { async execute() { assert.fail("Blocked preparation cannot launch Verification."); } },
+    {
+      async verify() {
+        return {
+          root: join(tmpdir(), `cmd-riker-conflict-${Date.now()}`),
+          baselineCommit: "c".repeat(40),
+          isolation: { kind: "worktree" },
+          managedExecutionCheckout: { kind: "managed-worktree", targetProjectRoot: checkout },
+        };
+      },
+      async advance() {
+        if (conflictPresent) {
+          throw new MaterialExecutionCheckoutError("The planned worktree path is occupied.");
+        }
+      },
+      async observeChanges() { return []; },
+    },
+  );
+  const started = await supervisor.delegateEffectful({
+    objective: "Implement the isolated change.",
+    prompt: "Change src/index.ts.",
+    targetProjectPath: checkout,
+    model: "gpt-5.6-sol",
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/index.ts"],
+    timeoutMs: 120_000,
+    verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+  });
+  await waitFor(() => state.readWorkerSession(started.workerSessionId)?.state === "blocked");
+  const blockedWorker = state.readWorkerSession(started.workerSessionId)!;
+  assert.equal(harness.starts.length, 0);
+  assert.equal(blockedWorker.assignment.readOnly, false);
+  assert.equal(
+    blockedWorker.assignment.readOnly
+      ? undefined
+      : blockedWorker.assignment.executionCheckout?.phase,
+    "blocked",
+  );
+  assert.equal(state.readCommitment(commitment.id)?.condition?.ownerAttention, "mission-critical-impairment");
+  assert.match(state.readCommitment(commitment.id)?.condition?.nextAction ?? "", /Remove or rename/);
+
+  conflictPresent = false;
+  const resumeTurnId = state.appendOwnerMessage("The conflicting path is removed. Resume.");
+  orchestration.resumeCommitment(commitment.id, resumeTurnId);
+  await supervisor.recover();
+  await waitFor(() => state.readWorkerExecutionAttempt(started.executionAttemptId)?.status === "running");
+  assert.equal(harness.starts.length, 1);
+  const resumedWorker = state.readWorkerSession(started.workerSessionId)!;
+  assert.equal(
+    resumedWorker.assignment.readOnly ? undefined : resumedWorker.assignment.executionCheckout?.phase,
+    "prepared",
+  );
+  state.close();
 });
 
 test("test Codex adapter satisfies the Worker harness contract", async () => {

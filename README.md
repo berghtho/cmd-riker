@@ -229,6 +229,15 @@ linked to the Worker effect; restart resumes a not-yet-dispatched Verification w
 Worker. Connection loss after dispatch leaves the effect unknown and reconciling; it is never
 automatically replayed.
 
+When a clean primary checkout lacks a provable default-branch identity, CMD Riker plans a detached,
+Commitment-attributed Execution Checkout beside it. The durable Worker authority and effect intent are
+recorded before `git worktree add`; the Worker receives only that worktree as its Authorized Write Root.
+After a settled Worker result, CMD Riker proves that the Owner-facing Target Project still matches the
+recorded baseline, reconciles the exact Git patch, disposes the worktree, and only then runs Verification.
+Each lifecycle step is read back before retry after restart. Conflicting Target Project changes or an
+ambiguous worktree identity stop automatic effects and surface one material Owner intervention while
+preserving both checkouts.
+
 ## Workflow skills
 
 CMD Riker ships its generic `design-council` skill and locks the complete

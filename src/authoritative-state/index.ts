@@ -241,6 +241,11 @@ export interface AuthoritativeState {
     questions?: WorkerQuestion[];
     effectIntent?: EffectIntent;
   }): void;
+  transitionExecutionCheckout(input: {
+    workerSession: WorkerSession;
+    executionAttempt?: WorkerExecutionAttempt;
+    commitmentSnapshots?: Commitment[];
+  }): void;
   settleWorkerVerification(
     effectIntent: WorkerAssignmentEffectIntent,
     commitmentSnapshots: Commitment[],
@@ -620,6 +625,7 @@ export function openAuthoritativeState(
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
+      | "commitment.snapshot"
       | "effect-intent.snapshot",
     subjectId: string,
   ): { id: string; value: T } | undefined => {
@@ -673,6 +679,7 @@ export function openAuthoritativeState(
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
+      | "commitment.snapshot"
       | "effect-intent.snapshot";
     subjectPrefix:
       | "worker-session"
@@ -683,6 +690,7 @@ export function openAuthoritativeState(
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
+      | "commitment"
       | "effect-intent";
     transitionPrefix:
       | "worker-session"
@@ -693,6 +701,7 @@ export function openAuthoritativeState(
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
+      | "commitment"
       | "effect-intent";
     snapshot: { id: string; state?: string; status?: string };
   };
@@ -1723,6 +1732,33 @@ export function openAuthoritativeState(
               },
             ]
           : []),
+      ]);
+    },
+
+    transitionExecutionCheckout(input) {
+      appendSnapshotBatch([
+        ...(input.executionAttempt
+          ? [
+              {
+                kind: "worker-execution-attempt.snapshot" as const,
+                subjectPrefix: "worker-execution-attempt" as const,
+                transitionPrefix: "worker-execution-attempt" as const,
+                snapshot: input.executionAttempt,
+              },
+            ]
+          : []),
+        {
+          kind: "worker-session.snapshot" as const,
+          subjectPrefix: "worker-session" as const,
+          transitionPrefix: "worker-session" as const,
+          snapshot: input.workerSession,
+        },
+        ...(input.commitmentSnapshots ?? []).map((commitment) => ({
+          kind: "commitment.snapshot" as const,
+          subjectPrefix: "commitment" as const,
+          transitionPrefix: "commitment" as const,
+          snapshot: commitment,
+        })),
       ]);
     },
 

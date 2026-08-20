@@ -23,6 +23,10 @@ Routine bounded Self-repair should be versioned, verified, reversible, and auton
 interrupted for genuine product decisions, irreversible actions, and unresolved blockers rather than
 for workflow maintenance.
 
+Every necessary Owner intervention presents a concrete recommended resolution and its material
+consequences, then asks whether to execute it. The Owner confirms or corrects the proposal rather than
+specifying the solution from scratch.
+
 ## Authority follows responsibility
 
 The Lead Agent receives the tools and authority needed for the outcomes it owns. Every restriction

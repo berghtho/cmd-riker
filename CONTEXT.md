@@ -88,6 +88,12 @@ _Avoid_: Model name, Provider selection, Routing guess
 The project whose work the Lead Agent coordinates. Exactly one is active in the first product.
 _Avoid_: Workspace, Client repository
 
+**Execution Checkout**:
+An isolated, Commitment-bound project view used as the sole Authorized Write Root for one effectful
+Worker Session while the Target Project remains Owner-facing. Its result is reconciled back to the
+Target Project before the Execution Checkout is disposed.
+_Avoid_: Target Project, Working directory
+
 **Authorized Write Root**:
 An explicitly bounded filesystem location where an actor may perform file effects under existing
 authority without further Owner approval. Native tool-owned credential or session state does not

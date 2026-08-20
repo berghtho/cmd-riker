@@ -61,11 +61,12 @@ $install = "$env:LOCALAPPDATA\CMD Riker"
 ```
 
 The registered Task Scheduler entry is per-user, on-demand, singleton, and has a bounded Recovery
-Actor restart policy. Launching again reconnects to the same Lead Agent. Closing the terminal only
-detaches; `stop` durably prevents new effects before supervision ends.
+Actor restart policy. Running `riker.cmd` opens Pi as the single visible Owner interface and
+reconnects it to the same supervised Lead Agent. `stop` durably prevents new effects before
+supervision ends.
 
 ```powershell
-& "$install\launcher\riker.cmd" start
+& "$install\launcher\riker.cmd"
 & "$install\launcher\riker.cmd" inspect
 & "$install\launcher\riker.cmd" stop
 ```

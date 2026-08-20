@@ -43,9 +43,20 @@ try {
   }
 } catch (error) {
   process.stderr.write(
-    `CMD_RIKER_LIFECYCLE_FAILURE: ${error instanceof Error ? error.message : String(error)}\n`,
+    `CMD_RIKER_LIFECYCLE_FAILURE: ${errorChain(error)}\n`,
   );
   process.exitCode = 2;
+}
+
+function errorChain(error: unknown): string {
+  const messages: string[] = [];
+  let current: unknown = error;
+  while (current instanceof Error) {
+    if (!messages.includes(current.message)) messages.push(current.message);
+    current = current.cause;
+  }
+  if (current !== undefined && current !== null) messages.push(String(current));
+  return messages.join(" Caused by: ");
 }
 
 async function productionInstallation(

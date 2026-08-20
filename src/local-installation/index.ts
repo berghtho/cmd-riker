@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   stageLocalRelease,
+  verifyLocalReleaseCandidate,
   type VerifiedLocalRelease,
 } from "../local-release/index.ts";
 import {
@@ -415,6 +416,13 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
           return actor.activate({ ...input.activation, candidate, baseline });
         });
         if (!candidate || !snapshot) throw new Error("Owner upgrade did not establish its exact candidate pair.");
+        if (result.outcome === "activated") {
+          const actorRelease = await verifyLocalReleaseCandidate(
+            lifecycle.actor.path,
+            "recovery-actor",
+          );
+          await writeLauncherManifest(paths, hostAddress, actorRelease, release);
+        }
         return { ...result, candidate, snapshot };
       } catch (error) {
         if (stoppedForUpgrade) {
@@ -599,6 +607,14 @@ async function writeLauncherManifest(
   leadAgent: VerifiedLocalRelease,
 ): Promise<void> {
   await mkdir(paths.launcher, { recursive: true });
+  const ownerLauncherRelativePath = "dist/owner-launcher.js";
+  if (!leadAgent.manifest.files.some((file) => file.path === ownerLauncherRelativePath)) {
+    throw new Error("The Lead Agent release does not contain its Owner launcher.");
+  }
+  const installedOwnerLauncherPath = join(
+    leadAgent.path,
+    ...ownerLauncherRelativePath.split("/"),
+  );
   await writeFile(
     join(paths.launcher, "installation.json"),
     `${JSON.stringify({
@@ -624,7 +640,7 @@ async function writeLauncherManifest(
   );
   await writeFile(
     join(paths.launcher, "riker.cmd"),
-    `@echo off\r\n"${actor.runtime.path}" "${actor.entrypointPath}" %*\r\n`,
+    `@echo off\r\n"${actor.runtime.path}" "${installedOwnerLauncherPath}" --install-root "${paths.root}" %*\r\n`,
     "utf8",
   );
 }

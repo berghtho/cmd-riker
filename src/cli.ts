@@ -1,14 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import {
-  Input,
-  Key,
-  matchesKey,
-  ProcessTerminal,
-  Text,
-  TuiMainScreen,
-} from "@earendil-works/pi-tui";
 
 import {
   completeAuthoritativeStateRecovery,
@@ -55,6 +47,7 @@ import {
   createLeadAgentRuntime,
   LeadAgentRuntimeDiagnostic,
 } from "./lead-agent-runtime/index.ts";
+import { runPiOwnerInterface } from "./pi-owner-interface.ts";
 import {
   parseSessionViewControl,
   parseSessionViewInspection,
@@ -281,81 +274,22 @@ function runInteractiveConversation(
   targetProjectPath: string,
   workerSupervisor: WorkerSupervisor | undefined,
 ): Promise<void> {
-  const terminal = new ProcessTerminal();
-  const tui = new TuiMainScreen(terminal);
   const conversation = state.readOwnerConversation();
-  const transcriptLines = (conversation?.messages ?? []).map((message) =>
-    `${message.role === "owner" ? "Owner" : "Lead Agent"}: ${message.content}`,
-  );
-  transcriptLines.push(...state.readCommitments().map(commitmentNotice));
-  const transcript = new Text(transcriptLines.join("\n\n"));
-  const sessionView = new Text(currentSessionView(state, workerSupervisor));
-  const input = new Input();
-  let busy = false;
-  let stopRequested = false;
+  const transcript = (conversation?.messages ?? []).map((message) => ({
+    source: message.role,
+    content: message.content,
+  }));
+  transcript.push(...state.readCommitments().map((commitment) => ({
+    source: "lead-agent" as const,
+    content: commitmentNotice(commitment),
+  })));
 
-  tui.addChild(new Text(`CMD Riker | Target Project: ${targetProjectPath}`));
-  tui.addChild(transcript);
-  tui.addChild(sessionView);
-  tui.addChild(new Text("Owner:"));
-  tui.addChild(input);
-  tui.setFocus(input);
-
-  return new Promise((resolve, reject) => {
-    let renderedSessionView = currentSessionView(state, workerSupervisor);
-    const refreshSessionView = () => {
-      const next = currentSessionView(
-        state,
-        workerSupervisor,
-        busy ? "responding" : "available",
-      );
-      if (next === renderedSessionView) return;
-      renderedSessionView = next;
-      sessionView.setText(next);
-      tui.requestRender();
-    };
-    const refreshTimer = setInterval(refreshSessionView, 250);
-    const stop = () => {
-      if (busy) {
-        stopRequested = true;
-        return;
-      }
-      clearInterval(refreshTimer);
-      tui.stop();
-      resolve();
-    };
-    tui.addInputListener((data) => {
-      if (matchesKey(data, Key.ctrl("c"))) {
-        stop();
-        return { consume: true };
-      }
-      return undefined;
-    });
-    input.onSubmit = (ownerInput) => {
-      if (busy || !ownerInput.trim()) return;
-      busy = true;
-      input.setValue("");
-      transcriptLines.push(`Owner: ${ownerInput}`, "Lead Agent: thinking...");
-      transcript.setText(transcriptLines.join("\n\n"));
-      refreshSessionView();
-      tui.requestRender();
-      void completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor)
-        .then((output) => {
-          transcriptLines[transcriptLines.length - 1] = `${output.source}: ${output.content}`;
-          transcript.setText(transcriptLines.join("\n\n"));
-          busy = false;
-          refreshSessionView();
-          if (stopRequested) stop();
-          else tui.requestRender();
-        })
-        .catch((error: unknown) => {
-          clearInterval(refreshTimer);
-          tui.stop();
-          reject(error);
-        });
-    };
-    input.onEscape = stop;
-    tui.start();
+  return runPiOwnerInterface({
+    targetProjectPath,
+    transcript,
+    completeOwnerInput: (ownerInput) =>
+      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor),
+    readSessionView: () => currentSessionView(state, workerSupervisor),
   });
 }
 

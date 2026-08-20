@@ -89,13 +89,20 @@ export function assessActivationBarrier(state: AuthoritativeState): {
 } {
   const blockers: string[] = [];
   const conversation = state.readOwnerConversation();
+  const leadTurnAttempts = state.readLeadTurnAttempts();
+  const terminallyFailedOwnerTurns = new Set(
+    leadTurnAttempts
+      .filter((attempt) => attempt.status === "failed")
+      .map((attempt) => attempt.ownerTurnId),
+  );
   for (const ownerMessage of conversation?.messages.filter((message) => message.role === "owner") ?? []) {
     if (state.ownerInteractionDisposition(ownerMessage.turnId) === "session-view-control") continue;
+    if (terminallyFailedOwnerTurns.has(ownerMessage.turnId)) continue;
     if (state.leadAgentResponse(ownerMessage.turnId) === undefined) {
       blockers.push(`Activation is blocked by unanswered Owner turn ${ownerMessage.turnId}.`);
     }
   }
-  for (const attempt of state.readLeadTurnAttempts()) {
+  for (const attempt of leadTurnAttempts) {
     if (attempt.status === "started") blockers.push(`Lead turn attempt ${attempt.id} is started.`);
   }
   for (const commitment of state.readCommitments()) {

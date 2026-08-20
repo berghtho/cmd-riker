@@ -25,6 +25,7 @@ import { advanceWriteGeneration } from "../src/write-generation.ts";
 
 const bundlePayload = {
   "dist/main.js": Buffer.from("console.log('local installation');\n"),
+  "dist/owner-launcher.js": Buffer.from("console.log('owner launcher');\n"),
   "runtime/node.exe": Buffer.from("bundled Node runtime"),
 };
 
@@ -55,7 +56,7 @@ test("happy install stages exact protected identities before register and verifi
   assert.equal(launcher.leadAgent.identity.digest, installed.active?.code.digest);
   assert.match(
     await readFile(join(installed.paths.launcher, "riker.cmd"), "utf8"),
-    /main\.js" %\*/,
+    /owner-launcher\.js" --install-root .* %\*/,
   );
 });
 

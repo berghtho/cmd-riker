@@ -348,6 +348,93 @@ function declaredPlatform(): "windows" | "linux" | "darwin" {
   return process.platform === "win32" ? "windows" : process.platform === "darwin" ? "darwin" : "linux";
 }
 
+test("two work items run effectful Workers in parallel in their own Execution Checkouts", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-parallel-workers-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const checkout = join(stateDirectory, "target-project");
+  await mkdir(checkout);
+  const state = openAuthoritativeState(stateDirectory);
+  state.initialize(ownerConfiguration(checkout));
+  const orchestration = createOrchestrationCore(state);
+  const ownerTurnId = state.appendOwnerMessage("Fix the bug and add the feature in parallel.");
+  const delegateManaged = (label: string) => {
+    const commitment = orchestration.recordCommitment(ownerTurnId, {
+      outcome: `The ${label} change passes its declared tests.`,
+      criteria: [{
+        kind: "target-project-operation",
+        description: "The declared test operation succeeds.",
+        operation: "test",
+      }],
+    });
+    return orchestration.delegateEffectfulWorker({
+      objective: `Apply the ${label} change.`,
+      prompt: `Change only src/${label}.ts.`,
+      targetProjectPath: checkout,
+      modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" },
+      modelPolicyRevision: "worker-policy-1",
+      commitmentId: commitment.id,
+      targets: [`src/${label}.ts`],
+      timeoutMs: 60_000,
+      checkoutIsolation: {
+        root: `${checkout}.cmd-riker-${label}`,
+        baselineCommit: "a".repeat(40),
+        isolation: { kind: "worktree" },
+        managedExecutionCheckout: { kind: "managed-worktree", targetProjectRoot: checkout },
+      },
+      verification: { operation: "test", workingDirectory: checkout, timeoutMs: 30_000 },
+    });
+  };
+
+  const first = delegateManaged("bugfix");
+  const second = delegateManaged("feature");
+  assert.notEqual(first.workerSession.id, second.workerSession.id);
+  assert.equal(state.readEffectIntent(first.executionAttempt.effectIntentId!)?.status, "pending");
+  assert.equal(state.readEffectIntent(second.executionAttempt.effectIntentId!)?.status, "pending");
+
+  // The same physical checkout still excludes a second effectful Worker.
+  const inPlaceCommitment = orchestration.recordCommitment(ownerTurnId, {
+    outcome: "The in-place change passes its declared tests.",
+    criteria: [{
+      kind: "target-project-operation",
+      description: "The declared test operation succeeds.",
+      operation: "test",
+    }],
+  });
+  const inPlaceInput = {
+    objective: "Apply the in-place change.",
+    prompt: "Change only src/inplace.ts.",
+    targetProjectPath: checkout,
+    modelSelection: { provider: "openai", model: "gpt-5.6-sol", nativeHarness: "codex" } as const,
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: inPlaceCommitment.id,
+    targets: ["src/inplace.ts"],
+    timeoutMs: 60_000,
+    checkoutIsolation: {
+      root: checkout,
+      baselineCommit: "a".repeat(40),
+      isolation: { kind: "branch" as const, branch: "codex/in-place" },
+    },
+    verification: { operation: "test" as const, workingDirectory: checkout, timeoutMs: 30_000 },
+  };
+  orchestration.delegateEffectfulWorker(inPlaceInput);
+  const secondInPlace = orchestration.recordCommitment(ownerTurnId, {
+    outcome: "The second in-place change passes its declared tests.",
+    criteria: [{
+      kind: "target-project-operation",
+      description: "The declared test operation succeeds.",
+      operation: "test",
+    }],
+  });
+  assert.throws(
+    () => orchestration.delegateEffectfulWorker({
+      ...inPlaceInput,
+      commitmentId: secondInPlace.id,
+    }),
+    /conflicting Target Project effect/i,
+  );
+  state.close();
+});
+
 function ownerConfiguration(checkout: string) {
   return {
     targetProject: { path: checkout },

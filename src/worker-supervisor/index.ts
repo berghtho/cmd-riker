@@ -223,7 +223,25 @@ export function createWorkerSupervisor(
       throw error;
     }
   };
-  const verifySettledWorker = async (
+  // Worker executions run in parallel in their own Execution Checkouts;
+  // settlement (reconcile, dispose, verify) serializes per Target Project so
+  // patches and Verification runs never race in the shared primary checkout.
+  const settlementQueues = new Map<string, Promise<void>>();
+  const enqueueSettlement = (key: string, work: () => Promise<void>): Promise<void> => {
+    const previous = settlementQueues.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(work);
+    settlementQueues.set(key, next.catch(() => {}));
+    return next;
+  };
+  const verifySettledWorker = (
+    workerSession: WorkerSession,
+    executionAttempt: WorkerExecutionAttempt,
+  ): Promise<void> =>
+    enqueueSettlement(
+      workerSession.assignment.targetProjectPath.toLowerCase(),
+      () => performWorkerSettlement(workerSession, executionAttempt),
+    );
+  const performWorkerSettlement = async (
     workerSession: WorkerSession,
     executionAttempt: WorkerExecutionAttempt,
   ): Promise<void> => {

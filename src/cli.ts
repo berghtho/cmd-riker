@@ -53,6 +53,7 @@ import {
   parseSessionViewInspection,
   parseSessionViewWorkerInspection,
   projectSessionView,
+  renderSessionItems,
   renderSessionView,
   renderSessionWorkers,
   type SessionViewSnapshot,
@@ -330,6 +331,12 @@ async function completeOwnerInteraction(
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisor);
+  if (/^\/session\s+items\s*$/i.test(ownerInput)) {
+    return {
+      source: "Session View",
+      content: renderSessionItems(snapshot),
+    };
+  }
   if (/^\/session\s+workers\s*$/i.test(ownerInput)) {
     return {
       source: "Session View",
@@ -422,55 +429,71 @@ async function availableWorkerSupervisor(
   configuration: OwnerConfiguration,
   ownerNotices: OwnerNoticeSink,
 ): Promise<WorkerSupervisor | undefined> {
-  if (!configuration.workerModelPolicy) return undefined;
-  const orchestration = createOrchestrationCore(state);
-  const selection = configuration.workerModelPolicy.selection;
-  try {
-    let harness: NativeWorkerHarness;
-    if (selection.nativeHarness === "codex") {
-      harness = createCodexWorkerHarness(await resolveCodexRuntime());
-    } else if (selection.nativeHarness === "claude") {
-      harness = createClaudeWorkerHarness(await resolveClaudeRuntime());
-    } else {
-      harness = createCopilotWorkerHarness(await resolveCopilotRuntime());
+  const settings = configuration.workerHarnessSettings ?? {};
+  const configured = configuration.workerModelPolicy?.selection.nativeHarness;
+  const candidates: Array<"codex" | "claude" | "copilot"> = [];
+  if (configured && settings[configured]?.enabled !== false) candidates.push(configured);
+  for (const harnessName of ["codex", "claude", "copilot"] as const) {
+    const setting = settings[harnessName];
+    if (harnessName !== configured && setting?.enabled === true && setting.model) {
+      candidates.push(harnessName);
     }
-    if (
-      selection.nativeHarness === "codex" &&
-      orchestration.observeCodexCapabilityAvailable() === "cleared"
-    ) {
-      process.stderr.write(
-        "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
-      );
-    }
-    return createWorkerSupervisor(
-      state,
-      harness,
-      createTargetProjectOperations(state),
-      undefined,
-      (notice) => ownerNotices.deliver(notice),
-    );
-  } catch (error) {
-    orchestration.reconcileInterruptedWorkers(
-      `The ${nativeHarnessName(selection.nativeHarness)} capability could not be proven after host restart.`,
-    );
-    const detail = error instanceof Error ? error.message : "capability probe failed";
-    const notice = selection.nativeHarness === "codex"
-      ? orchestration.observeCodexCapabilityUnavailable(
-          detail,
-          configuration.targetProject.path,
-        )
-      : "recorded";
-    if (notice === "recorded") {
-      const code = `CMD_RIKER_${selection.nativeHarness.toUpperCase()}_UNAVAILABLE`;
-      process.stderr.write(
-        `${code}: ` +
-          `${nativeHarnessName(selection.nativeHarness)} with expected native identity for Target Project ` +
-          `${configuration.targetProject.path} is unavailable: ` +
-          `${detail}\n`,
-      );
-    }
-    return undefined;
   }
+  if (candidates.length === 0) return undefined;
+  const orchestration = createOrchestrationCore(state);
+  let lastFailure: { harness: "codex" | "claude" | "copilot"; detail: string } | undefined;
+  for (const harnessName of candidates) {
+    try {
+      let harness: NativeWorkerHarness;
+      if (harnessName === "codex") {
+        harness = createCodexWorkerHarness(await resolveCodexRuntime());
+      } else if (harnessName === "claude") {
+        harness = createClaudeWorkerHarness(await resolveClaudeRuntime());
+      } else {
+        harness = createCopilotWorkerHarness(await resolveCopilotRuntime());
+      }
+      if (
+        harnessName === "codex" &&
+        orchestration.observeCodexCapabilityAvailable() === "cleared"
+      ) {
+        process.stderr.write(
+          "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
+        );
+      }
+      return createWorkerSupervisor(
+        state,
+        harness,
+        createTargetProjectOperations(state),
+        undefined,
+        (notice) => ownerNotices.deliver(notice),
+      );
+    } catch (error) {
+      lastFailure = {
+        harness: harnessName,
+        detail: error instanceof Error ? error.message : "capability probe failed",
+      };
+    }
+  }
+  const failed = lastFailure!;
+  orchestration.reconcileInterruptedWorkers(
+    `The ${nativeHarnessName(failed.harness)} capability could not be proven after host restart.`,
+  );
+  const notice = failed.harness === "codex"
+    ? orchestration.observeCodexCapabilityUnavailable(
+        failed.detail,
+        configuration.targetProject.path,
+      )
+    : "recorded";
+  if (notice === "recorded") {
+    const code = `CMD_RIKER_${failed.harness.toUpperCase()}_UNAVAILABLE`;
+    process.stderr.write(
+      `${code}: ` +
+        `${nativeHarnessName(failed.harness)} with expected native identity for Target Project ` +
+        `${configuration.targetProject.path} is unavailable: ` +
+        `${failed.detail}\n`,
+    );
+  }
+  return undefined;
 }
 
 function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {

@@ -73,10 +73,19 @@ export type SessionViewWorker = {
   actions: SessionViewAction[];
 };
 
+export type SessionViewItem = {
+  id: string;
+  outcome: string;
+  status: string;
+  needsOwner: boolean;
+  detail?: string;
+};
+
 export type SessionViewSnapshot = {
   leadAvailability: "available" | "responding";
   activeWorkerCount: number;
   workers: SessionViewWorker[];
+  items: SessionViewItem[];
   exceptions: SessionViewException[];
 };
 
@@ -467,12 +476,74 @@ export function projectSessionView(
     });
   }
 
+  const items = [...commitments.values()]
+    .filter((commitment) => !["cancelled", "superseded"].includes(commitment.state))
+    .map((commitment) =>
+      sessionViewItem(commitment, unsettledWorkerByCommitment.get(commitment.id)),
+    );
+
   return {
     leadAvailability: options.leadAvailability ?? "available",
     activeWorkerCount: visibleWorkers.length,
     workers: visibleWorkers,
+    items,
     exceptions,
   };
+}
+
+function sessionViewItem(
+  commitment: Commitment,
+  worker: WorkerSession | undefined,
+): SessionViewItem {
+  const base = { id: commitment.id, outcome: commitment.outcome };
+  if (commitment.state === "accepted") return { ...base, status: "done", needsOwner: false };
+  if (commitment.state === "awaiting-acceptance") {
+    return { ...base, status: "done, waiting for your acceptance", needsOwner: true };
+  }
+  if (commitment.state === "verifying") {
+    return { ...base, status: "verifying the result", needsOwner: false };
+  }
+  const condition = commitment.condition;
+  if (condition) {
+    if (condition.kind === "paused") {
+      return { ...base, status: "paused", needsOwner: false, detail: condition.reason };
+    }
+    const needsOwner = Boolean(condition.ownerAttention);
+    return {
+      ...base,
+      status: needsOwner
+        ? "needs you"
+        : condition.kind === "reconciling"
+          ? "recovering"
+          : "blocked",
+      needsOwner,
+      detail: `${condition.reason} Next: ${condition.nextAction}`,
+    };
+  }
+  if (worker) {
+    return { ...base, status: "in progress (Worker running)", needsOwner: false };
+  }
+  return { ...base, status: "in progress", needsOwner: false };
+}
+
+function itemsSummary(items: SessionViewItem[]): string {
+  if (items.length === 0) return "no items";
+  const needsOwner = items.filter((item) => item.needsOwner).length;
+  const label = items.length === 1 ? "item" : "items";
+  return needsOwner > 0
+    ? `${items.length} ${label} (${needsOwner} need${needsOwner === 1 ? "s" : ""} you)`
+    : `${items.length} ${label}`;
+}
+
+export function renderSessionItems(snapshot: SessionViewSnapshot): string {
+  if (snapshot.items.length === 0) return "No work items.";
+  return snapshot.items
+    .map(
+      (item) =>
+        `Item ${item.id.slice(0, 8)} | ${item.status} | ${item.outcome}` +
+        (item.detail ? `\n  ${item.detail}` : ""),
+    )
+    .join("\n");
 }
 
 export function renderSessionView(
@@ -484,7 +555,9 @@ export function renderSessionView(
     ? "no attention"
     : attentionClasses(snapshot.exceptions);
   const lines = [
-    `Lead ${snapshot.leadAvailability} | ${snapshot.activeWorkerCount} ${workerLabel} | ${attention}` +
+    `Lead ${snapshot.leadAvailability} | ${snapshot.activeWorkerCount} ${workerLabel} | ` +
+      `${itemsSummary(snapshot.items)} | ${attention}` +
+      (snapshot.items.length > 0 ? " | /session items" : "") +
       (snapshot.activeWorkerCount > 0 ? " | /session workers" : ""),
   ];
   if (snapshot.exceptions.length === 0) return lines.join("\n");

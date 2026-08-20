@@ -106,6 +106,11 @@ riker inspect
 riker stop
 ```
 
+Inside the `riker` terminal, `/items` lists every work item with a plain status ("in progress",
+"needs you", "done", …); `/workers` and `/riker` show Worker Sessions and the Session View. The
+Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"
+— and the Lead persists the preference durably; nobody edits configuration files by hand.
+
 Upgrade from another trusted local Lead Agent bundle. Compatibility and independent Review evidence
 are explicit inputs:
 
@@ -254,7 +259,10 @@ assignment's targets, effect classes, Authorized Write Root, Command Authority, 
 bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. A
 clean secondary worktree or non-default branch executes in place; any other primary checkout —
 dirty, detached, on the default branch, or without a provable default branch — automatically gets a
-managed sibling Execution Checkout instead of a refusal. Immediately before
+managed sibling Execution Checkout instead of a refusal. Work items run as many effectful Workers in
+parallel as the Owner orders — each in its own Execution Checkout; only two Workers on the same
+physical checkout exclude each other, and settlement (reconcile, dispose, Verification) serializes
+per Target Project. Immediately before
 `turn/start`, the production adapter requires Windows sandbox readiness and uses Codex `workspaceWrite`
 with no additional writable roots, no command network, no temporary-directory exception, and approval
 policy `never`. A real in-root/out-of-root probe runs under the same policy; failure to prove either

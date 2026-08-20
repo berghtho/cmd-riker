@@ -15,6 +15,13 @@ import type {
 } from "../target-project-operations/index.ts";
 import type { SelfRepairWorkerCandidate } from "../self-repair-controller/index.ts";
 
+export type WorkerHarnessName = "codex" | "claude" | "copilot";
+
+export type WorkerHarnessSetting = {
+  enabled: boolean;
+  model?: string;
+};
+
 export type OwnerConfiguration = {
   targetProject: { path: string };
   forgeAuthorities?: {
@@ -29,6 +36,9 @@ export type OwnerConfiguration = {
     revision: string;
     selection: WorkerModelSelection;
   };
+  /** Owner-conversation-managed per-harness preferences; never edited through
+   * config.json. */
+  workerHarnessSettings?: Partial<Record<WorkerHarnessName, WorkerHarnessSetting>>;
 };
 
 export type LeadModelRequirements = {
@@ -729,6 +739,10 @@ export interface OrchestrationCore {
     policy: LeadModelPolicy,
     validations: readonly ModelCandidateValidation[],
   ): void;
+  configureWorkerHarness(
+    ownerTurnId: string,
+    input: { harness: WorkerHarnessName; enabled?: boolean; model?: string },
+  ): WorkerHarnessSetting & { harness: WorkerHarnessName };
   recordCommitment(ownerTurnId: string, draft: CommitmentDraft): Commitment;
   recordCommitmentOwnerAttention(
     commitmentId: string,
@@ -1280,6 +1294,42 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       return "cleared";
     },
 
+    configureWorkerHarness(ownerTurnId, input) {
+      requireCurrentOwnerTurn(state, ownerTurnId);
+      if (!["codex", "claude", "copilot"].includes(input.harness)) {
+        throw new Error(`Unknown Native Harness ${input.harness}.`);
+      }
+      if (input.enabled === undefined && input.model === undefined) {
+        throw new Error("A harness configuration changes enabled, model, or both.");
+      }
+      if (input.model !== undefined && !input.model.trim()) {
+        throw new Error("A harness Worker model cannot be empty.");
+      }
+      const conversation = state.readOwnerConversation();
+      if (!conversation) throw new Error("Authoritative state is not configured.");
+      const { messages: _messages, ...configuration } =
+        conversation as OwnerConfiguration & { messages?: unknown };
+      const existing = configuration.workerHarnessSettings?.[input.harness];
+      const setting: WorkerHarnessSetting = {
+        enabled: input.enabled ??
+          existing?.enabled ??
+          configuration.workerModelPolicy?.selection.nativeHarness === input.harness,
+        ...(input.model !== undefined
+          ? { model: input.model }
+          : existing?.model !== undefined
+            ? { model: existing.model }
+            : {}),
+      };
+      state.replaceOwnerConfiguration({
+        ...configuration,
+        workerHarnessSettings: {
+          ...(configuration.workerHarnessSettings ?? {}),
+          [input.harness]: setting,
+        },
+      });
+      return { harness: input.harness, ...setting };
+    },
+
     activateLeadModelPolicy(policy, validations) {
       const existing = state.readOwnerConversation();
       if (!existing) throw new Error("Authoritative state is not configured.");
@@ -1291,6 +1341,10 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         modelFallbacks: policy.fallbacks,
         modelRequirements: policy.requirements,
         modelPolicyRevision: policy.revision,
+        ...(existing.workerModelPolicy ? { workerModelPolicy: existing.workerModelPolicy } : {}),
+        ...(existing.workerHarnessSettings
+          ? { workerHarnessSettings: existing.workerHarnessSettings }
+          : {}),
       });
     },
 
@@ -2049,7 +2103,10 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         workerSessionId,
         executionAttemptId,
         expectedEffect: `Apply the bounded Worker assignment to ${input.targets.join(", ")}.`,
-        authorizedWriteRootKey: normalizedAuthorizedWriteRoot(configuredPath),
+        // The effect scope is the actual Authorized Write Root. Managed sibling
+        // Execution Checkouts therefore run in parallel; only two Workers on the
+        // same physical checkout exclude each other.
+        authorizedWriteRootKey: normalizedAuthorizedWriteRoot(input.checkoutIsolation.root),
         authorization: {
           kind: "lead-agent-command-authority",
           commitmentId: input.commitmentId,

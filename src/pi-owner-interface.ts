@@ -158,6 +158,14 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     },
   });
 
+  pi.registerCommand("items", {
+    description: "Show every work item and its plain status",
+    handler: async (_args, ctx) => {
+      const response = await input.completeOwnerInput("/session items");
+      ctx.ui.notify(response.content, "info");
+    },
+  });
+
   pi.on("session_shutdown", () => {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;

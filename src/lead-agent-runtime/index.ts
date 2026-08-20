@@ -124,6 +124,19 @@ async function completeOwnerTurn(input: {
     });
     try {
       const workerCapabilities = input.workerSupervisor?.capabilities();
+      const harnessSettings = conversation.workerHarnessSettings ?? {};
+      const activeHarness = workerCapabilities?.nativeHarness;
+      const activeSetting = activeHarness ? harnessSettings[activeHarness] : undefined;
+      const workerModel = activeHarness
+        ? activeSetting?.model ??
+          (conversation.workerModelPolicy?.selection.nativeHarness === activeHarness
+            ? conversation.workerModelPolicy.selection.model
+            : undefined)
+        : undefined;
+      const workerDisabled = activeSetting?.enabled === false;
+      const workerAvailable = Boolean(input.workerSupervisor && !workerDisabled && workerModel);
+      const workerModelPolicyRevision =
+        conversation.workerModelPolicy?.revision ?? "worker-harness-settings";
       const response = await input.adapter.completeTurn({
         conversation: conversation.messages,
         ownerInput: input.ownerInput,
@@ -147,17 +160,26 @@ async function completeOwnerTurn(input: {
         },
         workers: orchestration.workerSessionsView(),
         workerQuestions: orchestration.workerQuestionsView(),
-        ...(!input.workerSupervisor &&
-            conversation.workerModelPolicy &&
-            input.state.readCapabilityNotice("codex-worker")?.state === "active"
+        harnessActions: {
+          configure: (configuration) =>
+            orchestration.configureWorkerHarness(turnId, configuration),
+        },
+        ...(!workerAvailable && (activeHarness || conversation.workerModelPolicy)
           ? {
               workerUnavailability: {
-                nativeHarness: conversation.workerModelPolicy.selection.nativeHarness,
-                detail: input.state.readCapabilityNotice("codex-worker")!.detail,
+                nativeHarness: activeHarness ??
+                  conversation.workerModelPolicy!.selection.nativeHarness,
+                detail: workerDisabled
+                  ? "The Owner disabled this harness; enable it again to delegate."
+                  : input.workerSupervisor && !workerModel
+                    ? "No Worker model is configured for the active harness; the Owner can set one conversationally."
+                    : input.state.readCapabilityNotice("codex-worker")?.state === "active"
+                      ? input.state.readCapabilityNotice("codex-worker")!.detail
+                      : "The Worker capability could not be proven at start.",
               },
             }
           : {}),
-        ...(input.workerSupervisor
+        ...(workerAvailable
           ? {
               workerActions: {
                 capabilities: {
@@ -176,8 +198,8 @@ async function completeOwnerTurn(input: {
                   input.workerSupervisor!.delegate({
                     ...assignment,
                     targetProjectPath: conversation.targetProject.path,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                    model: workerModel!,
+                    modelPolicyRevision: workerModelPolicyRevision,
                   }),
                 delegateReview: (assignment: {
                   implementationWorkerSessionId: string;
@@ -185,8 +207,8 @@ async function completeOwnerTurn(input: {
                 }) =>
                   input.workerSupervisor!.delegateReview({
                     ...assignment,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                    model: workerModel!,
+                    modelPolicyRevision: workerModelPolicyRevision,
                   }),
                 adjudicateReview: (adjudication) =>
                   orchestration.adjudicateReview(adjudication.commitmentId, adjudication.decisions),
@@ -217,8 +239,8 @@ async function completeOwnerTurn(input: {
                           ...assignment,
                           commitmentId,
                           targetProjectPath: conversation.targetProject.path,
-                          model: conversation.workerModelPolicy!.selection.model,
-                          modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                          model: workerModel!,
+                          modelPolicyRevision: workerModelPolicyRevision,
                           timeoutMs: 20 * 60_000,
                           verification: {
                             operation: "test" as const,

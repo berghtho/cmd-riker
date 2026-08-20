@@ -109,6 +109,13 @@ export type PiTurnRequest = {
   nativeTools?: {
     cwd: string;
   };
+  harnessActions?: {
+    configure(input: {
+      harness: "codex" | "claude" | "copilot";
+      enabled?: boolean;
+      model?: string;
+    }): { harness: string; enabled: boolean; model?: string };
+  };
   workers?: readonly WorkerSession[];
   workerQuestions?: readonly WorkerQuestion[];
   workerUnavailability?: {
@@ -342,6 +349,7 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
         ...forgeTools(request, mutationObserver),
         ...authorityTools(request, mutationObserver),
         ...workerTools(request, mutationObserver),
+        ...harnessTools(request, mutationObserver),
         ...(request.nativeTools ? leadNativeTools(request.nativeTools.cwd) : []),
       ];
       const nativeContext = request.nativeTools
@@ -405,6 +413,14 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "targets, criteria) from the conversation and durable state yourself. Never ask the Owner for internal " +
           "IDs, effect classes, authorization structures, or restatements of what they already said; if exactly " +
           "one material decision is genuinely missing, propose a concrete default and ask one short question." +
+          " When the Owner asks how things stand, answer in their language and in plain terms: name each " +
+          "work item by what it is, say what is happening right now, and say what (if anything) you need from " +
+          "them. Keep internal IDs and state-machine vocabulary out of the answer unless the Owner asks for them." +
+          (request.harnessActions
+            ? " The Owner configures Worker harnesses conversationally: when they ask to enable, disable, or " +
+              "change the model of a harness, call configure_worker_harness yourself — never send them to a " +
+              "configuration file."
+            : "") +
           (request.nativeTools
             ? " You hold your full native tool belt (read, bash, edit, write, grep, find, ls) rooted in the " +
               "Target Project under your own Command Authority. Act directly whenever that serves the mission " +
@@ -1020,6 +1036,50 @@ function authorityTools(
         return {
           content: [{ type: "text", text: `Acting Authority handoff: ${JSON.stringify(handoff)}` }],
           details: handoff,
+        };
+      },
+    },
+  ];
+}
+
+function harnessTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  const actions = request.harnessActions;
+  if (!actions) return [];
+  return [
+    {
+      name: "configure_worker_harness",
+      label: "Configure Worker Harness",
+      description:
+        "Persist the Owner's Native Harness preference: enable or disable a harness, or set its Worker model. " +
+        "Model changes apply from the next delegation; activating a different harness applies after the next start.",
+      parameters: Type.Object({
+        harness: Type.Union([
+          Type.Literal("codex"),
+          Type.Literal("claude"),
+          Type.Literal("copilot"),
+        ]),
+        enabled: Type.Optional(Type.Boolean()),
+        model: Type.Optional(Type.String({ minLength: 1 })),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const setting = actions.configure(params as {
+          harness: "codex" | "claude" | "copilot";
+          enabled?: boolean;
+          model?: string;
+        });
+        observer.onMutation();
+        return {
+          content: [{
+            type: "text",
+            text:
+              `Harness ${setting.harness} is now ${setting.enabled ? "enabled" : "disabled"}` +
+              (setting.model ? ` with Worker model ${setting.model}.` : "."),
+          }],
+          details: setting,
         };
       },
     },

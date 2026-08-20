@@ -48,6 +48,17 @@ import type {
   TargetProjectOperationAttempt,
   WorkerAssignmentEffectIntent,
 } from "../target-project-operations/index.ts";
+import {
+  assertWriteGeneration,
+  authoritativeStateSchemaRevision,
+  ensureWriteGenerationSchema,
+  readWriteGenerationHighWater,
+  readWriteGeneration,
+  recordWriteGenerationHighWater,
+  StaleWriteGenerationError,
+} from "../write-generation.ts";
+
+export { StaleWriteGenerationError };
 
 export type { ModelSelection } from "../model-selection.ts";
 export type {
@@ -110,7 +121,10 @@ export type AuthoritativeStateRecovery = {
   reason: string;
   detectedAt: string;
   damagedEvidenceDirectory: string;
+  failedWriteGeneration?: number;
   restoredBackup?: AuthoritativeStateBackup;
+  restoredWriteGeneration?: number;
+  restoredDatabaseSha256?: string;
   postBackupInventory?: PostBackupEffectInventory;
   postBackupReconciliations?: PostBackupEffectReconciliation[];
 };
@@ -157,6 +171,13 @@ export type AuthoritativeStateOpenResult =
 
 export interface AuthoritativeState {
   storageStatus(): { journalMode: "wal" };
+  lifecycleStatus(): {
+    schemaRevision: number;
+    writeGeneration: number;
+    journalMode: "wal";
+    integrity: "passed";
+  };
+  probeLifecycle(nonce: string): void;
   initialize(configuration: OwnerConfiguration): void;
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
   readOwnerConversation(): OwnerConversation | undefined;
@@ -164,6 +185,11 @@ export interface AuthoritativeState {
   latestOwnerTurnId(): string | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
   appendOwnerMessage(content: string): string;
+  recordOwnerInteractionDisposition(
+    ownerTurnId: string,
+    kind: "session-view-control",
+  ): void;
+  ownerInteractionDisposition(ownerTurnId: string): "session-view-control" | undefined;
   appendLeadAgentMessage(
     turnId: string,
     content: string,
@@ -319,24 +345,43 @@ type TransitionKind =
   | `target-project-operation-attempt.${TargetProjectOperationAttempt["status"]}`
   | `effect-intent.${EffectIntent["status"]}`;
 
-export function openAuthoritativeState(stateDirectory: string): AuthoritativeState {
+export function openAuthoritativeState(
+  stateDirectory: string,
+  options: { writeGeneration?: number } = {},
+): AuthoritativeState {
   mkdirSync(stateDirectory, { recursive: true });
   if (loadRecoveryStatus(stateDirectory)) {
     throw new Error("Authoritative state recovery is active; product mutations are disabled.");
   }
   const database = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"));
-  try {
-    database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
-    assertDatabaseIntegrity(database);
-    ensureSchema(database);
-  } catch (error) {
+  const writeGeneration = (() => {
     try {
-      database.close();
-    } catch {
-      // Preserve the original database failure; the next safe open captures the files as evidence.
+      database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
+      assertDatabaseIntegrity(database);
+      ensureWriteGenerationSchema(database);
+      const expected = options.writeGeneration ?? readWriteGeneration(database);
+      ensureSchema(database, expected);
+      recordWriteGenerationHighWater(stateDirectory, readWriteGeneration(database));
+      return expected;
+    } catch (error) {
+      try {
+        database.close();
+      } catch {
+        // Preserve the original database failure; the next safe open captures the files as evidence.
+      }
+      throw error;
     }
-    throw error;
-  }
+  })();
+
+  const beginWrite = (): void => {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      assertWriteGeneration(database, writeGeneration);
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
 
   const readConfigurationRow = (): { id: string; value: OwnerConfiguration } | undefined => {
     const row = database
@@ -383,7 +428,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     const factId = randomUUID();
     const transitionId = randomUUID();
     const recordedAt = new Date().toISOString();
-    database.exec("BEGIN IMMEDIATE");
+    beginWrite();
     try {
       database
         .prepare(`
@@ -452,7 +497,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       `)
       .get(`commitment:${commitmentId}`) as { id: string } | undefined;
     let predecessorId = current?.id;
-    database.exec("BEGIN IMMEDIATE");
+    beginWrite();
     try {
       for (const snapshot of snapshots) {
         const factId = randomUUID();
@@ -512,7 +557,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       throw new Error("One Lead turn attempt snapshot batch cannot contain multiple identities.");
     }
     let predecessorId = readLeadTurnAttemptRow(attemptId)?.id;
-    database.exec("BEGIN IMMEDIATE");
+    beginWrite();
     try {
       for (const snapshot of snapshots) {
         const factId = randomUUID();
@@ -630,7 +675,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
   const appendSnapshotBatch = (entries: DurableSnapshotEntry[]): void => {
     if (entries.length === 0) return;
     const predecessorBySubject = new Map<string, string | undefined>();
-    database.exec("BEGIN IMMEDIATE");
+    beginWrite();
     try {
       for (const entry of entries) {
         const subjectId = `${entry.subjectPrefix}:${entry.snapshot.id}`;
@@ -872,7 +917,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     const recordedAt = new Date().toISOString();
     const attemptFactId = randomUUID();
     const effectFactId = randomUUID();
-    database.exec("BEGIN IMMEDIATE");
+    beginWrite();
     try {
       input.beforeWrite?.();
       database
@@ -1019,6 +1064,46 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       return { journalMode: "wal" };
     },
 
+    lifecycleStatus() {
+      const { journalMode } = this.storageStatus();
+      const integrity = database.prepare("PRAGMA integrity_check").get() as {
+        integrity_check: string;
+      };
+      if (integrity.integrity_check !== "ok") {
+        throw new Error(`Authoritative State integrity check failed: ${integrity.integrity_check}.`);
+      }
+      const schemaRevision = readSchemaRevision(database);
+      if (schemaRevision !== authoritativeStateSchemaRevision) {
+        throw new Error(
+          `Authoritative State schema revision ${schemaRevision} is unsupported; expected ${authoritativeStateSchemaRevision}.`,
+        );
+      }
+      return {
+        schemaRevision,
+        writeGeneration: readWriteGeneration(database),
+        journalMode,
+        integrity: "passed",
+      };
+    },
+
+    probeLifecycle(nonce) {
+      if (!nonce.trim()) throw new Error("Lifecycle probe nonce is required.");
+      beginWrite();
+      try {
+        database
+          .prepare("UPDATE lifecycle_metadata SET probe_nonce = ? WHERE singleton = 1")
+          .run(nonce);
+        const row = database
+          .prepare("SELECT probe_nonce FROM lifecycle_metadata WHERE singleton = 1")
+          .get() as { probe_nonce: string | null };
+        if (row.probe_nonce !== nonce) throw new Error("Lifecycle write/read probe did not round-trip.");
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+
     initialize(configuration) {
       validateConfiguration(configuration);
       const existing = readConfigurationRow();
@@ -1122,6 +1207,38 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         "owner-conversation.owner-message-recorded",
       );
       return turnId;
+    },
+
+    recordOwnerInteractionDisposition(ownerTurnId, kind) {
+      if (this.ownerMessage(ownerTurnId) === undefined) {
+        throw new Error(`Unknown Owner turn ${ownerTurnId}.`);
+      }
+      beginWrite();
+      try {
+        database
+          .prepare(`
+            INSERT INTO owner_interaction_dispositions (owner_turn_id, kind, recorded_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(owner_turn_id) DO NOTHING
+          `)
+          .run(ownerTurnId, kind, new Date().toISOString());
+        const recorded = database
+          .prepare("SELECT kind FROM owner_interaction_dispositions WHERE owner_turn_id = ?")
+          .get(ownerTurnId) as { kind: "session-view-control" } | undefined;
+        if (recorded?.kind !== kind) {
+          throw new Error(`Owner turn ${ownerTurnId} has a different durable disposition.`);
+        }
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+
+    ownerInteractionDisposition(ownerTurnId) {
+      return (database
+        .prepare("SELECT kind FROM owner_interaction_dispositions WHERE owner_turn_id = ?")
+        .get(ownerTurnId) as { kind: "session-view-control" } | undefined)?.kind;
     },
 
     appendLeadAgentMessage(turnId, content, attribution) {
@@ -1294,7 +1411,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         "worker-session.snapshot",
         `worker-session:${workerSession.id}`,
       )?.id;
-      database.exec("BEGIN IMMEDIATE");
+      beginWrite();
       try {
         if (effectIntent) {
           const assignment = workerSession.assignment;
@@ -1468,7 +1585,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       ) {
         throw new Error("Worker Verification settlement requires current attributed state.");
       }
-      database.exec("BEGIN IMMEDIATE");
+      beginWrite();
       try {
         const recordedAt = new Date().toISOString();
         const effectFactId = randomUUID();
@@ -1874,7 +1991,7 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
       }
       const recordedAt = new Date().toISOString();
       const factId = randomUUID();
-      database.exec("BEGIN IMMEDIATE");
+      beginWrite();
       try {
         database
           .prepare(`
@@ -1922,9 +2039,6 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
     },
 
     async createBackup(databasePath) {
-      if (!readConfigurationRow()) {
-        throw new Error("An Authoritative State backup requires initialized CMD Riker state.");
-      }
       const destination = resolve(databasePath);
       const liveDatabase = resolve(join(stateDirectory, "authoritative-state.sqlite"));
       if (destination === liveDatabase) {
@@ -1934,33 +2048,53 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
         throw new Error("An Authoritative State backup requires a new destination.");
       }
       mkdirSync(dirname(destination), { recursive: true });
-      assertDatabaseIntegrity(database);
-      const row = database.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM facts").get() as {
-        sequence: number;
-      };
-      const identity = readStateIdentity(database);
-      const backupId = randomUUID();
-      const createdAt = new Date().toISOString();
-      database
-        .prepare(`
-          INSERT INTO state_backups (id, state_id, write_generation, last_journal_sequence, created_at)
-          VALUES (?, ?, ?, ?, ?)
-        `)
-        .run(backupId, identity.stateId, identity.writeGeneration, row.sequence, createdAt);
-      await backupDatabase(database, destination);
-      const manifest: AuthoritativeStateBackup = {
-        version: 1,
-        backupId,
-        sourceStateId: identity.stateId,
-        writeGeneration: identity.writeGeneration,
-        databasePath: destination,
-        sha256: sha256File(destination),
-        createdAt,
-        lastJournalSequence: row.sequence,
-      };
-      verifyCmdRikerBackupProvenance(destination, manifest);
-      writeJsonAtomically(backupManifestPath(destination), manifest);
-      return manifest;
+      const backupIdentity = (() => {
+        beginWrite();
+        try {
+          if (!readConfigurationRow()) {
+            throw new Error("An Authoritative State backup requires initialized CMD Riker state.");
+          }
+          assertDatabaseIntegrity(database);
+          const row = database
+            .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM facts")
+            .get() as { sequence: number };
+          const identity = readStateIdentity(database);
+          const backupId = randomUUID();
+          const createdAt = new Date().toISOString();
+          database
+            .prepare(`
+              INSERT INTO state_backups (
+                id, state_id, write_generation, last_journal_sequence, created_at
+              ) VALUES (?, ?, ?, ?, ?)
+            `)
+            .run(backupId, identity.stateId, identity.writeGeneration, row.sequence, createdAt);
+          database.exec("COMMIT");
+          return { backupId, createdAt, identity, lastJournalSequence: row.sequence };
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      })();
+      try {
+        await backupDatabase(database, destination);
+        const manifest: AuthoritativeStateBackup = {
+          version: 1,
+          backupId: backupIdentity.backupId,
+          sourceStateId: backupIdentity.identity.stateId,
+          writeGeneration: backupIdentity.identity.writeGeneration,
+          databasePath: destination,
+          sha256: sha256File(destination),
+          createdAt: backupIdentity.createdAt,
+          lastJournalSequence: backupIdentity.lastJournalSequence,
+        };
+        verifyCmdRikerBackupProvenance(destination, manifest);
+        writeJsonAtomically(backupManifestPath(destination), manifest);
+        return manifest;
+      } catch (error) {
+        rmSync(destination, { force: true });
+        rmSync(backupManifestPath(destination), { force: true });
+        throw error;
+      }
     },
 
     close() {
@@ -1971,13 +2105,15 @@ export function openAuthoritativeState(stateDirectory: string): AuthoritativeSta
 
 export function openAuthoritativeStateSafely(
   stateDirectory: string,
+  options: { writeGeneration?: number } = {},
 ): AuthoritativeStateOpenResult {
   mkdirSync(stateDirectory, { recursive: true });
   const activeRecovery = loadRecoveryStatus(stateDirectory);
   if (activeRecovery) return { kind: "recovery-required", recovery: activeRecovery };
   try {
-    return { kind: "operational", state: openAuthoritativeState(stateDirectory) };
+    return { kind: "operational", state: openAuthoritativeState(stateDirectory, options) };
   } catch (error) {
+    if (error instanceof StaleWriteGenerationError) throw error;
     const recovery = preserveDamagedState(
       stateDirectory,
       error instanceof Error ? error.message : "SQLite integrity could not be established.",
@@ -2002,7 +2138,16 @@ export function restoreAuthoritativeStateBackup(input: {
   }
   const restoreCandidate = join(stateDirectory, `restore-candidate-${randomUUID()}.sqlite`);
   copyFileSync(backup.databasePath, restoreCandidate);
+  const restoredWriteGeneration = Math.max(
+    backup.writeGeneration,
+    recovery.failedWriteGeneration ?? 0,
+    readWriteGenerationHighWater(stateDirectory) ?? 0,
+  ) + 1;
+  recordWriteGenerationHighWater(stateDirectory, restoredWriteGeneration);
+  let restoredDatabaseSha256: string;
   try {
+    verifyDatabaseFile(restoreCandidate);
+    setDatabaseWriteGeneration(restoreCandidate, restoredWriteGeneration);
     verifyDatabaseFile(restoreCandidate);
     const preserveSuffix = `${new Date().toISOString().replaceAll(":", "-")}-${randomUUID()}`;
     for (const fileName of [
@@ -2022,6 +2167,11 @@ export function restoreAuthoritativeStateBackup(input: {
     rmSync(`${databasePath}-wal`, { force: true });
     rmSync(`${databasePath}-shm`, { force: true });
     renameSync(restoreCandidate, databasePath);
+    restoredDatabaseSha256 = sha256File(databasePath);
+    verifyCmdRikerBackupProvenance(databasePath, backup, {
+      writeGeneration: restoredWriteGeneration,
+      sha256: restoredDatabaseSha256,
+    });
   } catch (error) {
     rmSync(restoreCandidate, { force: true });
     throw error;
@@ -2036,6 +2186,8 @@ export function restoreAuthoritativeStateBackup(input: {
     reason:
       "A verified backup was restored; every possible later external effect must be reconciled before mutations resume.",
     restoredBackup: backup,
+    restoredWriteGeneration,
+    restoredDatabaseSha256,
     postBackupInventory: input.postBackupInventory,
     postBackupReconciliations: [],
   };
@@ -2054,7 +2206,9 @@ export function reconcilePostBackupEffect(input: {
   if (
     recovery?.phase !== "post-backup-reconciliation" ||
     !recovery.postBackupInventory ||
-    !recovery.restoredBackup
+    !recovery.restoredBackup ||
+    recovery.restoredWriteGeneration === undefined ||
+    recovery.restoredDatabaseSha256 === undefined
   ) {
     throw new Error("Post-backup effect reconciliation requires a restored recovery state.");
   }
@@ -2087,7 +2241,9 @@ export function completeAuthoritativeStateRecovery(stateDirectoryInput: string):
   if (
     recovery?.phase !== "post-backup-reconciliation" ||
     !recovery.postBackupInventory ||
-    !recovery.restoredBackup
+    !recovery.restoredBackup ||
+    recovery.restoredWriteGeneration === undefined ||
+    recovery.restoredDatabaseSha256 === undefined
   ) {
     throw new Error("Authoritative State recovery is not ready for completion.");
   }
@@ -2103,6 +2259,10 @@ export function completeAuthoritativeStateRecovery(stateDirectoryInput: string):
   verifyCmdRikerBackupProvenance(
     join(stateDirectory, "authoritative-state.sqlite"),
     recovery.restoredBackup,
+    {
+      writeGeneration: recovery.restoredWriteGeneration,
+      sha256: recovery.restoredDatabaseSha256,
+    },
   );
   writeJsonAtomically(
     join(recovery.damagedEvidenceDirectory, "completed-recovery.json"),
@@ -2135,6 +2295,14 @@ export function establishNewAuthoritativeStateBaseline(input: {
       candidateState.close();
     }
     const candidateDatabase = join(candidateDirectory, "authoritative-state.sqlite");
+    verifyDatabaseFile(candidateDatabase);
+    const candidateGeneration = Math.max(
+      recovery.failedWriteGeneration ?? 0,
+      readWriteGenerationHighWater(stateDirectory) ?? 0,
+      1,
+    ) + 1;
+    setDatabaseWriteGeneration(candidateDatabase, candidateGeneration);
+    recordWriteGenerationHighWater(stateDirectory, candidateGeneration);
     verifyDatabaseFile(candidateDatabase);
     const databasePath = join(stateDirectory, "authoritative-state.sqlite");
     const preserveSuffix = `${new Date().toISOString().replaceAll(":", "-")}-${randomUUID()}`;
@@ -2190,6 +2358,29 @@ function verifyDatabaseFile(databasePath: string): void {
   }
 }
 
+function setDatabaseWriteGeneration(databasePath: string, writeGeneration: number): void {
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("PRAGMA synchronous = FULL; BEGIN IMMEDIATE;");
+    const result = database
+      .prepare(`
+        UPDATE lifecycle_metadata
+           SET write_generation = ?, probe_nonce = NULL
+         WHERE singleton = 1
+      `)
+      .run(writeGeneration);
+    if (result.changes !== 1) {
+      throw new Error("Restored Authoritative State is missing its write-generation identity.");
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    if (database.isTransaction) database.exec("ROLLBACK");
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
 function readVerifiedBackup(databasePathInput: string): AuthoritativeStateBackup {
   const databasePath = resolve(databasePathInput);
   const manifestPath = backupManifestPath(databasePath);
@@ -2223,9 +2414,12 @@ function readStateIdentity(database: DatabaseSync): {
 } {
   const row = database
     .prepare(`
-      SELECT state_id AS stateId, write_generation AS writeGeneration
-        FROM state_identity
-       WHERE singleton = 1
+      SELECT identity.state_id AS stateId,
+             lifecycle.write_generation AS writeGeneration
+        FROM state_identity identity
+        JOIN lifecycle_metadata lifecycle
+          ON lifecycle.singleton = identity.singleton
+       WHERE identity.singleton = 1
     `)
     .get() as { stateId: string; writeGeneration: number } | undefined;
   if (!row) throw new Error("CMD Riker Authoritative State identity is missing.");
@@ -2235,8 +2429,9 @@ function readStateIdentity(database: DatabaseSync): {
 function verifyCmdRikerBackupProvenance(
   databasePath: string,
   manifest: AuthoritativeStateBackup,
+  restored?: { writeGeneration: number; sha256: string },
 ): void {
-  if (sha256File(databasePath) !== manifest.sha256) {
+  if (sha256File(databasePath) !== (restored?.sha256 ?? manifest.sha256)) {
     throw new Error("CMD Riker backup hash does not match the installed recovery database.");
   }
   const database = new DatabaseSync(databasePath, { readOnly: true });
@@ -2267,7 +2462,7 @@ function verifyCmdRikerBackupProvenance(
     if (
       !configuration ||
       identity.stateId !== manifest.sourceStateId ||
-      identity.writeGeneration !== manifest.writeGeneration ||
+      identity.writeGeneration !== (restored?.writeGeneration ?? manifest.writeGeneration) ||
       !backup ||
       backup.stateId !== manifest.sourceStateId ||
       backup.writeGeneration !== manifest.writeGeneration ||
@@ -2353,6 +2548,7 @@ function preserveDamagedState(
     reason,
     detectedAt,
     damagedEvidenceDirectory,
+    ...bestEffortWriteGeneration(stateDirectory),
   };
   writeRecoveryStatus(stateDirectory, recovery);
   return recovery;
@@ -2413,9 +2609,30 @@ function preserveDamagedRecoveryMarker(
     reason: `Recovery metadata integrity failed: ${detail}`,
     detectedAt,
     damagedEvidenceDirectory,
+    ...bestEffortWriteGeneration(stateDirectory),
   };
   writeRecoveryStatus(stateDirectory, recovery);
   return recovery;
+}
+
+function bestEffortWriteGeneration(
+  stateDirectory: string,
+): Pick<AuthoritativeStateRecovery, "failedWriteGeneration"> {
+  const highWater = readWriteGenerationHighWater(stateDirectory);
+  try {
+    const database = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      return {
+        failedWriteGeneration: Math.max(readWriteGeneration(database), highWater ?? 0),
+      };
+    } finally {
+      database.close();
+    }
+  } catch {
+    return highWater === undefined ? {} : { failedWriteGeneration: highWater };
+  }
 }
 
 function isRecoveryStatus(value: unknown): value is AuthoritativeStateRecovery {
@@ -2449,8 +2666,17 @@ function writeJsonAtomically(path: string, value: unknown): void {
   }
 }
 
-function ensureSchema(database: DatabaseSync): void {
-  database.exec(`
+function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
+  database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;");
+  try {
+    assertWriteGeneration(database, writeGeneration);
+    const schemaRevision = readSchemaRevision(database);
+    if (schemaRevision !== authoritativeStateSchemaRevision) {
+      throw new Error(
+        `Authoritative State schema revision ${schemaRevision} is unsupported; expected ${authoritativeStateSchemaRevision}.`,
+      );
+    }
+    database.exec(`
     CREATE TABLE IF NOT EXISTS facts (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
       id TEXT NOT NULL UNIQUE,
@@ -2562,8 +2788,7 @@ function ensureSchema(database: DatabaseSync): void {
 
     CREATE TABLE IF NOT EXISTS state_identity (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      state_id TEXT NOT NULL UNIQUE,
-      write_generation INTEGER NOT NULL CHECK (write_generation > 0)
+      state_id TEXT NOT NULL UNIQUE
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS state_backups (
@@ -2574,11 +2799,23 @@ function ensureSchema(database: DatabaseSync): void {
       created_at TEXT NOT NULL,
       FOREIGN KEY (state_id) REFERENCES state_identity(state_id)
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS owner_interaction_dispositions (
+      owner_turn_id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('session-view-control')),
+      recorded_at TEXT NOT NULL
+    ) STRICT;
   `);
+  const stateIdentityColumns = database
+    .prepare("PRAGMA table_info(state_identity)")
+    .all() as Array<{ name: string }>;
+  if (stateIdentityColumns.some((column) => column.name === "write_generation")) {
+    database.exec("ALTER TABLE state_identity DROP COLUMN write_generation;");
+  }
   database
     .prepare(`
-      INSERT OR IGNORE INTO state_identity (singleton, state_id, write_generation)
-      VALUES (1, ?, 1)
+      INSERT OR IGNORE INTO state_identity (singleton, state_id)
+      VALUES (1, ?)
     `)
     .run(randomUUID());
   const row = database
@@ -2606,13 +2843,11 @@ function ensureSchema(database: DatabaseSync): void {
     transitionsRow.sql.includes("'forge-owner-action-notice.cleared'") &&
     transitionsRow.sql.includes("'effect-intent.reconciled'")
   ) {
+    database.exec("COMMIT");
     return;
   }
 
-  database.exec("PRAGMA foreign_keys = OFF;");
-  try {
     database.exec(`
-      BEGIN IMMEDIATE;
       ALTER TABLE facts RENAME TO facts_legacy;
       ALTER TABLE transitions RENAME TO transitions_legacy;
       DROP INDEX facts_one_successor;
@@ -2731,14 +2966,22 @@ function ensureSchema(database: DatabaseSync): void {
         SELECT id, kind, fact_id, recorded_at FROM transitions_legacy;
       DROP TABLE transitions_legacy;
       DROP TABLE facts_legacy;
-      COMMIT;
     `);
+    database.exec("COMMIT");
   } catch (error) {
-    database.exec("ROLLBACK;");
+    if (database.isTransaction) database.exec("ROLLBACK;");
     throw error;
   } finally {
     database.exec("PRAGMA foreign_keys = ON;");
   }
+}
+
+function readSchemaRevision(database: DatabaseSync): number {
+  const row = database
+    .prepare("SELECT schema_revision FROM lifecycle_metadata WHERE singleton = 1")
+    .get() as { schema_revision: number } | undefined;
+  if (!row) throw new Error("Authoritative State schema revision is unavailable.");
+  return row.schema_revision;
 }
 
 function parseConfiguration(valueJson: string): OwnerConfiguration {

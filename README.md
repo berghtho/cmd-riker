@@ -9,9 +9,9 @@ system when necessary.
 The Owner-facing product is a TypeScript/Node modular monolith using
 SQLite WAL state and pinned Pi `0.84.2` libraries behind CMD-Riker-owned seams.
 
-## Owner CLI
+## Development
 
-Install and verify the product:
+Install dependencies and verify a source checkout:
 
 ```powershell
 npm ci
@@ -20,7 +20,87 @@ npm test
 npm run build
 ```
 
-An uninitialized state directory requires a secret-free `config.json`:
+The build produces separate `dist/lead-agent` and `dist/recovery-actor` trees. The protected Recovery
+Actor uses only Node built-ins and stays outside the Lead Agent version it supervises.
+
+## Local Windows Installation
+
+CMD Riker installs per Windows user from an Owner-supplied local build. It does not download releases,
+start at boot or logon, install a service, require `SYSTEM`, or depend on a machine-wide Node runtime
+after installation.
+
+Build immutable Lead Agent and Recovery Actor bundles with official Node `24.17.0`:
+
+```powershell
+npm ci
+npm run build
+npm run build:local-release -- `
+  --revision riker-0.1.0-local.1 `
+  --node "C:\Program Files\nodejs\node.exe" `
+  --lead-dist dist\lead-agent `
+  --lead-node-modules node_modules `
+  --actor-dist dist\recovery-actor `
+  --output release\riker-0.1.0-local.1
+```
+
+The builder refuses another Node version, hashes every final file, and emits strict separate
+manifests. The Lead Agent carries its runtime dependencies; the Recovery Actor bundle cannot contain
+Pi, Codex, or another non-built-in dependency.
+
+Prepare the secret-free configuration below, then install without starting the product:
+
+```powershell
+$release = Resolve-Path release\riker-0.1.0-local.1
+$install = "$env:LOCALAPPDATA\CMD Riker"
+& "$release\recovery-actor\runtime\node.exe" `
+  "$release\recovery-actor\dist\lifecycle-cli.js" install `
+  --install-root $install `
+  --actor-bundle "$release\recovery-actor" `
+  --lead-bundle "$release\lead-agent" `
+  --config C:\path\to\config.json
+```
+
+The registered Task Scheduler entry is per-user, on-demand, singleton, and has a bounded Recovery
+Actor restart policy. Launching again reconnects to the same Lead Agent. Closing the terminal only
+detaches; `stop` durably prevents new effects before supervision ends.
+
+```powershell
+& "$install\launcher\riker.cmd" start
+& "$install\launcher\riker.cmd" inspect
+& "$install\launcher\riker.cmd" stop
+```
+
+Upgrade from another trusted local Lead Agent bundle. Compatibility and independent Review evidence
+are explicit inputs:
+
+```powershell
+& "$install\launcher\riker.cmd" upgrade `
+  --lead-bundle C:\path\to\next-release\lead-agent `
+  --state-revision before-riker-0.1.1 `
+  --compatibility-evidence "lossless migration and return path verified" `
+  --review-evidence "independent risk-focused review passed"
+```
+
+The Activation Journal records exact actor, attempt, code, state, baseline, and write-generation
+identity before cutover. A failed or interrupted candidate restores the immediate SQLite-native
+baseline under a fresh generation; stale writers are fenced on every Authoritative State transaction.
+Successful activation does not automatically promote the Recovery Baseline.
+
+Uninstall reaches a safe stop, unregisters supervision, and removes binaries and launcher material.
+It preserves Authoritative State, journals, snapshots, failed-state evidence, and unresolved attempts.
+Destructive state removal is a separate Owner action.
+
+```powershell
+& "$install\launcher\riker.cmd" uninstall
+```
+
+Local bundles are trusted Owner inputs. Their hashes prove exact identity and detect changes; V1 does
+not claim publisher authenticity, remote acquisition, automatic updates, or Recovery Actor
+self-upgrade.
+
+## Owner Configuration
+
+An uninitialized installation or development state directory requires a secret-free `config.json`:
 
 ```json
 {
@@ -66,10 +146,11 @@ npm exec -- pi auth check --provider openai-codex --json
 
 Pi's provider-owned `ModelRuntime` resolves and refreshes OAuth internally; credential values never
 cross CMD-Riker-owned interfaces or durable state. Keyless loopback OpenAI-compatible endpoints are
-also supported with `api: "openai-completions"` and a loopback `baseUrl`. Start the CLI with:
+also supported with `api: "openai-completions"` and a loopback `baseUrl`. For source-checkout
+development, start the CLI with:
 
 ```powershell
-npm start -- --state-dir C:\path\to\cmd-riker-state
+node src/cli.ts --state-dir C:\path\to\cmd-riker-state
 ```
 
 Non-TTY stdin/stdout remains line-oriented for scripts. A real terminal uses the CMD-Riker-owned

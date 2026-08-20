@@ -2,4 +2,5 @@ apm_modules/
 .agents/skills/
 node_modules/
 dist/
+release/
 scratch/

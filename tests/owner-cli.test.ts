@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
+import { advanceWriteGeneration } from "../src/write-generation.ts";
 import { startLocalModel } from "./support/local-model.ts";
 
 test("Owner CLI continues one canonical conversation in a new process", async (t) => {
@@ -274,6 +275,103 @@ test("Owner CLI reports missing configuration as a deterministic host diagnostic
     "CMD_RIKER_CONFIG_MISSING: Uninitialized state requires config.json in the state directory.\n",
   );
   assert.doesNotMatch(result.stdout + result.stderr, /Lead Agent:/);
+});
+
+test("Owner CLI reports a fenced installed generation without opening conversation", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-generation-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  state.initialize({
+    targetProject: { path: "C:\\target-project" },
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:11434/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  state.close();
+  advanceWriteGeneration(stateDirectory, 1);
+
+  const result = await runCli(stateDirectory, "", ["--write-generation", "1"]);
+
+  assert.equal(result.code, 2);
+  assert.equal(
+    result.stderr,
+    "CMD_RIKER_STALE_GENERATION: This Lead Agent process is fenced from Authoritative State generation 2.\n",
+  );
+  assert.doesNotMatch(result.stdout + result.stderr, /Lead Agent:/);
+  const active = openAuthoritativeState(stateDirectory, { writeGeneration: 2 });
+  active.close();
+});
+
+test("provisional activation reports readiness without requiring live Model availability", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-provisional-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  state.initialize({
+    targetProject: { path: "C:\\target-project" },
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:1/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  state.close();
+
+  const result = await runCli(stateDirectory, "", [
+    "--write-generation",
+    "1",
+    "--activation-provisional",
+    "--activation-handshake-nonce",
+    "nonce-1",
+    "--activation-attempt-id",
+    "attempt-1",
+    "--candidate-revision",
+    "candidate-1",
+    "--artifact-digest",
+    "digest-1",
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(
+    result.stdout,
+    /"type":"CMD_RIKER_ACTIVATION_READY".*"attemptId":"attempt-1".*"handshakeNonce":"nonce-1"/,
+  );
+});
+
+test("hosted Session View inspection acknowledges handling without inventing a durable Owner turn", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-hosted-session-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  state.initialize({
+    targetProject: { path: "C:\\target-project" },
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:1/v1",
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  state.close();
+
+  const result = await runCli(stateDirectory, "/session workers\n", [
+    "--write-generation",
+    "1",
+    "--activation-provisional",
+    "--hosted",
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /CMD_RIKER_OWNER_HANDLED/);
+  assert.doesNotMatch(result.stdout, /CMD_RIKER_OWNER_RECORDED:/);
+  const reopened = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  assert.deepEqual(reopened.readOwnerConversation()?.messages, []);
+  reopened.close();
 });
 
 test("Owner CLI reports malformed configuration as a deterministic host diagnostic", async (t) => {

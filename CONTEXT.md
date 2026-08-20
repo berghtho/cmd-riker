@@ -11,53 +11,52 @@ The personality may address the Owner as the Captain, but product specifications
 _Avoid_: User, Captain
 
 **Lead Agent**:
-The persistent Owner-facing agent accountable for commitments from intake through accepted outcome.
-It owns conversation, command, ADR enforcement, and Self-repair; it normally delegates Target Project
-implementation but retains authority to act directly when delegation would impede the mission.
+The persistent Owner-facing agent accountable for delivering Work Items from request through
+delivery. It owns the conversation, chooses Native Harnesses and Models per Delegation, orchestrates
+parallel Worker Sessions, performs Self-repair, and acts directly when delegation would impede the
+mission.
 _Avoid_: Board Agent, Primary Agent, Coordinator Agent
 
 **Command Authority**:
-The Lead Agent's standing authority to make decisions and perform effects needed to fulfill its
-accountability within the accepted mission, ADRs, and Standing Orders. It is never delegated to a
-Worker Session.
-_Avoid_: Tool permission, Unlimited access
-
-**Acting Authority**:
-The expanded Command Authority used when the Owner is unavailable and a mission decision cannot
-wait. It ends after the returning Owner receives a safe handoff; the personality may call its use
-becoming Acting Captain, but product state uses Acting Authority.
-_Avoid_: Owner transfer, Autonomous mission
+The Lead Agent's standing authority to decide and perform the effects its accountability requires,
+bounded only by the accepted mission, ADRs, and Standing Orders. It applies whether the Owner is
+present or absent; absence changes only the reporting duty. An irreversible effect without explicit
+coverage takes the reversible variant. It is never delegated to a Worker Session.
+_Avoid_: Acting Authority, Tool permission, Grant
 
 **Standing Order**:
-A durable Owner instruction that grants, reserves, or limits Command Authority for a known class of
-decisions or effects, especially during Owner absence. It is inspectable and revocable.
-_Avoid_: Assumed permission, Prompt hint
+A durable plain-language Owner instruction that grants, reserves, or limits Command Authority for a
+known class of decisions or effects. It is inspectable and revocable.
+_Avoid_: Assumed permission, Prompt hint, Grant form
 
-**Commitment**:
-A visibly accepted, outcome-oriented unit of work that the Lead Agent owns through an accepted
-outcome. It is recorded durably; a loose Owner request may remain conversation or produce one or
-more Commitments, and a tracker issue is only a conditional coordination artifact.
-_Avoid_: Message, Technical task, Tracker issue
+**Work Item**:
+The durable record of one outcome the Lead Agent has agreed to deliver. Any number of parallel
+Worker Sessions may serve one Work Item. The Owner speaks and hears plain language; identifiers
+stay internal.
+_Avoid_: Commitment, Tracker issue, Technical task
 
-**Verification**:
-The evidence-based determination that an outcome satisfies its stated criteria. Verification informs
-Acceptance but does not grant it.
-_Avoid_: Review, Acceptance
-
-**Review**:
-Independent judgment used to find material defects that objective Verification does not cover. It
-produces findings and evidence but neither re-verifies narration nor grants Acceptance.
-_Avoid_: Verification, Approval, Prose audit
-
-**Acceptance**:
-The authoritative determination that a verified outcome fulfills its Commitment. The Lead Agent may
-accept objective outcomes; the Owner retains acceptance of subjective or explicitly reserved ones.
-_Avoid_: Verification, Completion
+**Delegation**:
+The Lead Agent's per-task assignment of an objective to a Worker Session, including its choice of
+Native Harness and Model at that moment.
+_Avoid_: Startup probe, Harness configuration
 
 **Worker Session**:
 One delegated native agent session with its own provider identity, tools, conversation, and optional
 subagents. It never owns the Owner relationship or Command Authority.
 _Avoid_: Lane, Worker Agent, Subagent
+
+**Intervention**:
+A Lead Agent action inside a running Worker Session: answering its question, steering it with a
+message, or editing its Execution Checkout directly. Every direct edit is announced to the Worker
+before it continues, so the Worker never reacts to unexplained changes.
+_Avoid_: Cancel, Takeover
+
+**Verification**:
+The evidence-based check that a delivered outcome meets its stated criteria: tests, checks, and
+read-backs, reported with the delivery. Independent review is a tactic the Lead Agent may delegate
+when risk warrants it, not a lifecycle stage; delivery needs no Owner acceptance unless a Standing
+Order reserves it.
+_Avoid_: Acceptance, Review stage, Prose audit
 
 **Native Harness**:
 The installed Codex, Claude, Copilot, Pi, or other environment that owns a Worker Session's native
@@ -75,43 +74,27 @@ data-handling, and availability boundary.
 _Avoid_: Model, Native Harness
 
 **Model Policy**:
-An Owner-controlled durable set of constraints and preferences governing which Model Selections CMD
-Riker may make.
-_Avoid_: Model configuration, Router configuration, Harness configuration
-
-**Model Selection**:
-The attributed concrete choice of Model, Model Provider, and, when applicable, Native Harness for one
-Lead Agent turn or Worker Session execution attempt.
-_Avoid_: Model name, Provider selection, Routing guess
+An Owner-controlled durable set of constraints and preferences governing which Models, Model
+Providers, and Native Harnesses the Lead Agent may choose for itself and for Delegations.
+_Avoid_: Model configuration, Router configuration
 
 **Target Project**:
 The project whose work the Lead Agent coordinates. Exactly one is active in the first product.
 _Avoid_: Workspace, Client repository
 
 **Execution Checkout**:
-An isolated, Commitment-bound project view used as the sole Authorized Write Root for one effectful
-Worker Session while the Target Project remains Owner-facing. Its result is reconciled back to the
-Target Project before the Execution Checkout is disposed.
-_Avoid_: Target Project, Working directory
-
-**Authorized Write Root**:
-An explicitly bounded filesystem location where an actor may perform file effects under existing
-authority without further Owner approval. Native tool-owned credential or session state does not
-extend that boundary.
-_Avoid_: Allowed folder, Repository permission
+An isolated project checkout used as the sole write location for one effectful Worker Session while
+the Target Project remains Owner-facing. It is what makes parallel effectful Workers safe; its
+result is reconciled back before the checkout is disposed.
+_Avoid_: Target Project, Working directory, Authorized Write Root
 
 **Self-repair**:
 A Lead-Agent-initiated change to CMD Riker's own orchestration system rather than to the Target
-Project.
-_Avoid_: Self-deploy, Target work
-
-**Health Assessment**:
-An evidence-based, time-bounded determination about one named subject and scope, derived from
-authoritative facts and referenced evidence. Process presence and stale or missing evidence never
-establish health, and any overall presentation is only a projection of scoped assessments.
-_Avoid_: Global status light, Process is running
+Project. It is verified by green tests plus an available one-command rollback of the versioned
+install; no external guardian process supervises it.
+_Avoid_: Self-deploy, Staged probation
 
 **Session View**:
-A minimal, primarily observational overview of the Lead Agent and Worker Sessions that never owns
-workflow continuation.
-_Avoid_: Board, Dashboard, Control plane
+A minimal observational overview showing plain-language status of the Lead Agent and Worker
+Sessions. It never owns workflow continuation and shows no internal identifiers.
+_Avoid_: Board, Dashboard, Control plane, Attention ledger

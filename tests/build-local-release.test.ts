@@ -12,7 +12,21 @@ import { verifyLocalReleaseCandidate } from "../src/local-release/index.ts";
 const run = promisify(execFile);
 const script = fileURLToPath(new URL("../scripts/build-local-release.mjs", import.meta.url));
 
-test("builds separate complete Lead Agent and Recovery Actor release bundles", async (t) => {
+// The builder accepts the supported Node major at or above the proven floor and
+// records the exact supplied runtime version in the manifest.
+const minimumNodeVersion = [24, 16, 0] as const;
+const nodeVersionMatch = /^v(\d+)\.(\d+)\.(\d+)$/.exec(process.version);
+const runtimeSupported = nodeVersionMatch !== null &&
+  Number(nodeVersionMatch[1]) === minimumNodeVersion[0] &&
+  (Number(nodeVersionMatch[2]) > minimumNodeVersion[1] ||
+    (Number(nodeVersionMatch[2]) === minimumNodeVersion[1] &&
+      Number(nodeVersionMatch[3]) >= minimumNodeVersion[2])) &&
+  (process.arch === "x64" || process.arch === "arm64");
+const skip = runtimeSupported
+  ? false
+  : `requires Node ${minimumNodeVersion.join(".")} or newer on x64/arm64`;
+
+test("builds separate complete Lead Agent and Recovery Actor release bundles", { skip }, async (t) => {
   const fixture = await releaseFixture(t);
 
   await buildRelease(fixture, "release-37");
@@ -42,7 +56,7 @@ test("builds separate complete Lead Agent and Recovery Actor release bundles", a
     ["dist/lifecycle-cli.js", "dist/recovery-actor/index.js", "runtime/node.exe"],
   );
   assert.deepEqual(lead.manifest.runtime, {
-    version: "24.17.0",
+    version: process.version.slice(1),
     architecture: process.arch,
     path: "runtime/node.exe",
   });
@@ -53,7 +67,7 @@ test("builds separate complete Lead Agent and Recovery Actor release bundles", a
   );
 });
 
-test("refuses unsafe revisions and never replaces an existing output", async (t) => {
+test("refuses unsafe revisions and never replaces an existing output", { skip }, async (t) => {
   const fixture = await releaseFixture(t);
 
   await assert.rejects(buildRelease(fixture, "../unsafe"), /safe exact identifier/);
@@ -70,7 +84,7 @@ test("refuses unsafe revisions and never replaces an existing output", async (t)
   );
 });
 
-test("rejects Recovery Actor trees containing node_modules or non-built-in imports", async (t) => {
+test("rejects Recovery Actor trees containing node_modules or non-built-in imports", { skip }, async (t) => {
   const nodeModules = await releaseFixture(t, "node-modules");
   await mkdir(join(nodeModules.actorDist, "node_modules"));
   await assert.rejects(buildRelease(nodeModules, "actor-node-modules"), /node_modules/);
@@ -98,12 +112,6 @@ test("rejects Recovery Actor trees containing node_modules or non-built-in impor
 });
 
 async function releaseFixture(t: test.TestContext, suffix = "release") {
-  assert.equal(
-    process.version,
-    "v24.17.0",
-    "The release builder test requires the repository's supported Node runtime.",
-  );
-  assert(process.arch === "x64" || process.arch === "arm64");
   const root = await mkdtemp(join(tmpdir(), `cmd-riker-build-${suffix}-`));
   t.after(() => rm(root, { recursive: true, force: true }));
   const leadDist = join(root, "lead-dist");

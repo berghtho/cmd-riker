@@ -16,7 +16,24 @@ import {
   terminateRecordedProcess,
 } from "./codex-app-server.ts";
 
-const supportedVersions = new Set(["2.1.229 (Claude Code)", "2.1.233 (Claude Code)"]);
+// Oldest Claude Code release whose stream-json protocol passed the accepted probe.
+const minimumClaudeVersion = [2, 1, 229] as const;
+
+function assertSupportedClaudeVersion(version: string): void {
+  const match = /^(\d+)\.(\d+)\.(\d+) \(Claude Code\)$/.exec(version.trim());
+  const observed = match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+  const supported = observed && (
+    observed[0]! > minimumClaudeVersion[0] ||
+    (observed[0] === minimumClaudeVersion[0] &&
+      (observed[1]! > minimumClaudeVersion[1] ||
+        (observed[1] === minimumClaudeVersion[1] && observed[2]! >= minimumClaudeVersion[2])))
+  );
+  if (!supported) {
+    throw new Error(
+      `Unsupported Claude version ${version}; expected ${minimumClaudeVersion.join(".")} (Claude Code) or newer.`,
+    );
+  }
+}
 const protocolSchemaSha256 = createHash("sha256")
   .update("claude-stream-json:system/init,assistant,result,control_response@2.1.229-2.1.233")
   .digest("hex")
@@ -31,9 +48,7 @@ export type ClaudeRuntime = {
 };
 
 export function createClaudeWorkerHarness(runtime: ClaudeRuntime): NativeWorkerHarness {
-  if (!supportedVersions.has(runtime.version)) {
-    throw new Error(`Unsupported Claude version ${runtime.version}.`);
-  }
+  assertSupportedClaudeVersion(runtime.version);
   return new ClaudeStreamJsonHarness(runtime);
 }
 
@@ -47,9 +62,7 @@ export async function resolveClaudeRuntime(): Promise<ClaudeRuntime> {
     .find((line) => line && existsSync(line));
   if (!executable) throw new Error("claude.exe was not found.");
   const version = (await execText(resolve(executable), ["--version"])).trim();
-  if (!supportedVersions.has(version)) {
-    throw new Error(`Unsupported Claude version ${version}.`);
-  }
+  assertSupportedClaudeVersion(version);
   const auth = JSON.parse(await execText(resolve(executable), ["auth", "status", "--json"])) as {
     loggedIn?: boolean;
   };

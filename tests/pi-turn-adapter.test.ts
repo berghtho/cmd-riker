@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -58,6 +61,29 @@ test("production adapter completes a turn through pinned pi-agent-core", async (
     "Pinned Pi response.",
     modelSelection(localModel.baseUrl),
   );
+});
+
+test("production adapter grants the Lead its full native tool belt", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "cmd-riker-native-tools-test-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  let firstRequest = "";
+  const localModel = await startLocalModel((_call, requestBody) => {
+    firstRequest ||= JSON.stringify(requestBody);
+    return "Acting directly.";
+  });
+  t.after(() => localModel.close());
+
+  await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "starte einfach",
+    modelSelection: modelSelection(localModel.baseUrl),
+    nativeTools: { cwd },
+  });
+
+  assert.match(firstRequest, /full native tool belt/);
+  for (const toolName of ["read", "bash", "edit", "write", "grep", "find", "ls"]) {
+    assert.match(firstRequest, new RegExp(`"name"\\s*:\\s*"${toolName}"`));
+  }
 });
 
 test("production validation reports a failed context hard gate", async (t) => {

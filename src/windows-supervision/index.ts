@@ -3,6 +3,42 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+export type HiddenScriptHostCommandInput = {
+  scriptPath: string;
+  executable: string;
+  arguments: readonly string[];
+  windowsDirectory?: string;
+};
+
+export function hiddenScriptHostCommand(
+  input: HiddenScriptHostCommandInput,
+): { executable: string; arguments: string; script: string } {
+  const windowsDirectory = input.windowsDirectory ?? process.env.SystemRoot ?? process.env.WINDIR;
+  if (!windowsDirectory) throw new Error("The Windows directory is unavailable.");
+  const commandLine = [input.executable, ...input.arguments].map(quoteWindowsArgument).join(" ");
+  const script = [
+    "Option Explicit",
+    "Dim shell",
+    'Set shell = CreateObject("WScript.Shell")',
+    `WScript.Quit shell.Run(${vbString(commandLine)}, 0, True)`,
+    "",
+  ].join("\r\n");
+  return {
+    executable: join(windowsDirectory, "System32", "wscript.exe"),
+    arguments: `//B //NoLogo ${quoteWindowsArgument(input.scriptPath)}`,
+    script,
+  };
+}
+
+function quoteWindowsArgument(value: string): string {
+  if (value.includes("\0")) throw new TypeError("Hidden command arguments must not contain NUL characters.");
+  return `"${value.replaceAll(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/, "$1$1")}"`;
+}
+
+function vbString(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
 export type CommandResult = {
   exitCode: number;
   stdout: string;

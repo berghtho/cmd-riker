@@ -1589,9 +1589,7 @@ export function openAuthoritativeState(
               assignment.coordination.repairOfReviewFindingIds?.length
                 ? "self-repair"
                 : "update",
-            target: assignment.targets.length === 1
-              ? assignment.targets[0]!
-              : "",
+            target: assignment.targetProjectPath,
             reversible: true,
             externallyBinding: false,
             incrementalSpendUsd: assignment.costBound.maximumIncrementalSpendUsd,
@@ -3238,6 +3236,9 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
     ...(value.modelRequirements ? { modelRequirements: value.modelRequirements } : {}),
     modelPolicyRevision: value.modelPolicyRevision,
     ...(value.workerModelPolicy ? { workerModelPolicy: value.workerModelPolicy } : {}),
+    ...(value.workerHarnessSettings
+      ? { workerHarnessSettings: value.workerHarnessSettings }
+      : {}),
   };
 }
 
@@ -3264,6 +3265,17 @@ function validateConfiguration(configuration: OwnerConfiguration): void {
     const { revision, selection } = configuration.workerModelPolicy;
     if (!revision.trim()) throw new Error("Worker Model Policy revision is required.");
     assertSupportedWorkerModelSelection(selection);
+  }
+  for (const [harness, setting] of Object.entries(configuration.workerHarnessSettings ?? {})) {
+    if (!["codex", "claude", "copilot"].includes(harness)) {
+      throw new Error(`Unknown Native Harness ${harness} in harness settings.`);
+    }
+    if (typeof setting?.enabled !== "boolean") {
+      throw new Error(`Harness ${harness} settings require an explicit enabled flag.`);
+    }
+    if (setting.model !== undefined && !setting.model.trim()) {
+      throw new Error(`Harness ${harness} settings cannot carry an empty model.`);
+    }
   }
 }
 

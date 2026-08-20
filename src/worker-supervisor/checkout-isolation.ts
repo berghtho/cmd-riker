@@ -40,9 +40,7 @@ export class NativeEffectfulCheckoutInspector implements EffectfulCheckoutInspec
       throw new Error("The effectful Worker checkout is not a verified Git root.");
     }
     const status = await git(checkout, ["status", "--porcelain=v1", "-z"], timeoutMs);
-    if (status.length > 0) {
-      throw new Error("The effectful Worker checkout contains unaccepted changes.");
-    }
+    const dirty = status.length > 0;
     const baselineCommit = (await git(checkout, ["rev-parse", "HEAD"], timeoutMs)).trim();
     const branch = (await gitOptional(
       checkout,
@@ -55,6 +53,9 @@ export class NativeEffectfulCheckoutInspector implements EffectfulCheckoutInspec
     const currentIndex = worktrees.findIndex((path) => samePath(path, root));
     if (currentIndex < 0) throw new Error("The active checkout has no Git worktree identity.");
     if (currentIndex > 0) {
+      if (dirty) {
+        throw new Error("The effectful Worker checkout contains unaccepted changes.");
+      }
       return {
         root,
         baselineCommit,
@@ -67,25 +68,25 @@ export class NativeEffectfulCheckoutInspector implements EffectfulCheckoutInspec
       timeoutMs,
     )).trim();
     const defaultBranch = defaultBranchRef.replace(/^origin\//, "");
-    if (!defaultBranch) {
-      const executionRoot = join(
-        dirname(root),
-        `${basename(root)}.cmd-riker-${commitmentId.slice(0, 12)}-${randomUUID().slice(0, 8)}`,
-      );
-      return {
-        root: executionRoot,
-        baselineCommit,
-        isolation: { kind: "worktree" },
-        managedExecutionCheckout: {
-          kind: "managed-worktree",
-          targetProjectRoot: root,
-        },
-      };
+    if (!dirty && branch && defaultBranch && branch !== defaultBranch) {
+      return { root, baselineCommit, isolation: { kind: "branch", branch } };
     }
-    if (!branch || branch === defaultBranch) {
-      throw new Error("Effectful work requires an isolated non-default branch or secondary worktree.");
-    }
-    return { root, baselineCommit, isolation: { kind: "branch", branch } };
+    // A dirty, detached, default-branch, or default-branch-unprovable primary checkout
+    // gets a managed sibling Execution Checkout instead of a refusal; its result is
+    // reconciled back after the Worker settles.
+    const executionRoot = join(
+      dirname(root),
+      `${basename(root)}.cmd-riker-${commitmentId.slice(0, 12)}-${randomUUID().slice(0, 8)}`,
+    );
+    return {
+      root: executionRoot,
+      baselineCommit,
+      isolation: { kind: "worktree" },
+      managedExecutionCheckout: {
+        kind: "managed-worktree",
+        targetProjectRoot: root,
+      },
+    };
   }
 
   async advance(
@@ -141,23 +142,22 @@ export class NativeEffectfulCheckoutInspector implements EffectfulCheckoutInspec
           "The Target Project HEAD changed while its Execution Checkout was active.",
         );
       }
+      // Unrelated Owner changes may coexist in the Target Project; only the Worker's
+      // observed paths must reconcile exactly.
       const targetChanges = await this.observeChanges(
         unmanagedCheckout(checkout, targetRoot),
         timeoutMs,
       );
-      if (targetChanges.length > 0) {
-        if (!sameValues(targetChanges, observedChanges)) {
-          throw new MaterialExecutionCheckoutError(
-            "The Target Project contains concurrent unaccepted changes that do not match the Execution Checkout.",
-          );
-        }
+      const workerPaths = new Set(observedChanges);
+      const overlapping = targetChanges.filter((path) => workerPaths.has(path));
+      if (overlapping.length > 0) {
         const [sourcePatch, targetPatch] = await Promise.all([
           patchFor(checkout.root, checkout.baselineCommit, observedChanges, timeoutMs),
           patchFor(targetRoot, checkout.baselineCommit, observedChanges, timeoutMs),
         ]);
         if (sourcePatch !== targetPatch) {
           throw new MaterialExecutionCheckoutError(
-            "The Target Project contains concurrent changes instead of the exact Execution Checkout result.",
+            "The Target Project contains concurrent changes that conflict with the Execution Checkout result.",
           );
         }
         return;
@@ -178,7 +178,7 @@ export class NativeEffectfulCheckoutInspector implements EffectfulCheckoutInspec
         unmanagedCheckout(checkout, targetRoot),
         timeoutMs,
       );
-      if (!sameValues(reconciledChanges, observedChanges)) {
+      if (!observedChanges.every((path) => reconciledChanges.includes(path))) {
         throw new MaterialExecutionCheckoutError(
           "The reconciled Target Project change set does not match the Execution Checkout.",
         );
@@ -367,10 +367,6 @@ function pathTextEqual(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
-}
-
-function sameValues(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function unmanagedCheckout(checkout: IsolatedCheckout, root: string): IsolatedCheckout {

@@ -29,7 +29,8 @@ CMD Riker installs per Windows user from an Owner-supplied local build. It does 
 start at boot or logon, install a service, require `SYSTEM`, or depend on a machine-wide Node runtime
 after installation.
 
-Build immutable Lead Agent and Recovery Actor bundles with official Node `24.17.0`:
+Build immutable Lead Agent and Recovery Actor bundles with an official Node `24.16.0` or newer
+Node 24 runtime:
 
 ```powershell
 npm ci
@@ -43,8 +44,8 @@ npm run build:local-release -- `
   --output release\riker-0.1.0-local.1
 ```
 
-The builder refuses another Node version, hashes every final file, and emits strict separate
-manifests. The Lead Agent carries its runtime dependencies; the Recovery Actor bundle cannot contain
+The builder refuses an unsupported Node runtime, records the exact supplied version, hashes every
+final file, and emits strict separate manifests. The Lead Agent carries its runtime dependencies; the Recovery Actor bundle cannot contain
 Pi, Codex, or another non-built-in dependency.
 
 Prepare the secret-free configuration below, then install without starting the product:
@@ -60,15 +61,55 @@ $install = "$env:LOCALAPPDATA\CMD Riker"
   --config C:\path\to\config.json
 ```
 
-The registered Task Scheduler entry is per-user, on-demand, singleton, and has a bounded Recovery
-Actor restart policy. Launching again reconnects to the same Lead Agent. Closing the terminal only
-detaches; `stop` durably prevents new effects before supervision ends.
+### What the installation changes
+
+The installation is deliberately per-user and contained under `%LOCALAPPDATA%\CMD Riker`:
+
+- `launcher\riker.cmd` is the Owner-facing command. It opens Pi in the current terminal.
+- `launcher\supervise-hidden.vbs` starts the Recovery Actor without creating a console window.
+- `versions\` contains immutable Lead Agent releases, including their pinned Node runtime and Pi
+  dependencies.
+- `protected\recovery-actor\` contains the separately versioned Recovery Actor and its pinned Node
+  runtime.
+- `state\` contains the authoritative SQLite state.
+- `recovery\` contains activation journals, snapshots, and failed-candidate evidence.
+
+Installation also registers the per-user Windows Task Scheduler entry
+`\CMD Riker\Recovery Actor`. It has no boot or logon trigger and does not run until CMD Riker is
+started. It is an on-demand singleton with four one-minute restart attempts. Its GUI script-host
+wrapper remains invisible while the Recovery Actor supervises the Lead Agent. It is not a Windows
+service, does not run as `SYSTEM`, and does not require administrator privileges.
+
+The visible process chain is the current terminal, `riker.cmd`, and Pi. The background process chain
+is Windows Task Scheduler, `wscript.exe`, the Recovery Actor, and the hosted Lead Agent. The
+supervision layer does not hold provider credentials. Pi or a delegated native harness may access
+configured model providers and forges; their credentials remain in the provider-owned CLI or Pi
+credential store and are not copied into CMD Riker's SQLite state.
+
+To make the command available as `riker`, explicitly add its launcher directory to the current
+user's `PATH`, then open a new terminal:
 
 ```powershell
-& "$install\launcher\riker.cmd" start
-& "$install\launcher\riker.cmd" inspect
-& "$install\launcher\riker.cmd" stop
+$launcher = "$env:LOCALAPPDATA\CMD Riker\launcher"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath -split ";") -notcontains $launcher) {
+  [Environment]::SetEnvironmentVariable("Path", "$userPath;$launcher", "User")
+}
 ```
+
+Running `riker` opens Pi as the single visible Owner interface and reconnects it to the same
+supervised Lead Agent. `stop` durably prevents new effects before supervision ends.
+
+```powershell
+riker
+riker inspect
+riker stop
+```
+
+Inside the `riker` terminal, `/items` lists every work item with a plain status ("in progress",
+"needs you", "done", …); `/workers` and `/riker` show Worker Sessions and the Session View. The
+Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"
+— and the Lead persists the preference durably; nobody edits configuration files by hand.
 
 Upgrade from another trusted local Lead Agent bundle. Compatibility and independent Review evidence
 are explicit inputs:
@@ -86,9 +127,10 @@ identity before cutover. A failed or interrupted candidate restores the immediat
 baseline under a fresh generation; stale writers are fenced on every Authoritative State transaction.
 Successful activation does not automatically promote the Recovery Baseline.
 
-Uninstall reaches a safe stop, unregisters supervision, and removes binaries and launcher material.
-It preserves Authoritative State, journals, snapshots, failed-state evidence, and unresolved attempts.
-Destructive state removal is a separate Owner action.
+Uninstall reaches a safe stop, unregisters `\CMD Riker\Recovery Actor`, and removes binaries and
+launcher material. It preserves Authoritative State, journals, snapshots, failed-state evidence,
+and unresolved attempts. Destructive state removal and removing the launcher directory from the
+user `PATH` are separate explicit Owner actions.
 
 ```powershell
 & "$install\launcher\riker.cmd" uninstall
@@ -210,11 +252,17 @@ contains up to 32 checkout-relative file paths, each at most 16 MiB, whose SHA-2
 attributed to the operation result; use an empty array when the operation has no declared file
 artifact.
 
-With pinned Codex CLI `0.147.0` authenticated through ChatGPT, the Lead Agent can delegate an
-effectful assignment for an active Commitment that declares the `test` criterion. CMD Riker records
-the assignment's targets, effect classes, Authorized Write Root, Command Authority, time and cost
-bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. The
-checkout must be clean and use a non-default branch or secondary Git worktree. Immediately before
+With Codex CLI `0.147.0` or newer authenticated through ChatGPT, the Lead Agent can delegate an
+effectful assignment. When the Lead delegates without naming a Commitment, CMD Riker records the
+covering Commitment with its declared `test` criterion automatically. CMD Riker records the
+assignment's targets, effect classes, Authorized Write Root, Command Authority, time and cost
+bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. A
+clean secondary worktree or non-default branch executes in place; any other primary checkout —
+dirty, detached, on the default branch, or without a provable default branch — automatically gets a
+managed sibling Execution Checkout instead of a refusal. Work items run as many effectful Workers in
+parallel as the Owner orders — each in its own Execution Checkout; only two Workers on the same
+physical checkout exclude each other, and settlement (reconcile, dispose, Verification) serializes
+per Target Project. Immediately before
 `turn/start`, the production adapter requires Windows sandbox readiness and uses Codex `workspaceWrite`
 with no additional writable roots, no command network, no temporary-directory exception, and approval
 policy `never`. A real in-root/out-of-root probe runs under the same policy; failure to prove either
@@ -229,16 +277,26 @@ linked to the Worker effect; restart resumes a not-yet-dispatched Verification w
 Worker. Connection loss after dispatch leaves the effect unknown and reconciling; it is never
 automatically replayed.
 
-When a clean primary checkout lacks a provable default-branch identity, CMD Riker plans a detached,
-Commitment-attributed Execution Checkout beside it. The durable Worker authority and effect intent are
-recorded before `git worktree add`; the Worker receives only that worktree as its Authorized Write Root.
-After a settled Worker result, CMD Riker proves that the Owner-facing Target Project still matches the
-recorded baseline, reconciles the exact Git patch, disposes the worktree, and only then runs Verification.
-Each lifecycle step is read back before retry after restart. Conflicting Target Project changes or an
-ambiguous worktree identity stop automatic effects and surface one material Owner intervention while
-preserving both checkouts.
+For a managed Execution Checkout, the durable Worker authority and effect intent are recorded before
+`git worktree add`; the Worker receives only that detached, Commitment-attributed sibling worktree as
+its Authorized Write Root. After a settled Worker result, CMD Riker proves that the Target Project
+HEAD still matches the recorded baseline, reconciles the exact Git patch, disposes the worktree, and
+only then runs Verification. Unrelated uncommitted Owner changes in the Target Project are preserved
+and tolerated; only a change that touches the Worker's own paths differently stops automatic effects
+and surfaces one material Owner intervention while preserving both checkouts. Each lifecycle step is
+read back before retry after restart. Worker completion, failure, and required interventions are
+pushed to the Owner interface as they happen instead of waiting for the next Owner turn.
 
-## Workflow skills
+## Lead Agent tools and skills
+
+The Lead Agent holds its full native tool belt — read, bash, edit, write, grep, find, and ls —
+rooted in the Target Project under its own Command Authority. It acts directly when that serves the
+mission best; delegation to Worker Sessions is one option, never a prerequisite. The Owner's
+installed Pi skills and the Target Project's context files are part of the Lead's working context,
+and the Lead reads a skill's file itself when it uses one.
+
+The Pi Owner interface also loads the installed Pi skills normally. Invoking `/skill:<name>` in the
+`riker` terminal inlines that skill's content into the Owner turn.
 
 CMD Riker ships its generic `design-council` skill and locks the complete
 [`mattpocock/skills`](https://github.com/mattpocock/skills) package through APM. Materialize the

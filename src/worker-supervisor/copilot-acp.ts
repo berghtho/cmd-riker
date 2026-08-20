@@ -16,7 +16,24 @@ import {
   terminateRecordedProcess,
 } from "./codex-app-server.ts";
 
-const supportedVersion = "GitHub Copilot CLI 1.0.80.";
+// Oldest Copilot CLI release whose ACP protocol passed the accepted probe.
+const minimumCopilotVersion = [1, 0, 80] as const;
+
+function assertSupportedCopilotVersion(version: string): void {
+  const match = /^GitHub Copilot CLI (\d+)\.(\d+)\.(\d+)\.?$/.exec(version.trim());
+  const observed = match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+  const supported = observed && (
+    observed[0]! > minimumCopilotVersion[0] ||
+    (observed[0] === minimumCopilotVersion[0] &&
+      (observed[1]! > minimumCopilotVersion[1] ||
+        (observed[1] === minimumCopilotVersion[1] && observed[2]! >= minimumCopilotVersion[2])))
+  );
+  if (!supported) {
+    throw new Error(
+      `Unsupported Copilot version ${version}; expected GitHub Copilot CLI ${minimumCopilotVersion.join(".")} or newer.`,
+    );
+  }
+}
 const acpVersion = 1;
 const protocolSchemaSha256 = createHash("sha256")
   .update("copilot-acp:initialize,session/new,session/prompt,session/update@1.0.80/acp1")
@@ -31,9 +48,7 @@ export type CopilotRuntime = {
 };
 
 export function createCopilotWorkerHarness(runtime: CopilotRuntime): NativeWorkerHarness {
-  if (runtime.version !== supportedVersion) {
-    throw new Error(`Unsupported Copilot version ${runtime.version}; expected ${supportedVersion}.`);
-  }
+  assertSupportedCopilotVersion(runtime.version);
   return new CopilotAcpHarness(runtime);
 }
 
@@ -48,9 +63,7 @@ export async function resolveCopilotRuntime(): Promise<CopilotRuntime> {
   if (!executable) throw new Error("copilot.exe was not found.");
   const versionOutput = await execMerged(resolve(executable), ["--version"]);
   const version = versionOutput.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
-  if (version !== supportedVersion) {
-    throw new Error(`Unsupported Copilot version ${version}; expected ${supportedVersion}.`);
-  }
+  assertSupportedCopilotVersion(version);
   const help = await execMerged(resolve(executable), ["--help"]);
   if (!/(^|\s)--acp(?:\s|$)/m.test(help)) throw new Error("Copilot ACP support is unavailable.");
   return { executable: resolve(executable), args: [], version };

@@ -10,7 +10,17 @@ import {
   type AssistantMessage,
   type Model,
 } from "@earendil-works/pi-ai";
-import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+  createCodingTools,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  formatSkillsForPrompt,
+  getAgentDir,
+  loadProjectContextFiles,
+  loadSkills,
+  type ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import type {
@@ -18,7 +28,6 @@ import type {
   CommitmentDraft,
   ConversationMessage,
   ActingAuthority,
-  ActingAuthorityEffectRequest,
   ActingAuthorityEvent,
   ActingAuthorityHandoff,
   StandingOrder,
@@ -65,13 +74,11 @@ export type PiTurnRequest = {
     executeOperation(
       commitmentId: string,
       operation: "test",
-      actingAuthorityEffect?: ActingAuthorityEffectRequest,
     ): Promise<TargetProjectOperationResult>;
   };
   forgeActions?: {
     commentOnGitHubIssue?(
       input: { commitmentId: string; issueNumber: number; body: string },
-      actingAuthorityEffect: ActingAuthorityEffectRequest,
     ): Promise<ForgeOperationResult>;
     inspectAzureSubscription?(commitmentId: string): Promise<ForgeOperationResult>;
   };
@@ -96,8 +103,25 @@ export type PiTurnRequest = {
       actingAuthorityId: string,
     ): ActingAuthorityHandoff;
   };
+  /** Grants the Lead its full native tool belt (read, bash, edit, write, grep,
+   * find, ls) rooted in the Target Project, plus installed skills and project
+   * context files in its system prompt. */
+  nativeTools?: {
+    cwd: string;
+  };
+  harnessActions?: {
+    configure(input: {
+      harness: "codex" | "claude" | "copilot";
+      enabled?: boolean;
+      model?: string;
+    }): { harness: string; enabled: boolean; model?: string };
+  };
   workers?: readonly WorkerSession[];
   workerQuestions?: readonly WorkerQuestion[];
+  workerUnavailability?: {
+    nativeHarness: "codex" | "claude" | "copilot";
+    detail: string;
+  };
   workerActions?: {
     capabilities?: {
       nativeHarness: "codex" | "claude" | "copilot";
@@ -115,9 +139,8 @@ export type PiTurnRequest = {
     delegateEffectful?(input: {
       objective: string;
       prompt: string;
-      commitmentId: string;
+      commitmentId?: string;
       targets: string[];
-      actingAuthorityEffect?: ActingAuthorityEffectRequest;
       recoveryOfWorkerSessionId?: string;
       recoveryReason?: string;
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
@@ -326,7 +349,12 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
         ...forgeTools(request, mutationObserver),
         ...authorityTools(request, mutationObserver),
         ...workerTools(request, mutationObserver),
+        ...harnessTools(request, mutationObserver),
+        ...(request.nativeTools ? leadNativeTools(request.nativeTools.cwd) : []),
       ];
+      const nativeContext = request.nativeTools
+        ? loadNativeContext(request.nativeTools.cwd)
+        : { skillsPrompt: "", contextFilesPrompt: "" };
       const commitmentContext = (request.commitments ?? [])
         .map(
           (commitment) =>
@@ -380,23 +408,53 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "explicitly accepts the named waiting Commitment. Use resume_commitment only for a blocked or paused " +
           "Commitment the Owner asks to continue. Use control_commitment only for the Owner's explicit pause, " +
           "cancel, or supersede instruction." +
+          " Act on the Owner's intent immediately: a plain imperative like 'start', 'fix it', or 'go ahead' is " +
+          "sufficient authority to begin the obvious next unit of work. Fill routine parameters (Commitments, " +
+          "targets, criteria) from the conversation and durable state yourself. Never ask the Owner for internal " +
+          "IDs, effect classes, authorization structures, or restatements of what they already said; if exactly " +
+          "one material decision is genuinely missing, propose a concrete default and ask one short question." +
+          " When the Owner asks how things stand, answer in their language and in plain terms: name each " +
+          "work item by what it is, say what is happening right now, and say what (if anything) you need from " +
+          "them. Keep internal IDs and state-machine vocabulary out of the answer unless the Owner asks for them." +
+          (request.harnessActions
+            ? " The Owner configures Worker harnesses conversationally: when they ask to enable, disable, or " +
+              "change the model of a harness, call configure_worker_harness yourself — never send them to a " +
+              "configuration file."
+            : "") +
+          (request.nativeTools
+            ? " You hold your full native tool belt (read, bash, edit, write, grep, find, ls) rooted in the " +
+              "Target Project under your own Command Authority. Act directly whenever that serves the mission " +
+              "best; delegating to a Worker Session is one option, never a prerequisite. Record a Commitment " +
+              "for outcome-oriented work you accept, and use run_target_project_operation when durable " +
+              "Verification evidence is wanted."
+            : "") +
           " For a Target Project test outcome, record one Commitment with a target-project-operation " +
-           "criterion and then call run_target_project_operation. Never construct Task CLI commands." +
+           "criterion and then call run_target_project_operation for durable Verification evidence." +
            (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.inspectAzureSubscription
              ? " For a GitHub comment or Azure inspection, record one Commitment with the matching forge-operation criterion before calling its typed tool. " +
                "Use typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
-               "A GitHub public comment additionally requires an exact active Standing Order authorization. " +
+               "CMD Riker resolves applicable Standing Order authorization internally; a public GitHub comment still requires one to exist. " +
                "Treat an unavailable result as one Owner action and do not retry blindly."
              : "") +
            (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
            (request.authorityActions
              ? "\nStanding Orders are created or revoked only from explicit Owner instructions. Silence never begins Acting Authority. " +
+               "When the Owner grants standing authority in plain language, summarize the bounds you understood " +
+               "(effects, targets, spend, expiration) in your response and record the Standing Order from their words; " +
+               "quote the Owner's own sentence, and ask one short confirmation question only when a bound is genuinely undecidable. " +
                "During Acting Authority, record material decisions, effects, exceptions, risks, and uncertainty. " +
                "When the Owner returns, prepare the durable handoff before returning command."
              : "") +
            (standingOrderContext ? `\nStanding Orders:\n${standingOrderContext}` : "") +
            `\nActing Authority: ${actingAuthorityContext}` +
+           nativeContext.skillsPrompt +
+           nativeContext.contextFilesPrompt +
            (request.workerActions ? workerCapabilityPrompt(request.workerActions) : "") +
+           (!request.workerActions && request.workerUnavailability
+             ? `\nNo ${nativeHarnessName(request.workerUnavailability.nativeHarness)} Worker capability is ` +
+               `available right now: ${request.workerUnavailability.detail} ` +
+               "Tell the Owner plainly what is unavailable and what would restore it; never pretend delegation happened."
+             : "") +
            (workerContext ? `\nCurrent Worker Sessions:\n${workerContext}` : "") +
            (questionContext ? `\nOpen Worker questions:\n${questionContext}` : ""),
         model: execution.model,
@@ -569,19 +627,16 @@ function forgeTools(
         commitmentId: Type.String({ minLength: 1 }),
         issueNumber: Type.Integer({ minimum: 1 }),
         body: Type.String({ minLength: 1, maxLength: 65_536 }),
-        actingAuthorityEffect: actingAuthorityEffectRequestSchema,
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, issueNumber, body, actingAuthorityEffect } = params as {
+        const { commitmentId, issueNumber, body } = params as {
           commitmentId: string;
           issueNumber: number;
           body: string;
-          actingAuthorityEffect: ActingAuthorityEffectRequest;
         };
         const result = await actions.commentOnGitHubIssue!(
           { commitmentId, issueNumber, body },
-          actingAuthorityEffect,
         );
         observer.onMutation();
         return {
@@ -695,20 +750,14 @@ function commitmentTools(
       parameters: Type.Object({
         commitmentId: Type.String({ minLength: 1 }),
         operation: Type.Literal("test"),
-        actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, operation, actingAuthorityEffect } = params as {
+        const { commitmentId, operation } = params as {
           commitmentId: string;
           operation: "test";
-          actingAuthorityEffect?: ActingAuthorityEffectRequest;
         };
-        const result = await actions.executeOperation(
-          commitmentId,
-          operation,
-          actingAuthorityEffect,
-        );
+        const result = await actions.executeOperation(commitmentId, operation);
         observer.onMutation();
         return {
           content: [
@@ -850,16 +899,6 @@ const standingOrderEffectClassSchema = Type.Union([
   Type.Literal("self-repair"),
 ]);
 
-const actingAuthorityEffectRequestSchema = Type.Object({
-  actingAuthorityId: Type.String({ minLength: 1 }),
-  commitmentId: Type.String({ minLength: 1 }),
-  effectClass: standingOrderEffectClassSchema,
-  target: Type.String({ minLength: 1 }),
-  reversible: Type.Boolean(),
-  externallyBinding: Type.Boolean(),
-  incrementalSpendUsd: Type.Number({ minimum: 0 }),
-});
-
 function authorityTools(
   request: PiTurnRequest,
   observer: { onMutation(): void },
@@ -882,7 +921,7 @@ function authorityTools(
         allowExternallyBindingEffects: Type.Boolean(),
         maximumIncrementalSpendUsd: Type.Number({ minimum: 0 }),
         validUntil: Type.String({ minLength: 1 }),
-        ownerInstructionQuote: Type.String({ minLength: 8 }),
+        ownerInstructionQuote: Type.String({ minLength: 2 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -921,7 +960,7 @@ function authorityTools(
       parameters: Type.Object({
         commitmentIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
         standingOrderIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-        ownerInstructionQuote: Type.String({ minLength: 8 }),
+        ownerInstructionQuote: Type.String({ minLength: 2 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
@@ -1003,6 +1042,50 @@ function authorityTools(
   ];
 }
 
+function harnessTools(
+  request: PiTurnRequest,
+  observer: { onMutation(): void },
+): AgentTool[] {
+  const actions = request.harnessActions;
+  if (!actions) return [];
+  return [
+    {
+      name: "configure_worker_harness",
+      label: "Configure Worker Harness",
+      description:
+        "Persist the Owner's Native Harness preference: enable or disable a harness, or set its Worker model. " +
+        "Model changes apply from the next delegation; activating a different harness applies after the next start.",
+      parameters: Type.Object({
+        harness: Type.Union([
+          Type.Literal("codex"),
+          Type.Literal("claude"),
+          Type.Literal("copilot"),
+        ]),
+        enabled: Type.Optional(Type.Boolean()),
+        model: Type.Optional(Type.String({ minLength: 1 })),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const setting = actions.configure(params as {
+          harness: "codex" | "claude" | "copilot";
+          enabled?: boolean;
+          model?: string;
+        });
+        observer.onMutation();
+        return {
+          content: [{
+            type: "text",
+            text:
+              `Harness ${setting.harness} is now ${setting.enabled ? "enabled" : "disabled"}` +
+              (setting.model ? ` with Worker model ${setting.model}.` : "."),
+          }],
+          details: setting,
+        };
+      },
+    },
+  ];
+}
+
 function workerTools(
   request: PiTurnRequest,
   observer: { onMutation(): void },
@@ -1055,13 +1138,12 @@ function workerTools(
       name: `delegate_effectful_${capabilities.nativeHarness}`,
       label: `Delegate Effectful ${nativeName} Worker`,
       description:
-        `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. Requires an active Commitment with declared test Verification.`,
+        `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. When commitmentId is omitted, CMD Riker records the covering Commitment with its test Verification automatically.`,
       parameters: Type.Object({
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
-        commitmentId: Type.String({ minLength: 1 }),
+        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
         targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
-        actingAuthorityEffect: Type.Optional(actingAuthorityEffectRequestSchema),
         recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
         recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
       }),
@@ -1071,9 +1153,8 @@ function workerTools(
           params as {
             objective: string;
             prompt: string;
-            commitmentId: string;
+            commitmentId?: string;
             targets: string[];
-            actingAuthorityEffect?: ActingAuthorityEffectRequest;
             recoveryOfWorkerSessionId?: string;
             recoveryReason?: string;
           },
@@ -1271,7 +1352,7 @@ function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerAction
   return (
     `\nA proven ${nativeName} Worker capability is available for bounded read-only work.` +
     (capabilities.effectful
-      ? " Effectful work is confined to the active Target Project checkout; first record one Commitment with a target-project-operation test criterion, then delegate with checkout-relative targets. CMD Riker runs typed Verification after the Worker finishes."
+      ? " Effectful work is confined to the active Target Project checkout; delegate with checkout-relative targets. When you omit commitmentId, CMD Riker records the covering Commitment and its test Verification automatically, and it resolves any applicable durable authority internally — never ask the Owner for IDs, effect classes, or authorization details. CMD Riker runs typed Verification after the Worker finishes."
       : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
     (capabilities.nativeQuestions
       ? " Native questions are available; reserve only authority or product-judgment questions for Owner attention."
@@ -1282,6 +1363,54 @@ function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerAction
       : "") +
     " Never claim resume, deletion, child control, rollback, or effect continuity when the recorded capability facts do not prove it."
   );
+}
+
+function leadNativeTools(cwd: string): AgentTool[] {
+  return [
+    ...createCodingTools(cwd),
+    createGrepTool(cwd),
+    createFindTool(cwd),
+    createLsTool(cwd),
+  ];
+}
+
+const maximumContextFilePromptChars = 24_000;
+
+function loadNativeContext(cwd: string): {
+  skillsPrompt: string;
+  contextFilesPrompt: string;
+} {
+  let skillsPrompt = "";
+  try {
+    const skills = loadSkills({
+      cwd,
+      agentDir: getAgentDir(),
+      skillPaths: [],
+      includeDefaults: true,
+    }).skills;
+    if (skills.length > 0) {
+      skillsPrompt =
+        "\nInstalled skills are available; read a skill's file with your read tool when you use it.\n" +
+        formatSkillsForPrompt(skills);
+    }
+  } catch {
+    // Skills stay optional; a discovery failure never blocks the Lead turn.
+  }
+  let contextFilesPrompt = "";
+  try {
+    let remaining = maximumContextFilePromptChars;
+    const sections: string[] = [];
+    for (const file of loadProjectContextFiles({ cwd, agentDir: getAgentDir() })) {
+      if (remaining <= 0) break;
+      const content = file.content.slice(0, remaining);
+      remaining -= content.length;
+      sections.push(`\nContext file ${file.path}:\n${content}`);
+    }
+    contextFilesPrompt = sections.join("");
+  } catch {
+    // Context files stay optional; a discovery failure never blocks the Lead turn.
+  }
+  return { skillsPrompt, contextFilesPrompt };
 }
 
 function toPiModel(
@@ -1296,8 +1425,8 @@ function toPiModel(
     reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 32_768,
-    maxTokens: 4_096,
+    contextWindow: 131_072,
+    maxTokens: 16_384,
   };
 }
 

@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { dirname, resolve } from "node:path";
@@ -21,7 +21,10 @@ import {
 import { verifyLocalReleaseCandidate } from "./local-release/index.ts";
 import { openRecoveryActor } from "./recovery-actor/index.ts";
 import { requiredActivationHealthCriteria } from "./recovery-actor/index.ts";
-import { createWindowsSupervision } from "./windows-supervision/index.ts";
+import {
+  createWindowsSupervision,
+  hiddenScriptHostCommand,
+} from "./windows-supervision/index.ts";
 
 const command = process.argv[2];
 
@@ -43,9 +46,20 @@ try {
   }
 } catch (error) {
   process.stderr.write(
-    `CMD_RIKER_LIFECYCLE_FAILURE: ${error instanceof Error ? error.message : String(error)}\n`,
+    `CMD_RIKER_LIFECYCLE_FAILURE: ${errorChain(error)}\n`,
   );
   process.exitCode = 2;
+}
+
+function errorChain(error: unknown): string {
+  const messages: string[] = [];
+  let current: unknown = error;
+  while (current instanceof Error) {
+    if (!messages.includes(current.message)) messages.push(current.message);
+    current = current.cause;
+  }
+  if (current !== undefined && current !== null) messages.push(String(current));
+  return messages.join(" Caused by: ");
 }
 
 async function productionInstallation(
@@ -55,14 +69,22 @@ async function productionInstallation(
   const actorCommand = actorBundle
     ? await commandFromCandidate(installRoot, actorBundle)
     : await commandFromLauncher(installRoot);
+  const paths = localInstallationPaths(installRoot);
+  const hiddenSupervisorScript = join(paths.launcher, "supervise-hidden.vbs");
+  const hiddenSupervisor = hiddenScriptHostCommand({
+    scriptPath: hiddenSupervisorScript,
+    executable: actorCommand.runtimePath,
+    arguments: [actorCommand.entrypointPath, "supervise", "--install-root", installRoot],
+  });
+  await mkdir(paths.launcher, { recursive: true });
+  await writeFile(hiddenSupervisorScript, hiddenSupervisor.script, "utf8");
   const supervision = createWindowsSupervision({
     taskName: "\\CMD Riker\\Recovery Actor",
     currentUserId: currentUserId(),
-    executable: actorCommand.runtimePath,
-    arguments: `${quoteArgument(actorCommand.entrypointPath)} supervise --install-root ${quoteArgument(installRoot)}`,
+    executable: hiddenSupervisor.executable,
+    arguments: hiddenSupervisor.arguments,
     policy: { restartCount: 4, restartIntervalMinutes: 1 },
   });
-  const paths = localInstallationPaths(installRoot);
   return createLocalInstallation({
     installationRoot: installRoot,
     supervision,

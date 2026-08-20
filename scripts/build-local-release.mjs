@@ -25,7 +25,7 @@ import {
 import { promisify } from "node:util";
 
 const executeFile = promisify(execFile);
-const supportedNodeVersion = "24.17.0";
+const minimumNodeVersion = [24, 16, 0];
 const revisionPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const invalidWindowsName = /[\u0000-\u001f<>:"|?*]/;
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
@@ -155,9 +155,11 @@ function usageError() {
 
 async function inspectRuntime(nodePath) {
   const versionOutput = await runRuntimeProbe(nodePath, ["--version"], "version");
-  if (versionOutput !== `v${supportedNodeVersion}`) {
+  const observedVersion = parseSupportedNodeVersion(versionOutput);
+  if (!observedVersion) {
     throw new Error(
-      `Supplied Node runtime version must be exactly v${supportedNodeVersion}; received ${JSON.stringify(versionOutput)}.`,
+      `Supplied Node runtime version must be v${minimumNodeVersion.join(".")} or a newer ` +
+        `Node ${minimumNodeVersion[0]} release; received ${JSON.stringify(versionOutput)}.`,
     );
   }
   const architecture = await runRuntimeProbe(nodePath, ["-p", "process.arch"], "architecture");
@@ -166,7 +168,19 @@ async function inspectRuntime(nodePath) {
       `Supplied Node runtime architecture must be exactly x64 or arm64; received ${JSON.stringify(architecture)}.`,
     );
   }
-  return { version: supportedNodeVersion, architecture, path: "runtime/node.exe" };
+  return { version: observedVersion, architecture, path: "runtime/node.exe" };
+}
+
+// The exact supplied runtime is hashed into the manifest; the version gate only
+// bounds it to the supported Node major at or above the proven floor.
+function parseSupportedNodeVersion(versionOutput) {
+  const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(versionOutput.trim());
+  if (!match) return undefined;
+  const observed = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const supported = observed[0] === minimumNodeVersion[0] &&
+    (observed[1] > minimumNodeVersion[1] ||
+      (observed[1] === minimumNodeVersion[1] && observed[2] >= minimumNodeVersion[2]));
+  return supported ? observed.join(".") : undefined;
 }
 
 async function runRuntimeProbe(nodePath, argumentsList, description) {

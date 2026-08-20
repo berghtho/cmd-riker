@@ -10,7 +10,6 @@ import {
 import {
   createOrchestrationCore,
   defaultLeadModelRequirements,
-  type ActingAuthorityEffectRequest,
 } from "../orchestration-core/index.ts";
 import {
   createTargetProjectOperations,
@@ -87,6 +86,29 @@ async function completeOwnerTurn(input: {
       .readCommitments()
       .map((commitment) => [commitment.id, commitmentFingerprint(commitment)]),
   );
+  // Durable Acting Authority paperwork is resolved here, never composed by the
+  // model or requested from the Owner.
+  const actingAuthorityGrant = (
+    commitmentId: string,
+    effect: { effectClass: "test" | "update"; target: string; externallyBinding: boolean },
+  ) => {
+    const actingAuthority = orchestration.actingAuthorityView();
+    if (
+      actingAuthority?.state !== "active" ||
+      !actingAuthority.commitmentIds.includes(commitmentId)
+    ) {
+      return undefined;
+    }
+    return orchestration.authorizeActingAuthorityEffect({
+      actingAuthorityId: actingAuthority.id,
+      commitmentId,
+      effectClass: effect.effectClass,
+      target: effect.target,
+      reversible: true,
+      externallyBinding: effect.externallyBinding,
+      incrementalSpendUsd: 0,
+    });
+  };
   const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
   for (const [index, modelSelection] of candidates.entries()) {
     const validation = await input.adapter.validateSelection(
@@ -102,11 +124,25 @@ async function completeOwnerTurn(input: {
     });
     try {
       const workerCapabilities = input.workerSupervisor?.capabilities();
+      const harnessSettings = conversation.workerHarnessSettings ?? {};
+      const activeHarness = workerCapabilities?.nativeHarness;
+      const activeSetting = activeHarness ? harnessSettings[activeHarness] : undefined;
+      const workerModel = activeHarness
+        ? activeSetting?.model ??
+          (conversation.workerModelPolicy?.selection.nativeHarness === activeHarness
+            ? conversation.workerModelPolicy.selection.model
+            : undefined)
+        : undefined;
+      const workerDisabled = activeSetting?.enabled === false;
+      const workerAvailable = Boolean(input.workerSupervisor && !workerDisabled && workerModel);
+      const workerModelPolicyRevision =
+        conversation.workerModelPolicy?.revision ?? "worker-harness-settings";
       const response = await input.adapter.completeTurn({
         conversation: conversation.messages,
         ownerInput: input.ownerInput,
         modelSelection,
         commitments: input.state.readCommitments(),
+        nativeTools: { cwd: conversation.targetProject.path },
         standingOrders: orchestration.standingOrdersView(),
         ...(orchestration.actingAuthorityView()
           ? { actingAuthority: orchestration.actingAuthorityView()! }
@@ -124,7 +160,26 @@ async function completeOwnerTurn(input: {
         },
         workers: orchestration.workerSessionsView(),
         workerQuestions: orchestration.workerQuestionsView(),
-        ...(input.workerSupervisor
+        harnessActions: {
+          configure: (configuration) =>
+            orchestration.configureWorkerHarness(turnId, configuration),
+        },
+        ...(!workerAvailable && (activeHarness || conversation.workerModelPolicy)
+          ? {
+              workerUnavailability: {
+                nativeHarness: activeHarness ??
+                  conversation.workerModelPolicy!.selection.nativeHarness,
+                detail: workerDisabled
+                  ? "The Owner disabled this harness; enable it again to delegate."
+                  : input.workerSupervisor && !workerModel
+                    ? "No Worker model is configured for the active harness; the Owner can set one conversationally."
+                    : input.state.readCapabilityNotice("codex-worker")?.state === "active"
+                      ? input.state.readCapabilityNotice("codex-worker")!.detail
+                      : "The Worker capability could not be proven at start.",
+              },
+            }
+          : {}),
+        ...(workerAvailable
           ? {
               workerActions: {
                 capabilities: {
@@ -143,8 +198,8 @@ async function completeOwnerTurn(input: {
                   input.workerSupervisor!.delegate({
                     ...assignment,
                     targetProjectPath: conversation.targetProject.path,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                    model: workerModel!,
+                    modelPolicyRevision: workerModelPolicyRevision,
                   }),
                 delegateReview: (assignment: {
                   implementationWorkerSessionId: string;
@@ -152,8 +207,8 @@ async function completeOwnerTurn(input: {
                 }) =>
                   input.workerSupervisor!.delegateReview({
                     ...assignment,
-                    model: conversation.workerModelPolicy!.selection.model,
-                    modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                    model: workerModel!,
+                    modelPolicyRevision: workerModelPolicyRevision,
                   }),
                 adjudicateReview: (adjudication) =>
                   orchestration.adjudicateReview(adjudication.commitmentId, adjudication.decisions),
@@ -165,30 +220,33 @@ async function completeOwnerTurn(input: {
                       delegateEffectful: (assignment: {
                         objective: string;
                         prompt: string;
-                        commitmentId: string;
+                        commitmentId?: string;
                         targets: string[];
-                        actingAuthorityEffect?: ActingAuthorityEffectRequest;
                         recoveryOfWorkerSessionId?: string;
                         recoveryReason?: string;
                       }) => {
-                        const { actingAuthorityEffect, ...boundedAssignment } = assignment;
-                        const authorization = actingAuthorityEffect
-                          ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
-                          : undefined;
+                        const commitmentId = assignment.commitmentId ??
+                          orchestration.recordCommitment(turnId, {
+                            outcome: assignment.objective,
+                            criteria: [{
+                              kind: "target-project-operation",
+                              operation: "test",
+                              description:
+                                "The declared Target Project test operation verifies the delegated change.",
+                            }],
+                          }).id;
                         return input.workerSupervisor!.delegateEffectful({
-                          ...boundedAssignment,
+                          ...assignment,
+                          commitmentId,
                           targetProjectPath: conversation.targetProject.path,
-                          model: conversation.workerModelPolicy!.selection.model,
-                          modelPolicyRevision: conversation.workerModelPolicy!.revision,
+                          model: workerModel!,
+                          modelPolicyRevision: workerModelPolicyRevision,
                           timeoutMs: 20 * 60_000,
                           verification: {
                             operation: "test" as const,
                             workingDirectory: conversation.targetProject.path,
                             timeoutMs: 120_000,
                           },
-                          ...(authorization
-                            ? { actingAuthorityEffectAuthorizationId: authorization.id }
-                            : {}),
                         });
                       },
                       answer: (questionId: string, answers: Record<string, string[]>) =>
@@ -226,10 +284,12 @@ async function completeOwnerTurn(input: {
               );
             }
           },
-          executeOperation: async (commitmentId, operation, actingAuthorityEffect) => {
-            const authorization = actingAuthorityEffect
-              ? orchestration.authorizeActingAuthorityEffect(actingAuthorityEffect)
-              : undefined;
+          executeOperation: async (commitmentId, operation) => {
+            const authorization = actingAuthorityGrant(commitmentId, {
+              effectClass: "test",
+              target: operation,
+              externallyBinding: false,
+            });
             const result = await input.targetProjectOperations.execute({
               commitmentId,
               operation: { kind: operation, inputs: {} },
@@ -253,11 +313,13 @@ async function completeOwnerTurn(input: {
         forgeActions: {
           ...(conversation.forgeAuthorities?.github
             ? {
-                commentOnGitHubIssue: async (operationInput, actingAuthorityEffect) => {
+                commentOnGitHubIssue: async (operationInput) => {
                   const authority = conversation.forgeAuthorities!.github!;
-                  const authorization = orchestration.authorizeActingAuthorityEffect(
-                    actingAuthorityEffect,
-                  );
+                  const authorization = actingAuthorityGrant(operationInput.commitmentId, {
+                    effectClass: "update",
+                    target: `${authority.repository}#${operationInput.issueNumber}`,
+                    externallyBinding: true,
+                  });
                   const result = await input.forgeOperations.execute({
                     commitmentId: operationInput.commitmentId,
                     operation: {
@@ -268,11 +330,15 @@ async function completeOwnerTurn(input: {
                       expectedAccount: authority.account,
                     },
                     timeoutMs: 30_000,
-                    actingAuthorityEffectAuthorization: {
-                      actingAuthorityId: authorization.actingAuthorityId,
-                      authorizationId: authorization.id,
-                      standingOrderId: authorization.standingOrderId,
-                    },
+                    ...(authorization
+                      ? {
+                          actingAuthorityEffectAuthorization: {
+                            actingAuthorityId: authorization.actingAuthorityId,
+                            authorizationId: authorization.id,
+                            standingOrderId: authorization.standingOrderId,
+                          },
+                        }
+                      : {}),
                   });
                   orchestration.observeForgeOperationResult(operationInput.commitmentId, result);
                   return result;

@@ -20,7 +20,7 @@ export type ForgeOperationRequest =
         expectedAccount: string;
       };
       timeoutMs: number;
-      actingAuthorityEffectAuthorization: {
+      actingAuthorityEffectAuthorization?: {
         actingAuthorityId: string;
         authorizationId: string;
         standingOrderId: string;
@@ -527,7 +527,9 @@ async function executeGitHubMutation(
         resource: `${request.operation.repository}#${request.operation.issueNumber}`,
       },
       validatedAt: startedAt,
-      actingAuthority: request.actingAuthorityEffectAuthorization,
+      ...(request.actingAuthorityEffectAuthorization
+        ? { actingAuthority: request.actingAuthorityEffectAuthorization }
+        : {}),
     },
     retryRule: "Read back the exact remote comment identity before any retry.",
     status: "pending",

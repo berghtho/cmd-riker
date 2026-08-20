@@ -1,14 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import {
-  Input,
-  Key,
-  matchesKey,
-  ProcessTerminal,
-  Text,
-  TuiMainScreen,
-} from "@earendil-works/pi-tui";
 
 import {
   completeAuthoritativeStateRecovery,
@@ -55,11 +47,13 @@ import {
   createLeadAgentRuntime,
   LeadAgentRuntimeDiagnostic,
 } from "./lead-agent-runtime/index.ts";
+import { runPiOwnerInterface } from "./pi-owner-interface.ts";
 import {
   parseSessionViewControl,
   parseSessionViewInspection,
   parseSessionViewWorkerInspection,
   projectSessionView,
+  renderSessionItems,
   renderSessionView,
   renderSessionWorkers,
   type SessionViewSnapshot,
@@ -218,7 +212,11 @@ async function main(): Promise<void> {
     if (!policyValidated && !activationProvisional) {
       await validatePolicy(adapter, conversation);
     }
-    const workerSupervisor = await availableWorkerSupervisor(state, conversation);
+    const ownerNotices: OwnerNoticeSink = {
+      deliver: (content) =>
+        process.stdout.write(`CMD_RIKER_WORKER_NOTICE: ${singleLine(content)}\n`),
+    };
+    const workerSupervisor = await availableWorkerSupervisor(state, conversation, ownerNotices);
     if (workerSupervisor) await workerSupervisor.recover();
     emitActivationReady();
 
@@ -228,6 +226,7 @@ async function main(): Promise<void> {
         adapter,
         conversation.targetProject.path,
         workerSupervisor,
+        ownerNotices,
       );
     } else {
       await runScriptableConversation(
@@ -280,82 +279,31 @@ function runInteractiveConversation(
   adapter: PiTurnAdapter,
   targetProjectPath: string,
   workerSupervisor: WorkerSupervisor | undefined,
+  ownerNotices: OwnerNoticeSink,
 ): Promise<void> {
-  const terminal = new ProcessTerminal();
-  const tui = new TuiMainScreen(terminal);
   const conversation = state.readOwnerConversation();
-  const transcriptLines = (conversation?.messages ?? []).map((message) =>
-    `${message.role === "owner" ? "Owner" : "Lead Agent"}: ${message.content}`,
-  );
-  transcriptLines.push(...state.readCommitments().map(commitmentNotice));
-  const transcript = new Text(transcriptLines.join("\n\n"));
-  const sessionView = new Text(currentSessionView(state, workerSupervisor));
-  const input = new Input();
-  let busy = false;
-  let stopRequested = false;
+  const transcript = (conversation?.messages ?? []).map((message) => ({
+    source: message.role,
+    content: message.content,
+  }));
+  transcript.push(...state.readCommitments().map((commitment) => ({
+    source: "lead-agent" as const,
+    content: commitmentNotice(commitment),
+  })));
 
-  tui.addChild(new Text(`CMD Riker | Target Project: ${targetProjectPath}`));
-  tui.addChild(transcript);
-  tui.addChild(sessionView);
-  tui.addChild(new Text("Owner:"));
-  tui.addChild(input);
-  tui.setFocus(input);
-
-  return new Promise((resolve, reject) => {
-    let renderedSessionView = currentSessionView(state, workerSupervisor);
-    const refreshSessionView = () => {
-      const next = currentSessionView(
-        state,
-        workerSupervisor,
-        busy ? "responding" : "available",
-      );
-      if (next === renderedSessionView) return;
-      renderedSessionView = next;
-      sessionView.setText(next);
-      tui.requestRender();
-    };
-    const refreshTimer = setInterval(refreshSessionView, 250);
-    const stop = () => {
-      if (busy) {
-        stopRequested = true;
-        return;
-      }
-      clearInterval(refreshTimer);
-      tui.stop();
-      resolve();
-    };
-    tui.addInputListener((data) => {
-      if (matchesKey(data, Key.ctrl("c"))) {
-        stop();
-        return { consume: true };
-      }
-      return undefined;
-    });
-    input.onSubmit = (ownerInput) => {
-      if (busy || !ownerInput.trim()) return;
-      busy = true;
-      input.setValue("");
-      transcriptLines.push(`Owner: ${ownerInput}`, "Lead Agent: thinking...");
-      transcript.setText(transcriptLines.join("\n\n"));
-      refreshSessionView();
-      tui.requestRender();
-      void completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor)
-        .then((output) => {
-          transcriptLines[transcriptLines.length - 1] = `${output.source}: ${output.content}`;
-          transcript.setText(transcriptLines.join("\n\n"));
-          busy = false;
-          refreshSessionView();
-          if (stopRequested) stop();
-          else tui.requestRender();
-        })
-        .catch((error: unknown) => {
-          clearInterval(refreshTimer);
-          tui.stop();
-          reject(error);
-        });
-    };
-    input.onEscape = stop;
-    tui.start();
+  return runPiOwnerInterface({
+    targetProjectPath,
+    transcript,
+    completeOwnerInput: (ownerInput) =>
+      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor),
+    readSessionView: () => currentSessionView(state, workerSupervisor),
+    subscribeNotices: (listener) => {
+      const previous = ownerNotices.deliver;
+      ownerNotices.deliver = listener;
+      return () => {
+        ownerNotices.deliver = previous;
+      };
+    },
   });
 }
 
@@ -383,6 +331,12 @@ async function completeOwnerInteraction(
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisor);
+  if (/^\/session\s+items\s*$/i.test(ownerInput)) {
+    return {
+      source: "Session View",
+      content: renderSessionItems(snapshot),
+    };
+  }
   if (/^\/session\s+workers\s*$/i.test(ownerInput)) {
     return {
       source: "Session View",
@@ -464,57 +418,82 @@ function sessionViewSnapshot(
   });
 }
 
+type OwnerNoticeSink = { deliver: (content: string) => void };
+
+function singleLine(content: string): string {
+  return content.replaceAll(/\s*\r?\n\s*/g, " | ").trim();
+}
+
 async function availableWorkerSupervisor(
   state: AuthoritativeState,
   configuration: OwnerConfiguration,
+  ownerNotices: OwnerNoticeSink,
 ): Promise<WorkerSupervisor | undefined> {
-  if (!configuration.workerModelPolicy) return undefined;
-  const orchestration = createOrchestrationCore(state);
-  const selection = configuration.workerModelPolicy.selection;
-  try {
-    let harness: NativeWorkerHarness;
-    if (selection.nativeHarness === "codex") {
-      harness = createCodexWorkerHarness(await resolveCodexRuntime());
-    } else if (selection.nativeHarness === "claude") {
-      harness = createClaudeWorkerHarness(await resolveClaudeRuntime());
-    } else {
-      harness = createCopilotWorkerHarness(await resolveCopilotRuntime());
+  const settings = configuration.workerHarnessSettings ?? {};
+  const configured = configuration.workerModelPolicy?.selection.nativeHarness;
+  const candidates: Array<"codex" | "claude" | "copilot"> = [];
+  if (configured && settings[configured]?.enabled !== false) candidates.push(configured);
+  for (const harnessName of ["codex", "claude", "copilot"] as const) {
+    const setting = settings[harnessName];
+    if (harnessName !== configured && setting?.enabled === true && setting.model) {
+      candidates.push(harnessName);
     }
-    if (
-      selection.nativeHarness === "codex" &&
-      orchestration.observeCodexCapabilityAvailable() === "cleared"
-    ) {
-      process.stderr.write(
-        "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
-      );
-    }
-    return createWorkerSupervisor(
-      state,
-      harness,
-      createTargetProjectOperations(state),
-    );
-  } catch (error) {
-    orchestration.reconcileInterruptedWorkers(
-      `The ${nativeHarnessName(selection.nativeHarness)} capability could not be proven after host restart.`,
-    );
-    const detail = error instanceof Error ? error.message : "capability probe failed";
-    const notice = selection.nativeHarness === "codex"
-      ? orchestration.observeCodexCapabilityUnavailable(
-          detail,
-          configuration.targetProject.path,
-        )
-      : "recorded";
-    if (notice === "recorded") {
-      const code = `CMD_RIKER_${selection.nativeHarness.toUpperCase()}_UNAVAILABLE`;
-      process.stderr.write(
-        `${code}: ` +
-          `${nativeHarnessName(selection.nativeHarness)} with expected native identity for Target Project ` +
-          `${configuration.targetProject.path} is unavailable: ` +
-          `${detail}\n`,
-      );
-    }
-    return undefined;
   }
+  if (candidates.length === 0) return undefined;
+  const orchestration = createOrchestrationCore(state);
+  let lastFailure: { harness: "codex" | "claude" | "copilot"; detail: string } | undefined;
+  for (const harnessName of candidates) {
+    try {
+      let harness: NativeWorkerHarness;
+      if (harnessName === "codex") {
+        harness = createCodexWorkerHarness(await resolveCodexRuntime());
+      } else if (harnessName === "claude") {
+        harness = createClaudeWorkerHarness(await resolveClaudeRuntime());
+      } else {
+        harness = createCopilotWorkerHarness(await resolveCopilotRuntime());
+      }
+      if (
+        harnessName === "codex" &&
+        orchestration.observeCodexCapabilityAvailable() === "cleared"
+      ) {
+        process.stderr.write(
+          "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
+        );
+      }
+      return createWorkerSupervisor(
+        state,
+        harness,
+        createTargetProjectOperations(state),
+        undefined,
+        (notice) => ownerNotices.deliver(notice),
+      );
+    } catch (error) {
+      lastFailure = {
+        harness: harnessName,
+        detail: error instanceof Error ? error.message : "capability probe failed",
+      };
+    }
+  }
+  const failed = lastFailure!;
+  orchestration.reconcileInterruptedWorkers(
+    `The ${nativeHarnessName(failed.harness)} capability could not be proven after host restart.`,
+  );
+  const notice = failed.harness === "codex"
+    ? orchestration.observeCodexCapabilityUnavailable(
+        failed.detail,
+        configuration.targetProject.path,
+      )
+    : "recorded";
+  if (notice === "recorded") {
+    const code = `CMD_RIKER_${failed.harness.toUpperCase()}_UNAVAILABLE`;
+    process.stderr.write(
+      `${code}: ` +
+        `${nativeHarnessName(failed.harness)} with expected native identity for Target Project ` +
+        `${configuration.targetProject.path} is unavailable: ` +
+        `${failed.detail}\n`,
+    );
+  }
+  return undefined;
 }
 
 function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {

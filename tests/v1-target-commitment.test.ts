@@ -17,6 +17,7 @@ import {
 import {
   createCodexWorkerHarness,
   createWorkerSupervisor,
+  resolveCodexRuntime,
 } from "../src/worker-supervisor/index.ts";
 import { startLocalModel } from "./support/local-model.ts";
 
@@ -26,6 +27,7 @@ const fakeCodexAppServer = new URL("./support/fake-codex-app-server.ts", import.
 const fakeTaskCli = new URL("./support/fake-task-cli.ts", import.meta.url).pathname.slice(1);
 
 test("installed Lead runtime completes one real Target Project Commitment through recovery and restart", async (t) => {
+  const liveNativeWorker = process.env.CMD_RIKER_LIVE_V1 === "1";
   const root = await mkdtemp(join(tmpdir(), "cmd-riker-v1-proof-"));
   const stateDirectory = join(root, "state");
   const checkoutPath = join(root, "target-project");
@@ -38,7 +40,14 @@ test("installed Lead runtime completes one real Target Project Commitment throug
   await execGit(checkout, ["config", "user.email", "cmd-riker@example.invalid"]);
   await writeFile(
     join(checkout, "Taskfile.yml"),
-    "version: '3'\ntasks:\n  test:\n    cmds:\n      - node --test\n",
+    "version: '3'\ntasks:\n  test:\n    cmds:\n      - node --test index.test.mjs\n",
+  );
+  await writeFile(
+    join(checkout, "index.test.mjs"),
+    "import assert from 'node:assert/strict';\n" +
+      "import test from 'node:test';\n" +
+      "import { answer } from './src/index.ts';\n" +
+      "test('the implemented answer is available', () => assert.equal(answer, 42));\n",
   );
   await writeFile(
     join(checkout, "cmd-riker.operations.json"),
@@ -49,7 +58,12 @@ test("installed Lead runtime completes one real Target Project Commitment throug
       },
     }),
   );
-  await execGit(checkout, ["add", "Taskfile.yml", "cmd-riker.operations.json"]);
+  await execGit(checkout, [
+    "add",
+    "Taskfile.yml",
+    "cmd-riker.operations.json",
+    "index.test.mjs",
+  ]);
   await execGit(checkout, ["commit", "-m", "test: establish target project contract"]);
   await execGit(checkout, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
   await execGit(checkout, [
@@ -60,6 +74,7 @@ test("installed Lead runtime completes one real Target Project Commitment throug
   await execGit(checkout, ["switch", "-c", "feat/v1-proof"]);
 
   let commitmentId = "";
+  let failedWorkerSessionId = "";
   let modelCall = 0;
   const localModel = await startLocalModel((_call, requestBody) => {
     modelCall += 1;
@@ -94,7 +109,12 @@ test("installed Lead runtime completes one real Target Project Commitment throug
       return effectfulDelegation(
         "delegate-v1-recovered",
         commitmentId,
-        "Changed hypothesis: isolation is now proven; create the assigned implementation file.",
+        "Changed hypothesis: isolation is now proven. Create only src/index.ts with exactly " +
+          "`export const answer = 42;` followed by one newline.",
+        {
+          recoveryOfWorkerSessionId: failedWorkerSessionId,
+          recoveryReason: "Isolation readiness is now proven before effect dispatch.",
+        },
       );
     }
     if (modelCall === 5) return "The recovery Worker Session has started.";
@@ -142,18 +162,22 @@ test("installed Lead runtime completes one real Target Project Commitment throug
   assert.match(firstResponse, /first bounded Worker Session has started/);
   await waitFor(() => state.readWorkerSessions()[0]?.state === "failed");
   const failedWorker = state.readWorkerSessions()[0]!;
+  failedWorkerSessionId = failedWorker.id;
   const failedAttempt = state.readWorkerExecutionAttempt(failedWorker.currentExecutionAttemptId)!;
   assert.equal(state.readEffectIntent(failedAttempt.effectIntentId!)?.status, "rejected");
   assert.equal(state.readCommitment(commitmentId)?.state, "active");
   await assert.rejects(readFile(join(checkout, "src", "index.ts")), /ENOENT/);
 
+  const recoveredHarness = createCodexWorkerHarness(liveNativeWorker
+    ? await resolveCodexRuntime()
+    : {
+        executable: process.execPath,
+        args: [fakeCodexAppServer, "ready", "wait-and-write", releasePath],
+        version: "codex-cli 0.147.0",
+      });
   const recoveredSupervisor = createWorkerSupervisor(
     state,
-    createCodexWorkerHarness({
-      executable: process.execPath,
-      args: [fakeCodexAppServer, "ready", "wait-and-write", releasePath],
-      version: "codex-cli 0.147.0",
-    }),
+    recoveredHarness,
     operations,
   );
   const runtime = createLeadAgentRuntime({
@@ -173,15 +197,30 @@ test("installed Lead runtime completes one real Target Project Commitment throug
   );
   assert.match(concurrentResponse, /remain available while implementation continues/);
   assert.equal(state.readWorkerSessions()[1]?.state, "running");
-  await writeFile(releasePath, "release\n");
-  await waitFor(() => state.readCommitment(commitmentId)?.state === "accepted", 15_000);
+  if (!liveNativeWorker) await writeFile(releasePath, "release\n");
+  await waitFor(
+    () =>
+      state.readCommitment(commitmentId)?.state === "accepted" ||
+      ["blocked", "failed", "cancelled"].includes(state.readWorkerSessions()[1]?.state ?? ""),
+    liveNativeWorker ? 180_000 : 15_000,
+  );
   const accepted = state.readCommitment(commitmentId)!;
+  assert.equal(
+    accepted.state,
+    "accepted",
+    JSON.stringify({ commitment: accepted, worker: state.readWorkerSessions()[1] }),
+  );
   assert.equal(accepted.acceptance?.authority, "lead-agent");
   assert.equal(accepted.verification?.passed, true);
   assert.notEqual(
     state.readWorkerSessions()[0]?.assignment.prompt,
     state.readWorkerSessions()[1]?.assignment.prompt,
   );
+  assert.deepEqual(state.readWorkerSessions()[1]?.assignment.coordination, {
+    role: "implementer",
+    recoveryOfWorkerSessionId: failedWorkerSessionId,
+    recoveryReason: "Isolation readiness is now proven before effect dispatch.",
+  });
   assert.equal(await readFile(join(checkout, "src", "index.ts"), "utf8"), "export const answer = 42;\n");
   const workerCount = state.readWorkerSessions().length;
   state.close();
@@ -224,7 +263,12 @@ test("installed Lead runtime completes one real Target Project Commitment throug
   state.close();
 });
 
-function effectfulDelegation(id: string, commitmentId: string, prompt: string): {
+function effectfulDelegation(
+  id: string,
+  commitmentId: string,
+  prompt: string,
+  recovery?: { recoveryOfWorkerSessionId: string; recoveryReason: string },
+): {
   toolCall: { id: string; name: string; arguments: Record<string, unknown> };
 } {
   return {
@@ -236,6 +280,7 @@ function effectfulDelegation(id: string, commitmentId: string, prompt: string): 
         prompt,
         commitmentId,
         targets: ["src/index.ts"],
+        ...recovery,
       },
     },
   };

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
@@ -18,9 +19,18 @@ if (process.argv.includes("--list-all") && process.argv.includes("--json")) {
 }
 
 if (process.argv.at(-1) === "test") {
-  const implementation = await readFile(join(directory, "src", "index.ts"), "utf8")
-    .catch(() => "");
-  process.exit(implementation === "export const answer = 42;\n" ? 0 : 1);
+  const taskfile = argumentValue("--taskfile");
+  const declaration = taskfile ? await readFile(taskfile, "utf8").catch(() => "") : "";
+  if (!/node --test index\.test\.mjs/.test(declaration)) process.exit(2);
+  const child = spawn(process.execPath, ["--test", "index.test.mjs"], {
+    cwd: directory,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  process.exit(await new Promise<number>((resolveExit) => {
+    child.on("error", () => resolveExit(2));
+    child.on("close", (code) => resolveExit(code ?? 2));
+  }));
 }
 
 process.exit(2);

@@ -168,6 +168,8 @@ async function completeOwnerTurn(input: {
                         commitmentId: string;
                         targets: string[];
                         actingAuthorityEffect?: ActingAuthorityEffectRequest;
+                        recoveryOfWorkerSessionId?: string;
+                        recoveryReason?: string;
                       }) => {
                         const { actingAuthorityEffect, ...boundedAssignment } = assignment;
                         const authorization = actingAuthorityEffect

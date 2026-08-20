@@ -316,6 +316,16 @@ type WorkerAssignmentBase = {
       | { role: "recovery"; recoveryOfWorkerSessionId: string; reason: string };
 };
 
+type ExecutionCheckoutPhase =
+  | "planned"
+  | "preparing"
+  | "prepared"
+  | "reconciling"
+  | "reconciled"
+  | "disposing"
+  | "disposed"
+  | "blocked";
+
 export type ReviewFinding = {
   id: string;
   basis: "criterion" | "evidence" | "risk";
@@ -344,6 +354,19 @@ export type WorkerAssignment =
         root: string;
         baselineCommit: string;
         isolation: { kind: "branch"; branch: string } | { kind: "worktree"; branch?: string };
+        managedExecutionCheckout?: {
+          kind: "managed-worktree";
+          targetProjectRoot: string;
+        };
+      };
+      executionCheckout?: {
+        kind: "managed-worktree";
+        root: string;
+        targetProjectRoot: string;
+        phase: ExecutionCheckoutPhase;
+        workerEffectDispatchedAt?: string;
+        blockedReason?: string;
+        blockedFrom?: Exclude<ExecutionCheckoutPhase, "blocked">;
       };
       authority: {
         kind: "lead-agent-command-authority";
@@ -614,6 +637,11 @@ export interface OrchestrationState {
     questions?: WorkerQuestion[];
     effectIntent?: EffectIntent;
   }): void;
+  transitionExecutionCheckout(input: {
+    workerSession: WorkerSession;
+    executionAttempt?: WorkerExecutionAttempt;
+    commitmentSnapshots?: Commitment[];
+  }): void;
   settleWorkerVerification(
     effectIntent: Extract<EffectIntent, { kind: "worker-assignment" }>,
     commitmentSnapshots: Commitment[],
@@ -778,6 +806,10 @@ export interface OrchestrationCore {
       root: string;
       baselineCommit: string;
       isolation: { kind: "branch"; branch: string } | { kind: "worktree"; branch?: string };
+      managedExecutionCheckout?: {
+        kind: "managed-worktree";
+        targetProjectRoot: string;
+      };
     };
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
     actingAuthorityEffectAuthorizationId?: string;
@@ -820,6 +852,17 @@ export interface OrchestrationCore {
     executionAttemptId: string,
   ): WorkerExecutionAttempt;
   claimWorkerEffectDispatch(workerSessionId: string, executionAttemptId: string): void;
+  claimExecutionCheckoutPreparation(workerSessionId: string, executionAttemptId: string): WorkerSession;
+  observeExecutionCheckoutPrepared(workerSessionId: string, executionAttemptId: string): WorkerSession;
+  claimExecutionCheckoutReconciliation(workerSessionId: string, executionAttemptId: string): WorkerSession;
+  observeExecutionCheckoutReconciled(workerSessionId: string, executionAttemptId: string): WorkerSession;
+  claimExecutionCheckoutDisposal(workerSessionId: string, executionAttemptId: string): WorkerSession;
+  observeExecutionCheckoutDisposed(workerSessionId: string, executionAttemptId: string): WorkerSession;
+  blockExecutionCheckout(
+    workerSessionId: string,
+    executionAttemptId: string,
+    reason: string,
+  ): WorkerSession;
   observeWorkerQuestion(input: {
     workerSessionId: string;
     executionAttemptId: string;
@@ -1187,7 +1230,11 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
 
     workerVerificationRecoveryView() {
       return state.readWorkerSessions().flatMap((worker) => {
-        if (worker.assignment.readOnly || worker.state !== "completed") return [];
+        if (
+          worker.assignment.readOnly ||
+          worker.state !== "completed" ||
+          worker.assignment.executionCheckout?.phase === "blocked"
+        ) return [];
         const attempt = state.readWorkerExecutionAttempt(worker.currentExecutionAttemptId);
         const effect = attempt?.effectIntentId
           ? state.readEffectIntent(attempt.effectIntentId)
@@ -1214,7 +1261,9 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         attempt.status !== "completed" ||
         effect?.kind !== "worker-assignment" ||
         effect.status !== "succeeded" ||
-        effect.verificationOperationAttemptId
+        effect.verificationOperationAttemptId ||
+        (worker.assignment.executionCheckout &&
+          worker.assignment.executionCheckout.phase !== "disposed")
       ) {
         throw new Error("Worker effect is not ready for its attributed Verification operation.");
       }
@@ -1530,13 +1579,48 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
         const { reviewerWorkerSessionId: _reviewerWorkerSessionId, ...reviewWithoutReviewer } = review;
         resumedReview = reviewWithoutReviewer;
       }
-      state.appendCommitmentSnapshots([
-        {
-          ...unblocked,
-          ...(resumedReview ? { review: resumedReview } : {}),
-          ...(commitment.state === "active" ? { activeOwnerTurnId: ownerTurnId } : {}),
-        },
-      ]);
+      const resumedCommitment: Commitment = {
+        ...unblocked,
+        ...(resumedReview ? { review: resumedReview } : {}),
+        ...(commitment.state === "active" ? { activeOwnerTurnId: ownerTurnId } : {}),
+      };
+      const blockedExecutionCheckouts = state.readWorkerSessions().filter(
+        (worker) =>
+          !worker.assignment.readOnly &&
+          worker.assignment.commitmentId === commitmentId &&
+          worker.assignment.executionCheckout?.phase === "blocked" &&
+          worker.assignment.executionCheckout.blockedFrom,
+      );
+      if (blockedExecutionCheckouts.length > 1) {
+        throw new Error("A Commitment cannot resume multiple blocked Execution Checkouts.");
+      }
+      const worker = blockedExecutionCheckouts[0];
+      if (!worker || worker.assignment.readOnly || !worker.assignment.executionCheckout?.blockedFrom) {
+        state.appendCommitmentSnapshots([resumedCommitment]);
+        return;
+      }
+      const { blockedReason: _reason, blockedFrom, ...checkout } =
+        worker.assignment.executionCheckout;
+      const resumedWorker = withExecutionCheckout(worker, { ...checkout, phase: blockedFrom });
+      const attempt = state.readWorkerExecutionAttempt(worker.currentExecutionAttemptId);
+      if (worker.state === "blocked" && attempt?.status === "blocked") {
+        const { failure: _failure, outcome: _attemptOutcome, ...resumableAttempt } = attempt;
+        const {
+          ownerAttention: _ownerAttention,
+          outcome: _workerOutcome,
+          ...resumableWorker
+        } = resumedWorker;
+        state.transitionExecutionCheckout({
+          executionAttempt: { ...resumableAttempt, status: "launch-intent-recorded" },
+          workerSession: { ...resumableWorker, state: "starting" },
+          commitmentSnapshots: [resumedCommitment],
+        });
+      } else {
+        state.transitionExecutionCheckout({
+          workerSession: resumedWorker,
+          commitmentSnapshots: [resumedCommitment],
+        });
+      }
     },
 
     pauseCommitment(commitmentId, ownerTurnId, reason) {
@@ -1843,8 +1927,16 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (!samePath(input.verification.workingDirectory, configuredPath)) {
         throw new Error("Effectful Worker Verification must run from the active checkout root.");
       }
+      const managedCheckout = input.checkoutIsolation.managedExecutionCheckout;
+      const checkoutRootValid = managedCheckout
+        ? samePath(managedCheckout.targetProjectRoot, configuredPath) &&
+          input.checkoutIsolation.isolation.kind === "worktree" &&
+          !samePath(input.checkoutIsolation.root, configuredPath) &&
+          !isWithin(configuredPath, input.checkoutIsolation.root) &&
+          !isWithin(input.checkoutIsolation.root, configuredPath)
+        : samePath(input.checkoutIsolation.root, configuredPath);
       if (
-        !samePath(input.checkoutIsolation.root, configuredPath) ||
+        !checkoutRootValid ||
         !/^[0-9a-f]{40,64}$/i.test(input.checkoutIsolation.baselineCommit)
       ) {
         throw new Error("Effectful work requires a proven isolated checkout baseline.");
@@ -1917,10 +2009,20 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           commitmentId: input.commitmentId,
           targets: input.targets,
           effectClasses: ["filesystem-write", "bounded-process-execution"],
-          authorizedWriteRoots: [configuredPath],
+          authorizedWriteRoots: [input.checkoutIsolation.root],
           timeoutMs: input.timeoutMs,
           costBound: { maximumIncrementalSpendUsd: 0 },
           checkoutIsolation: input.checkoutIsolation,
+          ...(managedCheckout
+            ? {
+                executionCheckout: {
+                  kind: "managed-worktree" as const,
+                  root: input.checkoutIsolation.root,
+                  targetProjectRoot: configuredPath,
+                  phase: "planned" as const,
+                },
+              }
+            : {}),
           authority: {
             kind: "lead-agent-command-authority",
             commitmentId: input.commitmentId,
@@ -2155,16 +2257,59 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       const effect = attempt.effectIntentId
         ? state.readEffectIntent(attempt.effectIntentId)
         : undefined;
+      const executionCheckout = worker.assignment.executionCheckout;
       if (
         attempt.status !== "starting" ||
         effect?.kind !== "worker-assignment" ||
         effect.executionAttemptId !== attempt.id ||
-        effect.status !== "pending"
+        (executionCheckout
+          ? effect.status !== "dispatching" || executionCheckout.phase !== "prepared"
+          : effect.status !== "pending")
       ) {
         throw new Error(`Worker execution attempt ${attempt.id} has no pending effect to dispatch.`);
       }
       const claimedAt = new Date().toISOString();
       state.appendWorkerState({
+        ...(executionCheckout
+          ? {
+              workerSession: withExecutionCheckout(worker, {
+                ...executionCheckout,
+                workerEffectDispatchedAt: claimedAt,
+              }),
+            }
+          : {
+              effectIntent: {
+                ...effect,
+                status: "dispatching" as const,
+                lease: {
+                  claimedAt,
+                  expiresAt: new Date(Date.now() + worker.assignment.timeoutMs).toISOString(),
+                },
+              },
+            }),
+      });
+    },
+
+    claimExecutionCheckoutPreparation(workerSessionId, executionAttemptId) {
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+      const effect = state.readEffectIntent(attempt.effectIntentId!);
+      if (
+        worker.state !== "starting" ||
+        attempt.status !== "launch-intent-recorded" ||
+        worker.assignment.executionCheckout!.phase !== "planned" ||
+        effect?.kind !== "worker-assignment" ||
+        effect.status !== "pending"
+      ) {
+        throw new Error("Execution Checkout preparation has no durable pending effect to claim.");
+      }
+      const claimedAt = new Date().toISOString();
+      const preparing = withExecutionCheckout(worker, {
+        ...worker.assignment.executionCheckout!,
+        phase: "preparing",
+      });
+      state.appendWorkerState({
+        workerSession: preparing,
         effectIntent: {
           ...effect,
           status: "dispatching",
@@ -2174,6 +2319,132 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           },
         },
       });
+      return preparing;
+    },
+
+    observeExecutionCheckoutPrepared(workerSessionId, executionAttemptId) {
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      const executionCheckout = worker.assignment.executionCheckout!;
+      if (executionCheckout.phase === "prepared") return worker;
+      if (executionCheckout.phase !== "preparing") {
+        throw new Error("Execution Checkout preparation was not durably claimed.");
+      }
+      const prepared = withExecutionCheckout(worker, { ...executionCheckout, phase: "prepared" });
+      state.appendWorkerSessionSnapshots([prepared]);
+      return prepared;
+    },
+
+    claimExecutionCheckoutReconciliation(workerSessionId, executionAttemptId) {
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+      const effect = state.readEffectIntent(attempt.effectIntentId!);
+      const executionCheckout = worker.assignment.executionCheckout!;
+      if (
+        worker.state !== "completed" ||
+        attempt.status !== "completed" ||
+        effect?.kind !== "worker-assignment" ||
+        effect.status !== "succeeded" ||
+        executionCheckout.phase !== "prepared"
+      ) {
+        throw new Error("Execution Checkout reconciliation requires a settled Worker result.");
+      }
+      const reconciling = withExecutionCheckout(worker, {
+        ...executionCheckout,
+        phase: "reconciling",
+      });
+      state.appendWorkerSessionSnapshots([reconciling]);
+      return reconciling;
+    },
+
+    observeExecutionCheckoutReconciled(workerSessionId, executionAttemptId) {
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      const executionCheckout = worker.assignment.executionCheckout!;
+      if (executionCheckout.phase === "reconciled") return worker;
+      if (executionCheckout.phase !== "reconciling") {
+        throw new Error("Execution Checkout reconciliation was not durably claimed.");
+      }
+      const reconciled = withExecutionCheckout(worker, { ...executionCheckout, phase: "reconciled" });
+      state.appendWorkerSessionSnapshots([reconciled]);
+      return reconciled;
+    },
+
+    claimExecutionCheckoutDisposal(workerSessionId, executionAttemptId) {
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+      const effect = state.readEffectIntent(attempt.effectIntentId!);
+      const executionCheckout = worker.assignment.executionCheckout!;
+      const rejectedBeforeWorkerDispatch =
+        worker.state === "failed" &&
+        effect?.kind === "worker-assignment" &&
+        effect.status === "rejected" &&
+        !executionCheckout.workerEffectDispatchedAt &&
+        ["preparing", "prepared"].includes(executionCheckout.phase);
+      if (executionCheckout.phase !== "reconciled" && !rejectedBeforeWorkerDispatch) {
+        throw new Error("Execution Checkout disposal requires an attributed reconciled result.");
+      }
+      const disposing = withExecutionCheckout(worker, { ...executionCheckout, phase: "disposing" });
+      state.appendWorkerSessionSnapshots([disposing]);
+      return disposing;
+    },
+
+    observeExecutionCheckoutDisposed(workerSessionId, executionAttemptId) {
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      const executionCheckout = worker.assignment.executionCheckout!;
+      if (executionCheckout.phase === "disposed") return worker;
+      if (executionCheckout.phase !== "disposing") {
+        throw new Error("Execution Checkout disposal was not durably claimed.");
+      }
+      const disposed = withExecutionCheckout(worker, { ...executionCheckout, phase: "disposed" });
+      state.appendWorkerSessionSnapshots([disposed]);
+      return disposed;
+    },
+
+    blockExecutionCheckout(workerSessionId, executionAttemptId, reason) {
+      if (!reason.trim()) throw new Error("A blocked Execution Checkout requires a material reason.");
+      const worker = requireManagedExecutionCheckout(state, workerSessionId, executionAttemptId);
+      if (worker.assignment.executionCheckout!.phase === "blocked") return worker;
+      const blocked = withExecutionCheckout(worker, {
+        ...worker.assignment.executionCheckout!,
+        phase: "blocked",
+        blockedReason: reason,
+        blockedFrom: worker.assignment.executionCheckout!.phase,
+      });
+      const commitment = state.readCommitment(worker.assignment.commitmentId);
+      if (!commitment || ["accepted", "cancelled", "superseded"].includes(commitment.state)) {
+        throw new Error("A terminal or missing Commitment cannot own a blocked Execution Checkout.");
+      }
+      const materialCommitment: Commitment = {
+        ...commitment,
+        condition: {
+          kind: "blocked",
+          reason,
+          nextAction: executionCheckoutOwnerResolution(worker.assignment.executionCheckout!),
+          ownerAttention: "mission-critical-impairment",
+        },
+      };
+      if (worker.state === "starting") {
+        const attempt = requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+        const outcome: WorkerOutcome = {
+          status: "blocked",
+          summary: "Automatic Execution Checkout preparation requires Owner attention.",
+          affectedArtifacts: [],
+          materialCommands: [],
+          verificationResults: [],
+          unresolvedUncertainty: reason,
+          evidence: { baselineCommit: worker.assignment.checkoutIsolation.baselineCommit },
+        };
+        state.transitionExecutionCheckout({
+          executionAttempt: { ...attempt, status: "blocked", failure: reason, outcome },
+          workerSession: { ...blocked, state: "blocked", outcome },
+          commitmentSnapshots: [materialCommitment],
+        });
+      } else {
+        state.transitionExecutionCheckout({
+          workerSession: blocked,
+          commitmentSnapshots: [materialCommitment],
+        });
+      }
+      return blocked;
     },
 
     observeWorkerAttemptStarted(input) {
@@ -2447,8 +2718,12 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           observedChanges.length === input.reportedOutcome?.affectedArtifacts.length &&
           observedChanges.every((path) => input.reportedOutcome?.affectedArtifacts.includes(path));
         const deadlineExceeded = worker.cancellation?.kind === "deadline";
+        const workerEffectDispatched =
+          !assignment.executionCheckout ||
+          Boolean(assignment.executionCheckout.workerEffectDispatchedAt);
         const completedSafely =
           effect.status === "dispatching" &&
+          workerEffectDispatched &&
           input.status === "completed" &&
           input.processGone &&
           input.reportedOutcome?.status === "completed" &&
@@ -2458,7 +2733,8 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           !deadlineExceeded;
         const effectStatus = completedSafely
           ? "succeeded"
-          : effect.status === "pending"
+          : effect.status === "pending" ||
+              (assignment.executionCheckout && !workerEffectDispatched && input.processGone)
             ? "rejected"
             : "unknown";
         const timedOut = deadlineExceeded;
@@ -3306,6 +3582,56 @@ function requireCurrentOwnerTurn(state: OrchestrationState, ownerTurnId: string)
   if (state.latestOwnerTurnId() !== ownerTurnId || state.leadAgentResponse(ownerTurnId) !== undefined) {
     throw new Error("Authority changes require the current unanswered Owner turn.");
   }
+}
+
+function requireManagedExecutionCheckout(
+  state: OrchestrationState,
+  workerSessionId: string,
+  executionAttemptId: string,
+): WorkerSession & { assignment: Extract<WorkerAssignment, { readOnly: false }> } {
+  const worker = requireWorkerSession(state, workerSessionId);
+  requireCurrentWorkerAttempt(state, worker, executionAttemptId);
+  if (worker.assignment.readOnly || !worker.assignment.executionCheckout) {
+    throw new Error("Worker Session has no managed Execution Checkout.");
+  }
+  return worker as WorkerSession & { assignment: Extract<WorkerAssignment, { readOnly: false }> };
+}
+
+function withExecutionCheckout(
+  worker: WorkerSession,
+  executionCheckout: NonNullable<Extract<WorkerAssignment, { readOnly: false }>["executionCheckout"]>,
+): WorkerSession & { assignment: Extract<WorkerAssignment, { readOnly: false }> } {
+  if (worker.assignment.readOnly) {
+    throw new Error("A read-only Worker cannot own an Execution Checkout.");
+  }
+  return {
+    ...worker,
+    assignment: {
+      ...worker.assignment,
+      executionCheckout,
+    },
+  };
+}
+
+function executionCheckoutOwnerResolution(
+  checkout: NonNullable<Extract<WorkerAssignment, { readOnly: false }>["executionCheckout"]>,
+): string {
+  if (["planned", "preparing", "prepared"].includes(checkout.phase)) {
+    return (
+      `Remove or rename only the conflicting planned checkout path ${checkout.root}, then resume ` +
+      "automatic preparation; the original Target Project remains preserved."
+    );
+  }
+  if (["reconciling", "reconciled"].includes(checkout.phase)) {
+    return (
+      `Preserve ${checkout.root}, resolve the concurrent Target Project change, then resume exact ` +
+      "reconciliation; CMD Riker will not overwrite either result."
+    );
+  }
+  return (
+    `Keep the reconciled Target Project result, repair the stale worktree identity for ${checkout.root}, ` +
+    "then resume automatic cleanup."
+  );
 }
 
 function requireExplicitCurrentOwnerInstruction(

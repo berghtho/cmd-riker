@@ -4,6 +4,9 @@ Before starting a new slice, fetch `origin`, fast-forward local `main` with `git
 create or refresh the work branch. Preserve unrelated worktrees; when local `main` cannot be updated
 safely, start from `origin/main` in a clean worktree instead of using a stale base.
 
+Close an issue whose resolution includes code changes only after its linked pull request is merged.
+Name the pull request and merge commit in the issue's durable resolution comment.
+
 CMD Riker's wayfinding is complete and product implementation has begun. Read `CONTEXT.md` before
 using a domain noun. The accepted product and architecture map is
 [Design CMD Riker's product and architecture](https://github.com/berghtho/cmd-riker/issues/22);

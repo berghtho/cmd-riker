@@ -405,6 +405,13 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
             code: current.recoveryBaseline.code,
             state: candidate.state,
           };
+          writeLifecycle(paths.lifecycleJournal, {
+            ...lifecycle,
+            stopRequested: false,
+            stopped: false,
+          });
+          await options.supervision.start();
+          stoppedForUpgrade = false;
           return actor.activate({ ...input.activation, candidate, baseline });
         });
         if (!candidate || !snapshot) throw new Error("Owner upgrade did not establish its exact candidate pair.");
@@ -433,6 +440,9 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
         const lifecycle = requireInstalled();
         if (!lifecycle.operation) return inspect();
         if (lifecycle.operation.kind === "upgrade") {
+          if (processMatches(lifecycle.operation.pid, lifecycle.operation.startedAt)) {
+            return inspect();
+          }
           await withActor(lifecycle.actor, (actor) => actor.recover());
           releaseLifecycleOperation(paths.lifecycleJournal, lifecycle.operation.id);
         } else if (lifecycle.operation.kind === "start") {

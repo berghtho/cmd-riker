@@ -14,6 +14,7 @@ export type LeadHostTranscriptEntry =
 
 export type LeadHostExit =
   | { kind: "explicit-stop"; code: number | null; signal: NodeJS.Signals | null }
+  | { kind: "graceful-shutdown"; code: number | null; signal: NodeJS.Signals | null }
   | {
       kind: "unexpected-child-exit";
       code: number | null;
@@ -26,6 +27,7 @@ export type LocalLeadHostServer = {
   readonly childPid: number;
   readonly exit: Promise<LeadHostExit>;
   stop(): Promise<LeadHostExit>;
+  shutdown(): Promise<LeadHostExit>;
 };
 
 export type LocalLeadHostClient = {
@@ -126,6 +128,7 @@ export async function startLocalLeadHost(
   let writeQueue = Promise.resolve();
   const durableOwnerAcks: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
   let stopOperation: Promise<LeadHostExit> | undefined;
+  let shutdownOperation: Promise<LeadHostExit> | undefined;
   let finalizeOperation: Promise<LeadHostExit> | undefined;
   const exitResolution = Promise.withResolvers<LeadHostExit>();
 
@@ -271,6 +274,26 @@ export async function startLocalLeadHost(
     return stopOperation;
   };
 
+  const requestShutdown = (): Promise<LeadHostExit> => {
+    if (finalizeOperation) return finalizeOperation;
+    if (stopOperation) return stopOperation;
+    if (shutdownOperation) return shutdownOperation;
+    acceptingOwnerLines = false;
+    shutdownOperation = (async () => {
+      await writeQueue;
+      if (childExit) return finalize(unexpectedExit());
+      controlledChildShutdown = true;
+      child.stdin.end();
+      await waitForChildClose(child, stopGraceMs);
+      return finalize({
+        kind: "graceful-shutdown",
+        code: child.exitCode,
+        signal: child.signalCode,
+      });
+    })();
+    return shutdownOperation;
+  };
+
   server.on("connection", (socket) => {
     sockets.set(socket, { attached: false });
     socket.on("end", () => sockets.delete(socket));
@@ -336,6 +359,7 @@ export async function startLocalLeadHost(
     childPid: child.pid!,
     exit: exitResolution.promise,
     stop: requestStop,
+    shutdown: requestShutdown,
   };
 }
 

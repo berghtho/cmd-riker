@@ -19,7 +19,10 @@ import {
   recoverInterruptedAuthoritativeStateRestore,
   restoreAuthoritativeStateSnapshot,
 } from "./state-snapshot/index.ts";
-import { advanceWriteGeneration } from "./write-generation.ts";
+import {
+  advanceWriteGeneration,
+  readWriteGenerationHighWater,
+} from "./write-generation.ts";
 
 type CandidateLaunch = {
   server: LocalLeadHostServer;
@@ -255,7 +258,10 @@ export function createLocalActivationEffects(input: {
     },
     async restoreBaseline(pair, failedGeneration) {
       await verifyPair(pair);
-      const freshWriteGeneration = failedGeneration + 1;
+      const freshWriteGeneration = Math.max(
+        failedGeneration,
+        readWriteGenerationHighWater(input.stateDirectory) ?? 0,
+      ) + 1;
       const evidenceDirectory = join(
         input.recoveryDirectory,
         "failed-evidence",

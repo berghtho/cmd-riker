@@ -423,6 +423,7 @@ async function completeOwnerInteraction(
       ownerTurnId,
       "Owner requested a pause from the Session View.",
     );
+    state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
     return {
       source: "Session View",
       content: "Pause recorded. Linked Worker activity and any effects remain separate facts.",
@@ -434,6 +435,7 @@ async function completeOwnerInteraction(
     ownerTurnId,
     "Owner requested cancellation from the Session View.",
   );
+  state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
   return {
     source: "Session View",
     content: "Cancellation intent recorded and sent. Existing effects are not rolled back.",

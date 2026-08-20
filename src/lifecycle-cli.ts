@@ -122,68 +122,91 @@ async function upgrade(installation: LocalInstallation): Promise<void> {
 }
 
 async function supervise(installRoot: string): Promise<void> {
-  const installation = await productionInstallation(installRoot);
-  const inspection = await installation.recover();
-  if (inspection.status !== "installed" || inspection.stopped || inspection.stopRequested) return;
-  if (!inspection.actor) throw new Error("Protected Recovery Actor identity is unavailable.");
-  const paths = localInstallationPaths(installRoot);
-  const effects = createLocalActivationEffects({
-    installationRoot: paths.root,
-    stateDirectory: paths.state,
-    recoveryDirectory: paths.recovery,
-  });
-  const actor = openRecoveryActor(paths.journal, inspection.actor, effects);
+  let activeServer: Awaited<ReturnType<typeof startLocalLeadHost>> | undefined;
+  let shutdownRequested = false;
+  const gracefulShutdown = () => {
+    shutdownRequested = true;
+    void activeServer?.shutdown();
+  };
+  const shutdownSignals = ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const;
+  for (const signal of shutdownSignals) process.once(signal, gracefulShutdown);
   try {
-    await actor.recover();
-    while (true) {
-      const active = actor.inspect();
-      if (!active.active || active.writeGeneration === undefined) {
-        throw new Error("Recovery Actor has no exact accepted code-and-state pair.");
+    const installation = await productionInstallation(installRoot);
+    let inspection = await installation.recover();
+    while (inspection.currentOperation?.kind === "upgrade") {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      inspection = await installation.recover();
+    }
+    if (shutdownRequested) return;
+    if (inspection.status !== "installed" || inspection.stopped || inspection.stopRequested) return;
+    if (!inspection.actor) throw new Error("Protected Recovery Actor identity is unavailable.");
+    const paths = localInstallationPaths(installRoot);
+    const effects = createLocalActivationEffects({
+      installationRoot: paths.root,
+      stateDirectory: paths.state,
+      recoveryDirectory: paths.recovery,
+    });
+    const actor = openRecoveryActor(paths.journal, inspection.actor, effects);
+    try {
+      await actor.recover();
+      if (shutdownRequested) return;
+      while (true) {
+        const active = actor.inspect();
+        if (!active.active || active.writeGeneration === undefined) {
+          throw new Error("Recovery Actor has no exact accepted code-and-state pair.");
+        }
+        if (active.leadRestartBudget?.remaining === 0) {
+          process.stderr.write(
+            "CMD_RIKER_LEAD_RESTART_EXHAUSTED: The accepted Lead Agent revision requires Owner inspection.\n",
+          );
+          return;
+        }
+        const release = await verifyLocalReleaseCandidate(active.active.code.path, "lead-agent");
+        if (shutdownRequested) return;
+        try {
+          const server = await startLocalLeadHost({
+            address: localLeadHostAddress(paths.root),
+            executable: release.runtime.path,
+            args: [
+              release.entrypointPath,
+              "--state-dir",
+              paths.state,
+              "--write-generation",
+              String(active.writeGeneration),
+              "--hosted",
+            ],
+            transcriptSeed: conversationSeed(paths.state, active.writeGeneration),
+            durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+            ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
+            async onStopIntent() {
+              const current = await installation.inspect();
+              if (!current.stopRequested) {
+                throw new Error("The durable whole-system stop intent is missing.");
+              }
+            },
+          });
+          activeServer = server;
+          const exit = await server.exit;
+          activeServer = undefined;
+          if (exit.kind === "explicit-stop" || exit.kind === "graceful-shutdown") return;
+          actor.recordLeadFailure(
+            active.active.code.revision,
+            `Lead Agent exited unexpectedly with code ${exit.code ?? "none"} and signal ${exit.signal ?? "none"}.`,
+          );
+        } catch (error) {
+          actor.recordLeadFailure(
+            active.active.code.revision,
+            `Lead Agent launch failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        } finally {
+          activeServer = undefined;
+        }
       }
-      if (active.leadRestartBudget?.remaining === 0) {
-        process.stderr.write(
-          "CMD_RIKER_LEAD_RESTART_EXHAUSTED: The accepted Lead Agent revision requires Owner inspection.\n",
-        );
-        return;
-      }
-      const release = await verifyLocalReleaseCandidate(active.active.code.path, "lead-agent");
-      try {
-        const server = await startLocalLeadHost({
-          address: localLeadHostAddress(paths.root),
-          executable: release.runtime.path,
-          args: [
-            release.entrypointPath,
-            "--state-dir",
-            paths.state,
-            "--write-generation",
-            String(active.writeGeneration),
-            "--hosted",
-          ],
-           transcriptSeed: conversationSeed(paths.state, active.writeGeneration),
-           durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
-           ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
-           async onStopIntent() {
-            const current = await installation.inspect();
-            if (!current.stopRequested) {
-              throw new Error("The durable whole-system stop intent is missing.");
-            }
-          },
-        });
-        const exit = await server.exit;
-        if (exit.kind === "explicit-stop") return;
-        actor.recordLeadFailure(
-          active.active.code.revision,
-          `Lead Agent exited unexpectedly with code ${exit.code ?? "none"} and signal ${exit.signal ?? "none"}.`,
-        );
-      } catch (error) {
-        actor.recordLeadFailure(
-          active.active.code.revision,
-          `Lead Agent launch failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+    } finally {
+      actor.close();
     }
   } finally {
-    actor.close();
+    for (const signal of shutdownSignals) process.off(signal, gracefulShutdown);
   }
 }
 

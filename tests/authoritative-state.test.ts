@@ -6,7 +6,11 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
-import { advanceWriteGeneration } from "../src/write-generation.ts";
+import {
+  advanceWriteGeneration,
+  readWriteGenerationHighWater,
+  recordWriteGenerationHighWater,
+} from "../src/write-generation.ts";
 import {
   createOrchestrationCore,
   defaultLeadModelRequirements,
@@ -106,6 +110,14 @@ test("generation transfer fences every stale Authoritative State writer", async 
     integrity: "passed",
   });
   assert.equal(active.readOwnerConversation()?.messages.length, 0);
+  const liveDatabase = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"), {
+    readOnly: true,
+  });
+  const stateIdentityColumns = liveDatabase
+    .prepare("PRAGMA table_info(state_identity)")
+    .all() as Array<{ name: string }>;
+  assert.equal(stateIdentityColumns.some((column) => column.name === "write_generation"), false);
+  liveDatabase.close();
   active.appendOwnerMessage("The active generation can commit.");
   const backup = await active.createBackup(join(stateDirectory, "generation-2-backup.sqlite"));
   assert.equal(backup.writeGeneration, 2);
@@ -124,6 +136,8 @@ test("generation transfer fences every stale Authoritative State writer", async 
   const reopened = openAuthoritativeState(stateDirectory, { writeGeneration: 2 });
   assert.equal(reopened.readOwnerConversation()?.messages.length, 1);
   reopened.close();
+  assert.equal(recordWriteGenerationHighWater(stateDirectory, 1), 2);
+  assert.equal(readWriteGenerationHighWater(stateDirectory), 2);
 });
 
 test("a validated Lead Model policy activates atomically and preserves its ordered fallbacks", async (t) => {

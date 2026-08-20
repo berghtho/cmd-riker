@@ -63,6 +63,9 @@ test("activation durably identifies the exact cutover before transferring the wr
       assert.equal(attempt?.recoveryPath, "restore-exact-baseline-pair");
       observations.push("durable-before-transfer");
     },
+    beforeTerminate: () => {
+      assert.equal(actor.inspect().currentAttempt?.phase, "activated");
+    },
   }, observations));
   actor.initialize({ active: baseline, recoveryBaseline: baseline, writeGeneration: 1 });
 
@@ -245,6 +248,7 @@ function activationEffects(
     crashAfterGenerationTransfer?: boolean;
     crashAfterBaselineRestore?: boolean;
     restoredGeneration?: number | undefined;
+    beforeTerminate?: () => void;
   },
   observations: string[],
 ): ActivationEffects {
@@ -303,6 +307,7 @@ function activationEffects(
       return healthy;
     },
     async terminate(process) {
+      hooks.beforeTerminate?.();
       observations.push(`terminate:${process.pid}`);
     },
     async restoreBaseline(pair, failedGeneration) {

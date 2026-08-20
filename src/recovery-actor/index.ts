@@ -368,13 +368,13 @@ export function openRecoveryActor(
         if (probation.verdict !== "healthy") {
           throw new Error(`Candidate probation health is ${probation.verdict}.`);
         }
-        await effects.terminate(candidateProcess);
         attempt = transition(
           attempt,
           "activated",
           { health: probation },
           { active: attempt.candidate, writeGeneration: candidateGeneration },
         );
+        await effects.terminate(candidateProcess);
         return { attemptId: attempt.id, outcome: "activated" };
       } catch (error) {
         const failure = error instanceof Error ? error.message : String(error);

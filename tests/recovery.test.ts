@@ -12,6 +12,7 @@ import {
   openAuthoritativeStateSafely,
 } from "../src/authoritative-state/index.ts";
 import { createOrchestrationCore } from "../src/orchestration-core/index.ts";
+import { recordWriteGenerationHighWater } from "../src/write-generation.ts";
 import type {
   TargetProjectOperationAttempt,
   TargetProjectOperationEffectIntent,
@@ -293,11 +294,14 @@ test("restore preserves damaged evidence and blocks mutations until post-backup 
   const backupManifest = JSON.parse(
     await readFile(`${backupPath}.manifest.json`, "utf8"),
   ) as { databasePath: string; sha256: string };
+  const originalBackup = await readFile(backupPath);
+  const originalBackupManifest = await readFile(`${backupPath}.manifest.json`);
   assert.equal(backupManifest.databasePath, backupPath);
   assert.match(backupManifest.sha256, /^[a-f0-9]{64}$/);
   state = openAuthoritativeState(stateDirectory);
   state.appendOwnerMessage("This later message will not be restored.");
   state.close();
+  recordWriteGenerationHighWater(stateDirectory, 7);
 
   const damagedBytes = Buffer.from("damaged after the backup\n", "utf8");
   await writeFile(join(stateDirectory, "authoritative-state.sqlite"), damagedBytes);
@@ -450,11 +454,14 @@ test("restore preserves damaged evidence and blocks mutations until post-backup 
   assert.equal(opened.kind, "operational");
   if (opened.kind !== "operational") assert.fail("Reconciled restore must reopen operationally.");
   state = opened.state;
+  assert.equal(state.lifecycleStatus().writeGeneration, 9);
   assert.deepEqual(
     state.readOwnerConversation()?.messages.map((message) => message.content),
     ["This message is inside the verified backup."],
   );
   state.close();
+  assert.deepEqual(await readFile(backupPath), originalBackup);
+  assert.deepEqual(await readFile(`${backupPath}.manifest.json`), originalBackupManifest);
 });
 
 test("Owner can explicitly establish a new baseline when no trusted backup exists", async (t) => {
@@ -494,6 +501,7 @@ test("Owner can explicitly establish a new baseline when no trusted backup exist
     Buffer.from("damaged without backup\n"),
   );
   state = openAuthoritativeState(stateDirectory);
+  assert.equal(state.lifecycleStatus().writeGeneration, 2);
   assert.deepEqual(state.readOwnerConversation()?.messages, []);
   assert.equal(state.readOwnerConversation()?.targetProject.path, "C:\\target-project");
   state.close();

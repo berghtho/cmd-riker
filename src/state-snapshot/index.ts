@@ -14,6 +14,11 @@ import {
 import { basename, join, resolve } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 
+import {
+  readWriteGenerationHighWater,
+  recordWriteGenerationHighWater,
+} from "../write-generation.ts";
+
 export type AuthoritativeStateSnapshot = {
   revision: string;
   digest: string;
@@ -123,6 +128,12 @@ export async function restoreAuthoritativeStateSnapshot(
   }
 
   const stateDirectory = resolve(input.stateDirectory);
+  const highWaterGeneration = readWriteGenerationHighWater(stateDirectory) ?? 0;
+  if (input.freshWriteGeneration <= highWaterGeneration) {
+    throw new Error(
+      "Restored Authoritative State requires a write generation above the durable high-water mark.",
+    );
+  }
   const evidenceDirectory = resolve(input.evidenceDirectory);
   const activePath = join(stateDirectory, databaseFileName);
   const snapshotPath = resolve(input.snapshot.path);
@@ -193,6 +204,7 @@ export async function restoreAuthoritativeStateSnapshot(
       evidenceDirectory,
       failedFiles,
     };
+    recordWriteGenerationHighWater(stateDirectory, input.freshWriteGeneration);
     await writeRestoreJournal(journalPath, journal);
 
     for (const [index, plan] of displacementPlan.toReversed().entries()) {

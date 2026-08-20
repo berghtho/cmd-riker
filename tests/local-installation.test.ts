@@ -218,6 +218,32 @@ test("Owner upgrade snapshots SQLite state before handing the exact candidate pa
   assert.equal(inspection.currentAttempt?.baseline.code.revision, "lead-1");
 });
 
+test("upgrade restarts protected supervision before transferring Authoritative State", async (t) => {
+  const events: string[] = [];
+  const fixture = await installationFixture(t, {
+    supervisionEvents: events,
+    effectsHooks: {
+      beforeGenerationTransfer() {
+        assert.equal(events.includes("start"), true);
+      },
+    },
+  });
+  await fixture.installation.initialInstall(fixture.initialInput);
+  const lead2 = join(fixture.root, "candidate-lead-supervised");
+  await writeBundle(lead2, "lead-agent", "lead-supervised");
+  events.length = 0;
+
+  await fixture.installation.upgrade({
+    leadAgentCandidateDirectory: lead2,
+    stateRevision: "state-supervised",
+    stateProvenance: "supervised-upgrade",
+    activation: activationRequest(),
+  });
+
+  assert.equal(events[0], "start");
+  assert.equal((await fixture.installation.inspect()).stopped, false);
+});
+
 test("invalid upgrade preparation leaves the accepted Lead Agent running", async (t) => {
   const events: string[] = [];
   const fixture = await installationFixture(t, { supervisionEvents: events });
@@ -322,7 +348,10 @@ async function installationFixture(
     connectHost?: (address: string) => Promise<LocalLeadHostClient>;
     requestStop?: (address: string) => Promise<void>;
     supervisionEvents?: string[];
-    effectsHooks?: { verifyCandidate?: (candidate: CodeStatePair) => void };
+    effectsHooks?: {
+      verifyCandidate?: (candidate: CodeStatePair) => void;
+      beforeGenerationTransfer?: () => void;
+    };
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "cmd-riker-installation-"));
@@ -354,7 +383,10 @@ async function installationFixture(
 
 function activationEffects(
   stateDirectory: string,
-  hooks: { verifyCandidate?: (candidate: CodeStatePair) => void } = {},
+  hooks: {
+    verifyCandidate?: (candidate: CodeStatePair) => void;
+    beforeGenerationTransfer?: () => void;
+  } = {},
 ): ActivationEffects {
   const healthy: HealthAssessment = {
     verdict: "healthy",
@@ -375,6 +407,7 @@ function activationEffects(
     },
     async snapshotState() {},
     async transferWriteGeneration(expected) {
+      hooks.beforeGenerationTransfer?.();
       return advanceWriteGeneration(stateDirectory, expected);
     },
     async currentWriteGeneration() {

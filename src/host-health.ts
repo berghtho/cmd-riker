@@ -90,6 +90,7 @@ export function assessActivationBarrier(state: AuthoritativeState): {
   const blockers: string[] = [];
   const conversation = state.readOwnerConversation();
   for (const ownerMessage of conversation?.messages.filter((message) => message.role === "owner") ?? []) {
+    if (state.ownerInteractionDisposition(ownerMessage.turnId) === "session-view-control") continue;
     if (state.leadAgentResponse(ownerMessage.turnId) === undefined) {
       blockers.push(`Activation is blocked by unanswered Owner turn ${ownerMessage.turnId}.`);
     }

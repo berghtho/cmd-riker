@@ -92,6 +92,23 @@ test("explicit stop durably records intent before closing the Lead Agent input",
   assert.deepEqual(await server.exit, exit);
 });
 
+test("best-effort system shutdown closes the Lead Agent without inventing Owner stop intent", async () => {
+  let stopIntentCalled = false;
+  const server = await startTestHost({
+    async onStopIntent() {
+      stopIntentCalled = true;
+    },
+  });
+  const client = await connectLocalLeadHost(server.address);
+  await waitForLeadLine(client, `lead-ready:${server.childPid}`);
+
+  const exit = await server.shutdown();
+
+  assert.equal(exit.kind, "graceful-shutdown");
+  assert.equal(stopIntentCalled, false);
+  assert.deepEqual(await server.exit, exit);
+});
+
 test("Owner input is acknowledged only after the child reports its durable turn identity", async (t) => {
   const server = await startTestHost();
   t.after(() => server.stop());

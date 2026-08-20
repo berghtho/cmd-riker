@@ -80,6 +80,59 @@ test("health is impaired while Owner input remains unprocessed and does not clai
   assert.doesNotMatch(JSON.stringify(assessment), /process.*running|port.*listening/i);
 });
 
+test("a dispositioned Session View control is not treated as an unanswered Lead turn", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-health-session-control-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  state.initialize(configuration);
+  const ownerTurnId = state.appendOwnerMessage("/session pause commitment-1");
+  state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
+  state.close();
+
+  const assessment = assessHostHealth({
+    stateDirectory,
+    expectedWriteGeneration: 1,
+    expectedAttemptId: "attempt-1",
+    reportedAttemptId: "attempt-1",
+    expectedCandidateRevision: "riker-2",
+    reportedCandidateRevision: "riker-2",
+    expectedArtifactDigest: "a".repeat(64),
+    observedArtifactDigest: "a".repeat(64),
+    expectedHandshakeNonce: "handshake-1",
+    reportedHandshakeNonce: "handshake-1",
+    observedAt: "2026-08-20T10:01:00.000Z",
+  });
+
+  assert.equal(assessment.verdict, "healthy");
+  assert.equal(assessment.checks.activationBarrier, "passed");
+});
+
+test("Session View syntax without a durable control disposition still blocks cutover", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-health-session-pending-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  state.initialize(configuration);
+  state.appendOwnerMessage("/session pause commitment-1");
+  state.close();
+
+  const assessment = assessHostHealth({
+    stateDirectory,
+    expectedWriteGeneration: 1,
+    expectedAttemptId: "attempt-1",
+    reportedAttemptId: "attempt-1",
+    expectedCandidateRevision: "riker-2",
+    reportedCandidateRevision: "riker-2",
+    expectedArtifactDigest: "a".repeat(64),
+    observedArtifactDigest: "a".repeat(64),
+    expectedHandshakeNonce: "handshake-1",
+    reportedHandshakeNonce: "handshake-1",
+    observedAt: "2026-08-20T10:01:00.000Z",
+  });
+
+  assert.equal(assessment.verdict, "impaired");
+  assert.match(assessment.evidence.join("\n"), /unanswered Owner turn/);
+});
+
 test("a stale generation produces unknown health without committing the probe", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-health-stale-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));

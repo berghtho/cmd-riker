@@ -10,7 +10,6 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { isBuiltin } from "node:module";
 import {
   basename,
   dirname,
@@ -29,9 +28,6 @@ const minimumNodeVersion = [24, 16, 0];
 const revisionPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const invalidWindowsName = /[\u0000-\u001f<>:"|?*]/;
 const reservedWindowsName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
-const importedModulePattern = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s*)["']([^"']+)["']/g;
-const forbiddenActorModulePattern = /(?:^|[/@-])(?:pi(?:[/@-]|$)|codex(?:[/@-]|$))/i;
-
 try {
   await main();
 } catch (error) {
@@ -48,18 +44,16 @@ async function main() {
   const nodePath = resolve(options.node);
   const leadDist = resolve(options.leadDist);
   const leadNodeModules = resolve(options.leadNodeModules);
-  const actorDist = resolve(options.actorDist);
   const output = resolve(options.output);
   await assertMissing(output, "Release output");
   await assertPlainDirectory(dirname(output), "Release output parent");
   await assertPlainDirectory(leadDist, "Lead Agent dist");
   await assertPlainDirectory(leadNodeModules, "Lead Agent node_modules");
-  await assertPlainDirectory(actorDist, "Recovery Actor dist");
   await assertPlainFile(nodePath, "Supplied Node runtime");
   if (basename(nodePath).toLowerCase() !== "node.exe") {
     throw new Error("--node must reference node.exe.");
   }
-  if (isWithin(leadDist, output) || isWithin(leadNodeModules, output) || isWithin(actorDist, output)) {
+  if (isWithin(leadDist, output) || isWithin(leadNodeModules, output)) {
     throw new Error("Release output must not be inside a supplied dist tree.");
   }
 
@@ -69,10 +63,10 @@ async function main() {
     leadNodeModules,
     "Lead Agent node_modules",
   );
-  const actorFiles = await collectDistFiles(actorDist, "Recovery Actor dist", true);
   requireEntrypoint(leadFiles, "cli.js", "Lead Agent");
-  requireEntrypoint(actorFiles, "lifecycle-cli.js", "Recovery Actor");
-  await assertActorIsolation(actorDist, actorFiles);
+  requireEntrypoint(leadFiles, "lifecycle-cli.js", "Lead Agent");
+  requireEntrypoint(leadFiles, "owner-launcher.js", "Lead Agent");
+  requireEntrypoint(leadFiles, "owner-client.js", "Lead Agent");
 
   const temporary = join(
     dirname(output),
@@ -96,15 +90,6 @@ async function main() {
       nodePath,
       runtime,
     });
-    await writeBundle({
-      root: join(temporary, "recovery-actor"),
-      kind: "recovery-actor",
-      revision: options.revision,
-      entrypoint: "dist/lifecycle-cli.js",
-      trees: [{ sourceRoot: actorDist, sourceFiles: actorFiles, destination: "dist" }],
-      nodePath,
-      runtime,
-    });
     await assertMissing(output, "Release output");
     try {
       await rename(temporary, output);
@@ -125,7 +110,6 @@ function parseArguments(argumentsList) {
     ["--node", "node"],
     ["--lead-dist", "leadDist"],
     ["--lead-node-modules", "leadNodeModules"],
-    ["--actor-dist", "actorDist"],
     ["--output", "output"],
   ]);
   const values = {};
@@ -148,8 +132,7 @@ function parseArguments(argumentsList) {
 function usageError() {
   return new Error(
     "Usage: build-local-release.mjs --revision <revision> --node <node.exe> " +
-      "--lead-dist <directory> --lead-node-modules <directory> " +
-      "--actor-dist <directory> --output <directory>",
+      "--lead-dist <directory> --lead-node-modules <directory> --output <directory>",
   );
 }
 
@@ -201,7 +184,7 @@ async function runRuntimeProbe(nodePath, argumentsList, description) {
   return result.stdout.trim();
 }
 
-async function collectDistFiles(root, description, rejectNodeModules = false) {
+async function collectDistFiles(root, description) {
   const files = [];
   const windowsPaths = new Map();
   const walk = async (directory, relativeDirectory) => {
@@ -209,9 +192,6 @@ async function collectDistFiles(root, description, rejectNodeModules = false) {
     entries.sort((left, right) => left.localeCompare(right, "en"));
     for (const name of entries) {
       const relativePath = relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
-      if (rejectNodeModules && name.toLowerCase() === "node_modules") {
-        throw new Error(`Recovery Actor dist must not contain node_modules: ${relativePath}.`);
-      }
       validateRelativePath(relativePath, description);
       const key = relativePath.normalize("NFKC").toLowerCase();
       const existing = windowsPaths.get(key);
@@ -237,27 +217,6 @@ async function collectDistFiles(root, description, rejectNodeModules = false) {
 function requireEntrypoint(files, entrypoint, description) {
   if (!files.includes(entrypoint)) {
     throw new Error(`${description} entrypoint is missing: ${entrypoint}.`);
-  }
-}
-
-async function assertActorIsolation(actorDist, files) {
-  for (const path of files) {
-    if (!/\.(?:(?:c|m)?js|ts)$/i.test(path)) continue;
-    const source = await readFile(join(actorDist, ...path.split("/")), "utf8");
-    for (const match of source.matchAll(importedModulePattern)) {
-      const specifier = match[1];
-      if (specifier !== undefined && forbiddenActorModulePattern.test(specifier)) {
-        throw new Error(`Recovery Actor dist contains forbidden Pi/Codex import ${JSON.stringify(specifier)} in ${path}.`);
-      }
-      if (
-        specifier !== undefined &&
-        !specifier.startsWith("./") &&
-        !specifier.startsWith("../") &&
-        !isBuiltin(specifier)
-      ) {
-        throw new Error(`Recovery Actor dist contains non-built-in import ${JSON.stringify(specifier)} in ${path}.`);
-      }
-    }
   }
 }
 

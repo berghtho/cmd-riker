@@ -12,20 +12,21 @@ const commandArguments = forwarded.slice(1);
 try {
   const installation = await readInstallation(installRoot);
   if (command === "start") {
-    await run(installation.actor.runtimePath, [
-      installation.actor.entrypointPath,
+    await run(installation.leadAgent.runtimePath, [
+      installation.leadAgent.lifecyclePath,
       "start",
       "--install-root",
       installRoot,
     ], "ignore", true);
     await run(installation.leadAgent.runtimePath, [
-      join(installation.leadAgent.path, "dist", "owner-client.js"),
+      installation.leadAgent.ownerClientPath ??
+        join(installation.leadAgent.path, "dist", "owner-client.js"),
       "--install-root",
       installRoot,
     ], "inherit", false);
   } else {
-    await run(installation.actor.runtimePath, [
-      installation.actor.entrypointPath,
+    await run(installation.leadAgent.runtimePath, [
+      installation.leadAgent.lifecyclePath,
       command,
       "--install-root",
       installRoot,
@@ -40,8 +41,12 @@ try {
 }
 
 type InstallationManifest = {
-  actor: { runtimePath: string; entrypointPath: string };
-  leadAgent: { path: string; runtimePath: string };
+  leadAgent: {
+    path: string;
+    runtimePath: string;
+    lifecyclePath: string;
+    ownerClientPath?: string;
+  };
 };
 
 async function readInstallation(installationRoot: string): Promise<InstallationManifest> {
@@ -49,10 +54,9 @@ async function readInstallation(installationRoot: string): Promise<InstallationM
     await readFile(join(installationRoot, "launcher", "installation.json"), "utf8"),
   ) as Partial<InstallationManifest>;
   if (
-    typeof value.actor?.runtimePath !== "string" ||
-    typeof value.actor.entrypointPath !== "string" ||
     typeof value.leadAgent?.path !== "string" ||
-    typeof value.leadAgent.runtimePath !== "string"
+    typeof value.leadAgent.runtimePath !== "string" ||
+    typeof value.leadAgent.lifecyclePath !== "string"
   ) {
     throw new Error("The installed launcher manifest is incomplete.");
   }

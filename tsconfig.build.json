@@ -8,9 +8,10 @@
   },
   "include": [
     "src/cli.ts",
+    "src/lifecycle-cli.ts",
     "src/live-smoke.ts",
     "src/owner-client.ts",
     "src/owner-launcher.ts"
   ],
-  "exclude": ["tests", "src/lifecycle-cli.ts", "src/recovery-actor/**/*.ts"]
+  "exclude": ["tests"]
 }

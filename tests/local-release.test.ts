@@ -18,11 +18,13 @@ const payload = {
   "runtime/node.exe": Buffer.from("fake pinned node runtime"),
 };
 
-test("strictly parses format version 1 manifests for both candidate kinds", () => {
-  for (const kind of ["lead-agent", "recovery-actor"] as const) {
-    const manifest = releaseManifest(kind, "revision-1", payload);
-    assert.deepEqual(parseLocalReleaseManifest(JSON.stringify(manifest, null, 2)), manifest);
-  }
+test("strictly parses format version 1 Lead Agent manifests", () => {
+  const manifest = releaseManifest("lead-agent", "revision-1", payload);
+  assert.deepEqual(parseLocalReleaseManifest(JSON.stringify(manifest, null, 2)), manifest);
+  assert.throws(
+    () => parseLocalReleaseManifest(JSON.stringify({ ...manifest, kind: "recovery-actor" })),
+    /kind is invalid/,
+  );
 
   const valid = releaseManifest("lead-agent", "revision-1", payload);
   assert.throws(
@@ -99,11 +101,6 @@ test("verifies exact files, bundled runtime, entrypoint, and candidate kind", as
     architecture: "x64",
     path: join(candidate, "runtime", "node.exe"),
   });
-  await assert.rejects(
-    verifyLocalReleaseCandidate(candidate, "recovery-actor"),
-    /does not match expected recovery-actor/,
-  );
-
   const invalidRuntime = releaseManifest("lead-agent", "runtime-missing", payload);
   invalidRuntime.runtime.path = "missing/node.exe";
   assert.throws(() => parseLocalReleaseManifest(JSON.stringify(invalidRuntime)), /must reference a listed file/);

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -16,97 +16,88 @@ import {
   type LocalLeadHostClient,
 } from "../local-host/index.ts";
 import {
-  openRecoveryActor,
-  type ActivationEffects,
-  type CodeStatePair,
-  type RecoveryActor,
-  type RecoveryActorIdentity,
-} from "../recovery-actor/index.ts";
-import {
   createAuthoritativeStateSnapshot,
+  restoreAuthoritativeStateSnapshot,
   type AuthoritativeStateSnapshot,
 } from "../state-snapshot/index.ts";
-import type {
-  WindowsSupervisionInspection,
-  WindowsTaskSchedulerSupervision,
-} from "../windows-supervision/index.ts";
-import { ensureWriteGenerationSchema } from "../write-generation.ts";
+import {
+  advanceWriteGeneration,
+  ensureWriteGenerationSchema,
+  readWriteGenerationHighWater,
+} from "../write-generation.ts";
 
-export type LocalInstallationStatus =
-  | "not-installed"
-  | "prepared"
-  | "installed"
-  | "registration-failed"
-  | "uninstalled";
+export type CodeStatePair = {
+  code: {
+    revision: string;
+    digest: string;
+    path: string;
+    runtime: { version: string; architecture: string };
+  };
+  state: {
+    revision: string;
+    digest: string;
+    snapshotPath: string;
+  };
+};
+
+export type LocalInstallationStatus = "not-installed" | "installed" | "uninstalled";
 
 export type LocalInstallationPaths = {
   root: string;
   leadAgentVersions: string;
-  protectedRecoveryActorVersions: string;
   launcher: string;
   state: string;
   recovery: string;
   snapshots: string;
   failedEvidence: string;
   journal: string;
-  activationJournal: string;
   lifecycleJournal: string;
 };
 
-export type LocalInstallationSupervision = Pick<
-  WindowsTaskSchedulerSupervision,
-  "register" | "verify" | "inspect" | "start" | "stop" | "unregister"
->;
-
 export type InitialInstallInput = {
-  recoveryActorCandidateDirectory: string;
   leadAgentCandidateDirectory: string;
   stateRevision: string;
   stateProvenance: string;
 };
-
-type RecoveryActivationInput = Parameters<RecoveryActor["activate"]>[0];
 
 export type OwnerUpgradeInput = {
   leadAgentCandidateDirectory: string;
   stateRevision: string;
   stateProvenance: string;
-  activation: Omit<RecoveryActivationInput, "candidate" | "baseline">;
 };
 
 export type LocalInstallationInspection = {
   status: LocalInstallationStatus;
   stopRequested: boolean;
-  stopped: boolean;
+  hostRunning: boolean;
   paths: LocalInstallationPaths;
   hostAddress: string;
-  actor?: RecoveryActorIdentity;
   active?: CodeStatePair;
-  recoveryBaseline?: CodeStatePair;
-  writeGeneration?: number;
-  currentAttempt?: ReturnType<RecoveryActor["inspect"]>["currentAttempt"];
-  leadRestartBudget?: ReturnType<RecoveryActor["inspect"]>["leadRestartBudget"];
+  previous?: CodeStatePair;
   currentOperation?: StoredLifecycle["operation"];
-  supervision?: WindowsSupervisionInspection;
 };
 
 export type LocalInstallationOptions = {
   installationRoot: string;
-  supervision: LocalInstallationSupervision;
-  activationEffects: ActivationEffects;
+  // The host runner is spawned detached from the active bundle; tests inject a fake.
+  spawnHost?: (active: CodeStatePair, paths: LocalInstallationPaths) => Promise<void>;
   connectHost?: (address: string) => Promise<LocalLeadHostClient>;
-  requestStop?: (address: string) => Promise<void>;
+  probeHost?: (address: string) => Promise<boolean>;
 };
 
 export interface LocalInstallation {
   initialInstall(input: InitialInstallInput): Promise<LocalInstallationInspection>;
   upgrade(input: OwnerUpgradeInput): Promise<{
-    attemptId: string;
-    outcome: "activated" | "rolled-back";
-    candidate: CodeStatePair;
+    outcome: "activated";
+    active: CodeStatePair;
+    previous: CodeStatePair;
     snapshot: AuthoritativeStateSnapshot;
   }>;
-  recover(): Promise<LocalInstallationInspection>;
+  rollback(): Promise<{
+    outcome: "rolled-back";
+    active: CodeStatePair;
+    restoredWriteGeneration: number;
+  }>;
   inspect(): Promise<LocalInstallationInspection>;
   start(): Promise<LocalLeadHostClient>;
   stop(): Promise<void>;
@@ -116,22 +107,26 @@ export interface LocalInstallation {
 type StoredLifecycle = {
   status: Exclude<LocalInstallationStatus, "not-installed">;
   stopRequested: boolean;
-  stopped: boolean;
-  actor: RecoveryActorIdentity;
+  active: CodeStatePair;
+  previous?: CodeStatePair;
   operation?: {
     id: string;
-    kind: Exclude<LifecycleOperation, "install" | "inspect">;
+    kind: LifecycleOperation;
     pid: number;
     startedAt: string;
   };
 };
 
-type LifecycleOperation = "install" | "inspect" | "start" | "stop" | "upgrade" | "uninstall";
+type LifecycleOperation = "install" | "start" | "stop" | "upgrade" | "rollback" | "uninstall";
+
+type ClaimedLifecycle = StoredLifecycle & {
+  operation: NonNullable<StoredLifecycle["operation"]>;
+};
 
 export class LocalInstallationError extends Error {
-  readonly operation: LifecycleOperation;
+  readonly operation: LifecycleOperation | "inspect";
 
-  constructor(operation: LifecycleOperation, message: string, cause?: unknown) {
+  constructor(operation: LifecycleOperation | "inspect", message: string, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "LocalInstallationError";
     this.operation = operation;
@@ -145,14 +140,12 @@ export function localInstallationPaths(installationRoot: string): LocalInstallat
   return {
     root,
     leadAgentVersions: join(root, "versions"),
-    protectedRecoveryActorVersions: join(root, "protected", "recovery-actor"),
     launcher: join(root, "launcher"),
     state: join(root, "state"),
     recovery,
     snapshots: join(recovery, "snapshots"),
     failedEvidence: join(recovery, "failed-evidence"),
     journal,
-    activationJournal: join(journal, "activation-journal.sqlite"),
     lifecycleJournal: join(journal, "installation-lifecycle.sqlite"),
   };
 }
@@ -160,27 +153,30 @@ export function localInstallationPaths(installationRoot: string): LocalInstallat
 export function createLocalInstallation(options: LocalInstallationOptions): LocalInstallation {
   const paths = localInstallationPaths(options.installationRoot);
   const hostAddress = localLeadHostAddress(paths.root);
-  const connectHost = options.connectHost ?? connectLocalLeadHost;
-
-  const withActor = async <T>(
-    identity: RecoveryActorIdentity,
-    operation: (actor: RecoveryActor) => Promise<T> | T,
-  ): Promise<T> => {
-    const actor = openRecoveryActor(paths.journal, identity, options.activationEffects);
+  const connectHost = options.connectHost ?? ((address) => connectWithRetry(address, 10_000));
+  const probeHost = options.probeHost ?? (async (address) => {
     try {
-      return await operation(actor);
-    } finally {
-      actor.close();
+      const client = await connectLocalLeadHost(address);
+      await client.detach();
+      return true;
+    } catch {
+      return false;
     }
-  };
-
-  const requireInstalled = (): StoredLifecycle => {
-    const lifecycle = readLifecycle(paths.lifecycleJournal);
-    if (lifecycle?.status !== "installed") {
-      throw new Error("Local installation is not installed.");
-    }
-    return lifecycle;
-  };
+  });
+  const spawnHost = options.spawnHost ?? (async (active) => {
+    const release = await verifyLocalReleaseCandidate(active.code.path, "lead-agent");
+    const child = spawn(
+      release.runtime.path,
+      [
+        join(active.code.path, "dist", "lifecycle-cli.js"),
+        "host",
+        "--install-root",
+        paths.root,
+      ],
+      { detached: true, stdio: "ignore", windowsHide: true },
+    );
+    child.unref();
+  });
 
   const inspect = async (): Promise<LocalInstallationInspection> => {
     try {
@@ -189,24 +185,20 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
         return {
           status: "not-installed",
           stopRequested: false,
-          stopped: false,
+          hostRunning: false,
           paths,
           hostAddress,
         };
       }
-      const actorInspection = await withActor(lifecycle.actor, (actor) => actor.inspect());
-      const supervision = lifecycle.status === "installed"
-        ? await options.supervision.inspect()
-        : undefined;
       return {
         status: lifecycle.status,
         stopRequested: lifecycle.stopRequested,
-        stopped: lifecycle.stopped,
+        hostRunning: lifecycle.status === "installed" && await probeHost(hostAddress),
         ...(lifecycle.operation ? { currentOperation: lifecycle.operation } : {}),
         paths,
         hostAddress,
-        ...actorInspection,
-        ...(supervision ? { supervision } : {}),
+        active: lifecycle.active,
+        ...(lifecycle.previous ? { previous: lifecycle.previous } : {}),
       };
     } catch (error) {
       if (error instanceof LocalInstallationError) throw error;
@@ -214,340 +206,229 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
     }
   };
 
-  const stopInstalledLifecycle = async (lifecycle: StoredLifecycle): Promise<void> => {
-    if (lifecycle.stopped) return;
-    if (!lifecycle.stopRequested) {
-      writeLifecycle(paths.lifecycleJournal, {
-        ...lifecycle,
-        stopRequested: true,
-        stopped: false,
-      });
-      try {
-        if (options.requestStop) {
-          await options.requestStop(hostAddress);
-        } else {
-          const client = await connectHost(hostAddress);
-          await client.stop();
-        }
-      } catch {
-        // The durable stop intent remains authoritative; scheduler termination still fences restarts.
-      }
+  const connectForStop = options.connectHost ??
+    (async (address: string) => connectLocalLeadHost(address));
+  const stopHost = async (lifecycle: StoredLifecycle): Promise<void> => {
+    writeLifecycle(paths.lifecycleJournal, { ...lifecycle, stopRequested: true });
+    try {
+      const client = await connectForStop(hostAddress);
+      await client.stop();
+    } catch {
+      // No reachable host means it is already down; the durable stop intent
+      // keeps the host runner from restarting a straggler.
     }
-    await options.supervision.stop();
-    writeLifecycle(paths.lifecycleJournal, {
-      ...lifecycle,
-      stopRequested: true,
-      stopped: true,
-    });
+    await hostGone(probeHost, hostAddress, 10_000);
   };
 
-  const stop = async (): Promise<void> => {
-    let operation: StoredLifecycle["operation"];
+  const startHost = async (lifecycle: StoredLifecycle): Promise<LocalLeadHostClient> => {
+    writeLifecycle(paths.lifecycleJournal, { ...lifecycle, stopRequested: false });
+    if (!(await probeHost(hostAddress))) {
+      await spawnHost(lifecycle.active, paths);
+    }
+    return connectHost(hostAddress);
+  };
+
+  const withOperation = async <T>(
+    kind: LifecycleOperation,
+    operation: (lifecycle: ClaimedLifecycle) => Promise<T>,
+  ): Promise<T> => {
+    releaseAbandonedOperation(paths.lifecycleJournal);
+    const lifecycle = claimLifecycleOperation(paths.lifecycleJournal, kind);
     try {
-      const lifecycle = claimLifecycleOperation(paths.lifecycleJournal, "stop");
-      operation = lifecycle.operation;
-      await stopInstalledLifecycle(lifecycle);
+      return await operation(lifecycle);
     } catch (error) {
       if (error instanceof LocalInstallationError) throw error;
       throw new LocalInstallationError(
-        "stop",
-        "Local installation stop failed before scheduler shutdown completed.",
+        kind,
+        `Local installation ${kind} failed: ${error instanceof Error ? error.message : String(error)}`,
         error,
       );
     } finally {
-      if (operation) releaseLifecycleOperation(paths.lifecycleJournal, operation.id);
+      releaseLifecycleOperation(paths.lifecycleJournal, lifecycle.operation.id);
     }
   };
 
   return {
     async initialInstall(input) {
-      let existing: StoredLifecycle | undefined;
       try {
-        existing = readLifecycle(paths.lifecycleJournal);
-      } catch (error) {
-        throw new LocalInstallationError(
-          "install",
-          "Local installation lifecycle journal could not be read.",
-          error,
-        );
-      }
-      if (existing?.status === "installed") {
-        throw new LocalInstallationError("install", "Local installation is already installed.");
-      }
-
-      try {
-        const actorRelease = await stageLocalRelease(
-          input.recoveryActorCandidateDirectory,
-          paths.protectedRecoveryActorVersions,
-          "recovery-actor",
-        );
-        const leadRelease = await stageLocalRelease(
-          input.leadAgentCandidateDirectory,
-          paths.leadAgentVersions,
-          "lead-agent",
-        );
-        const actorIdentity = releaseActorIdentity(actorRelease);
-
-        await mkdir(paths.state, { recursive: true });
-        await mkdir(paths.snapshots, { recursive: true });
-        await mkdir(paths.failedEvidence, { recursive: true });
-        ensureInitialState(paths.state);
-
-        await withActor(actorIdentity, async (actor) => {
-          const initialized = actor.inspect();
-          if (initialized.actor) {
-            requireSameInitialIdentity(initialized, actorIdentity, leadRelease, input.stateRevision);
-            return;
-          }
-          const snapshot = await createAuthoritativeStateSnapshot({
-            stateDirectory: paths.state,
-            recoveryDirectory: paths.snapshots,
-            revision: input.stateRevision,
-            provenance: input.stateProvenance,
-          });
-          const initialPair = releaseStatePair(leadRelease, snapshot);
-          actor.initialize({
-            active: initialPair,
-            recoveryBaseline: initialPair,
-            writeGeneration: snapshot.writeGeneration,
-          });
-        });
-
-        writeLifecycle(paths.lifecycleJournal, {
-          status: "prepared",
-          stopRequested: false,
-          stopped: true,
-          actor: actorIdentity,
-        });
-        await writeLauncherManifest(paths, hostAddress, actorRelease, leadRelease);
-      } catch (error) {
-        if (error instanceof LocalInstallationError) throw error;
-        throw new LocalInstallationError("install", "Local installation preparation failed.", error);
-      }
-
-      const prepared = readLifecycle(paths.lifecycleJournal);
-      if (!prepared) {
-        throw new LocalInstallationError("install", "Local installation preparation was not recorded.");
-      }
-      try {
-        await options.supervision.register();
-        await options.supervision.verify();
-        writeLifecycle(paths.lifecycleJournal, {
-          ...prepared,
-          status: "installed",
-          stopRequested: false,
-          stopped: true,
-        });
-      } catch (registrationError) {
-        let rollbackError: unknown;
-        try {
-          await options.supervision.unregister();
-        } catch (error) {
-          rollbackError = error;
+        const existing = readLifecycle(paths.lifecycleJournal);
+        if (existing?.status === "installed") {
+          throw new Error("Local installation is already installed.");
         }
-        writeLifecycle(paths.lifecycleJournal, {
-          ...prepared,
-          status: "registration-failed",
-          stopRequested: true,
-          stopped: rollbackError === undefined,
-        });
-        const cause = rollbackError === undefined
-          ? registrationError
-          : new AggregateError(
-              [registrationError, rollbackError],
-              "Scheduler registration and rollback both failed.",
-            );
-        throw new LocalInstallationError(
-          "install",
-          "Local installation scheduler registration failed and was rolled back.",
-          cause,
-        );
-      }
-      return inspect();
-    },
-
-    async upgrade(input) {
-      let operation: StoredLifecycle["operation"];
-      let stoppedForUpgrade = false;
-      let snapshot: AuthoritativeStateSnapshot | undefined;
-      let candidate: CodeStatePair | undefined;
-      try {
-        const lifecycle = claimLifecycleOperation(paths.lifecycleJournal, "upgrade");
-        operation = lifecycle.operation;
         const release = await stageLocalRelease(
           input.leadAgentCandidateDirectory,
           paths.leadAgentVersions,
           "lead-agent",
         );
-        if (resolve(release.path) === resolve(lifecycle.actor.path)) {
-          throw new Error("An Owner-supplied candidate cannot target the protected Recovery Actor.");
-        }
-        const result = await withActor(lifecycle.actor, async (actor) => {
-          const current = actor.inspect();
-          if (!current.active || !current.recoveryBaseline || current.writeGeneration === undefined) {
-            throw new Error("Recovery Actor has no exact active code-and-state identity.");
-          }
-          const wasRunning = !lifecycle.stopped;
-          await stopInstalledLifecycle(lifecycle);
-          stoppedForUpgrade = wasRunning;
-          snapshot = await createAuthoritativeStateSnapshot({
-            stateDirectory: paths.state,
-            recoveryDirectory: paths.snapshots,
-            revision: input.stateRevision,
-            provenance: input.stateProvenance,
-          });
-          candidate = releaseStatePair(release, snapshot);
-          if (snapshot.writeGeneration !== current.writeGeneration) {
-            throw new Error(
-              "Owner upgrade snapshot write generation does not match the active Recovery Actor generation.",
-            );
-          }
-          const baseline: CodeStatePair = {
-            code: current.recoveryBaseline.code,
-            state: candidate.state,
-          };
-          writeLifecycle(paths.lifecycleJournal, {
-            ...lifecycle,
-            stopRequested: false,
-            stopped: false,
-          });
-          await options.supervision.start();
-          stoppedForUpgrade = false;
-          return actor.activate({ ...input.activation, candidate, baseline });
+        await mkdir(paths.state, { recursive: true });
+        await mkdir(paths.snapshots, { recursive: true });
+        await mkdir(paths.failedEvidence, { recursive: true });
+        await mkdir(paths.journal, { recursive: true });
+        ensureInitialState(paths.state);
+        const snapshot = await createAuthoritativeStateSnapshot({
+          stateDirectory: paths.state,
+          recoveryDirectory: paths.snapshots,
+          revision: input.stateRevision,
+          provenance: input.stateProvenance,
         });
-        if (!candidate || !snapshot) throw new Error("Owner upgrade did not establish its exact candidate pair.");
-        if (result.outcome === "activated") {
-          const actorRelease = await verifyLocalReleaseCandidate(
-            lifecycle.actor.path,
-            "recovery-actor",
-          );
-          await writeLauncherManifest(paths, hostAddress, actorRelease, release);
-        }
-        return { ...result, candidate, snapshot };
+        const active = releaseStatePair(release, snapshot);
+        writeLifecycle(paths.lifecycleJournal, {
+          status: "installed",
+          stopRequested: true,
+          active,
+        });
+        await writeLauncherManifest(paths, hostAddress, release);
+        return await inspect();
       } catch (error) {
-        if (stoppedForUpgrade) {
-          const current = readLifecycle(paths.lifecycleJournal);
-          if (current?.status === "installed") {
-            writeLifecycle(paths.lifecycleJournal, {
-              ...current,
-              stopRequested: false,
-              stopped: false,
-            });
-            await options.supervision.start();
-          }
-        }
         if (error instanceof LocalInstallationError) throw error;
-        throw new LocalInstallationError("upgrade", "Owner-supplied upgrade failed.", error);
-      } finally {
-        if (operation) releaseLifecycleOperation(paths.lifecycleJournal, operation.id);
-      }
-    },
-
-    async recover() {
-      try {
-        const lifecycle = requireInstalled();
-        if (!lifecycle.operation) return inspect();
-        if (lifecycle.operation.kind === "upgrade") {
-          if (processMatches(lifecycle.operation.pid, lifecycle.operation.startedAt)) {
-            return inspect();
-          }
-          await withActor(lifecycle.actor, (actor) => actor.recover());
-          releaseLifecycleOperation(paths.lifecycleJournal, lifecycle.operation.id);
-        } else if (lifecycle.operation.kind === "start") {
-          releaseLifecycleOperation(paths.lifecycleJournal, lifecycle.operation.id);
-        } else if (lifecycle.operation.kind === "stop" && lifecycle.stopped) {
-          releaseLifecycleOperation(paths.lifecycleJournal, lifecycle.operation.id);
-        }
-        return inspect();
-      } catch (error) {
         throw new LocalInstallationError(
-          "inspect",
-          "Local installation lifecycle recovery failed.",
+          "install",
+          `Local installation failed: ${error instanceof Error ? error.message : String(error)}`,
           error,
         );
       }
+    },
+
+    async upgrade(input) {
+      return withOperation("upgrade", async (lifecycle) => {
+        const release = await stageLocalRelease(
+          input.leadAgentCandidateDirectory,
+          paths.leadAgentVersions,
+          "lead-agent",
+        );
+        await stopHost(lifecycle);
+        const snapshot = await createAuthoritativeStateSnapshot({
+          stateDirectory: paths.state,
+          recoveryDirectory: paths.snapshots,
+          revision: input.stateRevision,
+          provenance: input.stateProvenance,
+        });
+        // Advancing the generation fences any straggler host of the old version.
+        advanceWriteGeneration(paths.state, snapshot.writeGeneration);
+        const active = releaseStatePair(release, snapshot);
+        // Rollback returns to the previous code with the state as it was right
+        // before this cutover, so the pair shares the fresh snapshot.
+        const previous: CodeStatePair = { code: lifecycle.active.code, state: active.state };
+        const updated: StoredLifecycle = {
+          status: "installed",
+          stopRequested: true,
+          active,
+          previous,
+          operation: lifecycle.operation,
+        };
+        writeLifecycle(paths.lifecycleJournal, updated);
+        await writeLauncherManifest(paths, hostAddress, release);
+        return {
+          outcome: "activated" as const,
+          active,
+          previous,
+          snapshot,
+        };
+      });
+    },
+
+    async rollback() {
+      return withOperation("rollback", async (lifecycle) => {
+        const previous = lifecycle.previous;
+        if (!previous) throw new Error("No previous version is available to roll back to.");
+        await verifyLocalReleaseCandidate(previous.code.path, "lead-agent");
+        await stopHost(lifecycle);
+        const failedGeneration = readGeneration(paths.state);
+        const freshWriteGeneration = Math.max(
+          failedGeneration,
+          readWriteGenerationHighWater(paths.state) ?? 0,
+        ) + 1;
+        const evidenceDirectory = join(
+          paths.failedEvidence,
+          `generation-${failedGeneration}-${previous.state.digest.slice(0, 16)}`,
+        );
+        await mkdir(evidenceDirectory, { recursive: true });
+        await restoreAuthoritativeStateSnapshot({
+          stateDirectory: paths.state,
+          evidenceDirectory,
+          snapshot: {
+            revision: previous.state.revision,
+            digest: previous.state.digest,
+            path: previous.state.snapshotPath,
+            writeGeneration: readSnapshotGeneration(previous.state.snapshotPath),
+            provenance: `Rollback to ${previous.code.revision}`,
+          },
+          expectedDigest: previous.state.digest,
+          failedWriteGeneration: failedGeneration,
+          freshWriteGeneration,
+        });
+        const updated: StoredLifecycle = {
+          status: "installed",
+          stopRequested: true,
+          active: previous,
+          previous: lifecycle.active,
+          operation: lifecycle.operation,
+        };
+        writeLifecycle(paths.lifecycleJournal, updated);
+        const release = await verifyLocalReleaseCandidate(previous.code.path, "lead-agent");
+        await writeLauncherManifest(paths, hostAddress, release);
+        return {
+          outcome: "rolled-back" as const,
+          active: previous,
+          restoredWriteGeneration: freshWriteGeneration,
+        };
+      });
     },
 
     inspect,
 
     async start() {
-      let lifecycle: StoredLifecycle | undefined;
-      let startedFromStopped = false;
-      let operation: StoredLifecycle["operation"];
-      try {
-        releaseAbandonedOperationForStart(paths.lifecycleJournal);
-        lifecycle = claimLifecycleOperation(paths.lifecycleJournal, "start");
-        operation = lifecycle.operation;
-        startedFromStopped = lifecycle.stopped;
-        if (lifecycle.stopped) {
-          await withActor(lifecycle.actor, (actor) => actor.resetLeadRestartBudget(3));
-        }
-        writeLifecycle(paths.lifecycleJournal, {
-          ...lifecycle,
-          stopRequested: false,
-          stopped: false,
-        });
-        await options.supervision.start();
-        return await connectHost(hostAddress);
-      } catch (error) {
-        if (lifecycle && startedFromStopped) {
-          try {
-            await options.supervision.stop();
-          } catch {
-            // Preserve the original start failure; inspection still reports the safe stopped intent.
-          }
-          writeLifecycle(paths.lifecycleJournal, {
-            ...lifecycle,
-            stopRequested: true,
-            stopped: true,
-          });
-        }
-        if (error instanceof LocalInstallationError) throw error;
-        throw new LocalInstallationError("start", "Local installation start or attachment failed.", error);
-      } finally {
-        if (operation) releaseLifecycleOperation(paths.lifecycleJournal, operation.id);
-      }
+      return withOperation("start", (lifecycle) => startHost(lifecycle));
     },
 
-    stop,
+    async stop() {
+      return withOperation("stop", (lifecycle) => stopHost(lifecycle));
+    },
 
     async uninstall() {
-      let operation: StoredLifecycle["operation"];
-      try {
-        let lifecycle = requireInstalled();
-        if (!lifecycle.stopped) await stop();
-        lifecycle = claimLifecycleOperation(paths.lifecycleJournal, "uninstall");
-        operation = lifecycle.operation;
-        await options.supervision.unregister();
+      return withOperation("uninstall", async (lifecycle) => {
+        await stopHost(lifecycle);
         await rm(paths.leadAgentVersions, { recursive: true, force: true });
-        await rm(join(paths.root, "protected"), { recursive: true, force: true });
         await rm(paths.launcher, { recursive: true, force: true });
+        await rm(join(paths.root, "protected"), { recursive: true, force: true });
         writeLifecycle(paths.lifecycleJournal, {
           ...lifecycle,
           status: "uninstalled",
           stopRequested: true,
-          stopped: true,
         });
-      } catch (error) {
-        if (error instanceof LocalInstallationError && error.operation === "uninstall") throw error;
-        throw new LocalInstallationError(
-          "uninstall",
-          "Local installation uninstall failed; preserved data was not removed.",
-          error,
-        );
-      } finally {
-        if (operation) releaseLifecycleOperation(paths.lifecycleJournal, operation.id);
-      }
+      });
     },
   };
 }
 
-function releaseActorIdentity(release: VerifiedLocalRelease): RecoveryActorIdentity {
-  return {
-    revision: release.identity.revision,
-    digest: release.identity.digest,
-    path: release.path,
-  };
+export async function connectWithRetry(
+  address: string,
+  timeoutMs: number,
+): Promise<LocalLeadHostClient> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      return await connectLocalLeadHost(address);
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    }
+  }
+  throw new Error("Timed out waiting for the Lead Agent host.", { cause: lastError });
+}
+
+async function hostGone(
+  probeHost: (address: string) => Promise<boolean>,
+  address: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await probeHost(address))) return;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  throw new Error("The Lead Agent host did not release its address after the stop request.");
 }
 
 function releaseStatePair(
@@ -572,24 +453,6 @@ function releaseStatePair(
   };
 }
 
-function requireSameInitialIdentity(
-  initialized: ReturnType<RecoveryActor["inspect"]>,
-  actor: RecoveryActorIdentity,
-  leadRelease: VerifiedLocalRelease,
-  stateRevision: string,
-): void {
-  if (
-    initialized.actor?.revision !== actor.revision ||
-    initialized.actor.digest !== actor.digest ||
-    resolve(initialized.actor.path) !== resolve(actor.path) ||
-    initialized.active?.code.revision !== leadRelease.identity.revision ||
-    initialized.active.code.digest !== leadRelease.identity.digest ||
-    initialized.active.state.revision !== stateRevision
-  ) {
-    throw new Error("Existing Recovery Actor initialization does not match this installation request.");
-  }
-}
-
 function ensureInitialState(stateDirectory: string): void {
   const database = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"));
   try {
@@ -600,37 +463,53 @@ function ensureInitialState(stateDirectory: string): void {
   }
 }
 
+export function readGeneration(stateDirectory: string): number {
+  const database = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"), {
+    readOnly: true,
+  });
+  try {
+    return (database
+      .prepare("SELECT write_generation FROM lifecycle_metadata WHERE singleton = 1")
+      .get() as { write_generation: number }).write_generation;
+  } finally {
+    database.close();
+  }
+}
+
+function readSnapshotGeneration(path: string): number {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return (database
+      .prepare("SELECT write_generation FROM lifecycle_metadata WHERE singleton = 1")
+      .get() as { write_generation: number }).write_generation;
+  } finally {
+    database.close();
+  }
+}
+
 async function writeLauncherManifest(
   paths: LocalInstallationPaths,
   hostAddress: string,
-  actor: VerifiedLocalRelease,
   leadAgent: VerifiedLocalRelease,
 ): Promise<void> {
   await mkdir(paths.launcher, { recursive: true });
-  const ownerLauncherRelativePath = "dist/owner-launcher.js";
-  if (!leadAgent.manifest.files.some((file) => file.path === ownerLauncherRelativePath)) {
-    throw new Error("The Lead Agent release does not contain its Owner launcher.");
+  for (const required of ["dist/owner-launcher.js", "dist/owner-client.js", "dist/lifecycle-cli.js"]) {
+    if (!leadAgent.manifest.files.some((file) => file.path === required)) {
+      throw new Error(`The Lead Agent release does not contain ${required}.`);
+    }
   }
-  const installedOwnerLauncherPath = join(
-    leadAgent.path,
-    ...ownerLauncherRelativePath.split("/"),
-  );
   await writeFile(
     join(paths.launcher, "installation.json"),
     `${JSON.stringify({
-      formatVersion: 1,
+      formatVersion: 2,
       hostAddress,
-      actor: {
-        identity: actor.identity,
-        path: actor.path,
-        entrypointPath: actor.entrypointPath,
-        runtimePath: actor.runtime.path,
-      },
       leadAgent: {
         identity: leadAgent.identity,
         path: leadAgent.path,
         entrypointPath: leadAgent.entrypointPath,
         runtimePath: leadAgent.runtime.path,
+        lifecyclePath: join(leadAgent.path, "dist", "lifecycle-cli.js"),
+        ownerClientPath: join(leadAgent.path, "dist", "owner-client.js"),
       },
       stateDirectory: paths.state,
       recoveryDirectory: paths.recovery,
@@ -640,42 +519,48 @@ async function writeLauncherManifest(
   );
   await writeFile(
     join(paths.launcher, "riker.cmd"),
-    `@echo off\r\n"${actor.runtime.path}" "${installedOwnerLauncherPath}" --install-root "${paths.root}" %*\r\n`,
+    `@echo off\r\n"${leadAgent.runtime.path}" "${join(leadAgent.path, "dist", "owner-launcher.js")}" --install-root "${paths.root}" %*\r\n`,
     "utf8",
   );
 }
 
-function readLifecycle(path: string): StoredLifecycle | undefined {
+export function readLifecycle(path: string): StoredLifecycle | undefined {
   if (!existsSync(path)) return undefined;
   const database = openLifecycleDatabase(path);
   try {
-    const row = database
-      .prepare(`
-        SELECT status, stop_requested, stopped, actor_json, operation_json
-          FROM local_installation
-         WHERE singleton = 1
-      `)
-      .get() as {
-        status: StoredLifecycle["status"];
-        stop_requested: number;
-        stopped: number;
-        actor_json: string;
-        operation_json: string | null;
-      } | undefined;
-    return row
-      ? {
-          status: row.status,
-          stopRequested: row.stop_requested === 1,
-          stopped: row.stopped === 1,
-          actor: JSON.parse(row.actor_json) as RecoveryActorIdentity,
-          ...(row.operation_json
-            ? { operation: JSON.parse(row.operation_json) as NonNullable<StoredLifecycle["operation"]> }
-            : {}),
-        }
-      : undefined;
+    return readLifecycleRow(database);
   } finally {
     database.close();
   }
+}
+
+function readLifecycleRow(database: DatabaseSync): StoredLifecycle | undefined {
+  const row = database
+    .prepare(`
+      SELECT status, stop_requested, active_json, previous_json, operation_json
+        FROM local_lifecycle_v2
+       WHERE singleton = 1
+    `)
+    .get() as {
+      status: StoredLifecycle["status"];
+      stop_requested: number;
+      active_json: string;
+      previous_json: string | null;
+      operation_json: string | null;
+    } | undefined;
+  return row
+    ? {
+        status: row.status,
+        stopRequested: row.stop_requested === 1,
+        active: JSON.parse(row.active_json) as CodeStatePair,
+        ...(row.previous_json
+          ? { previous: JSON.parse(row.previous_json) as CodeStatePair }
+          : {}),
+        ...(row.operation_json
+          ? { operation: JSON.parse(row.operation_json) as NonNullable<StoredLifecycle["operation"]> }
+          : {}),
+      }
+    : undefined;
 }
 
 function writeLifecycle(path: string, lifecycle: StoredLifecycle): void {
@@ -683,22 +568,22 @@ function writeLifecycle(path: string, lifecycle: StoredLifecycle): void {
   try {
     database
       .prepare(`
-        INSERT INTO local_installation (
-          singleton, status, stop_requested, stopped, actor_json, operation_json, updated_at
+        INSERT INTO local_lifecycle_v2 (
+          singleton, status, stop_requested, active_json, previous_json, operation_json, updated_at
         ) VALUES (1, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(singleton) DO UPDATE SET
           status = excluded.status,
           stop_requested = excluded.stop_requested,
-          stopped = excluded.stopped,
-          actor_json = excluded.actor_json,
+          active_json = excluded.active_json,
+          previous_json = excluded.previous_json,
           operation_json = excluded.operation_json,
           updated_at = excluded.updated_at
       `)
       .run(
         lifecycle.status,
         lifecycle.stopRequested ? 1 : 0,
-        lifecycle.stopped ? 1 : 0,
-        JSON.stringify(lifecycle.actor),
+        JSON.stringify(lifecycle.active),
+        lifecycle.previous ? JSON.stringify(lifecycle.previous) : null,
         lifecycle.operation ? JSON.stringify(lifecycle.operation) : null,
         new Date().toISOString(),
       );
@@ -709,22 +594,18 @@ function writeLifecycle(path: string, lifecycle: StoredLifecycle): void {
 
 function openLifecycleDatabase(path: string): DatabaseSync {
   const directory = dirname(path);
-  const database = (() => {
-    // DatabaseSync cannot create its parent directory.
-    if (!existsSync(directory)) throw new Error("Local installation journal directory is missing.");
-    return new DatabaseSync(path);
-  })();
+  // DatabaseSync cannot create its parent directory.
+  if (!existsSync(directory)) throw new Error("Local installation journal directory is missing.");
+  const database = new DatabaseSync(path);
   database.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = FULL;
-    CREATE TABLE IF NOT EXISTS local_installation (
+    CREATE TABLE IF NOT EXISTS local_lifecycle_v2 (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      status TEXT NOT NULL CHECK (status IN (
-        'prepared', 'installed', 'registration-failed', 'uninstalled'
-      )),
+      status TEXT NOT NULL CHECK (status IN ('installed', 'uninstalled')),
       stop_requested INTEGER NOT NULL CHECK (stop_requested IN (0, 1)),
-      stopped INTEGER NOT NULL CHECK (stopped IN (0, 1)),
-      actor_json TEXT NOT NULL CHECK (json_valid(actor_json)),
+      active_json TEXT NOT NULL CHECK (json_valid(active_json)),
+      previous_json TEXT CHECK (previous_json IS NULL OR json_valid(previous_json)),
       operation_json TEXT CHECK (operation_json IS NULL OR json_valid(operation_json)),
       updated_at TEXT NOT NULL
     ) STRICT;
@@ -732,30 +613,18 @@ function openLifecycleDatabase(path: string): DatabaseSync {
   return database;
 }
 
-function claimLifecycleOperation(
-  path: string,
-  kind: NonNullable<StoredLifecycle["operation"]>["kind"],
-): StoredLifecycle {
+function claimLifecycleOperation(path: string, kind: LifecycleOperation): ClaimedLifecycle {
   const database = openLifecycleDatabase(path);
   database.exec("BEGIN IMMEDIATE");
   try {
-    const row = database
-      .prepare(`
-        SELECT status, stop_requested, stopped, actor_json, operation_json
-          FROM local_installation
-         WHERE singleton = 1
-      `)
-      .get() as {
-      status: StoredLifecycle["status"];
-      stop_requested: number;
-      stopped: number;
-      actor_json: string;
-      operation_json: string | null;
-    } | undefined;
-    if (!row || row.status !== "installed") throw new Error("Local installation is not installed.");
-    if (row.operation_json) {
-      const current = JSON.parse(row.operation_json) as NonNullable<StoredLifecycle["operation"]>;
-      throw new Error(`Local installation operation ${current.kind} is already in progress.`);
+    const lifecycle = readLifecycleRow(database);
+    if (!lifecycle || lifecycle.status !== "installed") {
+      throw new Error("Local installation is not installed.");
+    }
+    if (lifecycle.operation) {
+      throw new Error(
+        `Local installation operation ${lifecycle.operation.kind} is already in progress.`,
+      );
     }
     const operation = {
       id: randomUUID(),
@@ -764,16 +633,10 @@ function claimLifecycleOperation(
       startedAt: processStartedAt(process.pid) ?? new Date().toISOString(),
     };
     database
-      .prepare("UPDATE local_installation SET operation_json = ?, updated_at = ? WHERE singleton = 1")
+      .prepare("UPDATE local_lifecycle_v2 SET operation_json = ?, updated_at = ? WHERE singleton = 1")
       .run(JSON.stringify(operation), new Date().toISOString());
     database.exec("COMMIT");
-    return {
-      status: row.status,
-      stopRequested: row.stop_requested === 1,
-      stopped: row.stopped === 1,
-      actor: JSON.parse(row.actor_json) as RecoveryActorIdentity,
-      operation,
-    };
+    return { ...lifecycle, operation };
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -786,14 +649,14 @@ function releaseLifecycleOperation(path: string, operationId: string): void {
   const database = openLifecycleDatabase(path);
   try {
     const row = database
-      .prepare("SELECT operation_json FROM local_installation WHERE singleton = 1")
+      .prepare("SELECT operation_json FROM local_lifecycle_v2 WHERE singleton = 1")
       .get() as { operation_json: string | null } | undefined;
     if (!row?.operation_json) return;
     const operation = JSON.parse(row.operation_json) as NonNullable<StoredLifecycle["operation"]>;
     if (operation.id !== operationId) return;
     database
       .prepare(`
-        UPDATE local_installation
+        UPDATE local_lifecycle_v2
            SET operation_json = NULL, updated_at = ?
          WHERE singleton = 1 AND operation_json = ?
       `)
@@ -803,14 +666,10 @@ function releaseLifecycleOperation(path: string, operationId: string): void {
   }
 }
 
-function releaseAbandonedOperationForStart(path: string): void {
+function releaseAbandonedOperation(path: string): void {
   const lifecycle = readLifecycle(path);
   const operation = lifecycle?.operation;
-  if (
-    !operation ||
-    operation.kind === "uninstall" ||
-    processMatches(operation.pid, operation.startedAt)
-  ) return;
+  if (!operation || processMatches(operation.pid, operation.startedAt)) return;
   releaseLifecycleOperation(path, operation.id);
 }
 

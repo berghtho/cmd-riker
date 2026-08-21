@@ -20,8 +20,9 @@ npm test
 npm run build
 ```
 
-The build produces separate `dist/lead-agent` and `dist/recovery-actor` trees. The protected Recovery
-Actor uses only Node built-ins and stays outside the Lead Agent version it supervises.
+The build produces one `dist/lead-agent` tree containing the Lead Agent, the lifecycle CLI, and the
+Owner launcher and client. There is no separate guardian process; lifecycle insurance is versioned
+immutable installs, a one-command `rollback`, and the SQLite journal.
 
 ## Local Windows Installation
 
@@ -29,7 +30,7 @@ CMD Riker installs per Windows user from an Owner-supplied local build. It does 
 start at boot or logon, install a service, require `SYSTEM`, or depend on a machine-wide Node runtime
 after installation.
 
-Build immutable Lead Agent and Recovery Actor bundles with an official Node `24.16.0` or newer
+Build one immutable Lead Agent bundle with an official Node `24.16.0` or newer
 Node 24 runtime:
 
 ```powershell
@@ -40,23 +41,21 @@ npm run build:local-release -- `
   --node "C:\Program Files\nodejs\node.exe" `
   --lead-dist dist\lead-agent `
   --lead-node-modules node_modules `
-  --actor-dist dist\recovery-actor `
   --output release\riker-0.1.0-local.1
 ```
 
 The builder refuses an unsupported Node runtime, records the exact supplied version, hashes every
-final file, and emits strict separate manifests. The Lead Agent carries its runtime dependencies; the Recovery Actor bundle cannot contain
-Pi, Codex, or another non-built-in dependency.
+final file, and emits a strict manifest. The bundle carries its own pinned Node runtime and Pi
+dependencies.
 
-Prepare the secret-free configuration below, then install without starting the product:
+Prepare the secret-free configuration below, then install:
 
 ```powershell
 $release = Resolve-Path release\riker-0.1.0-local.1
 $install = "$env:LOCALAPPDATA\CMD Riker"
-& "$release\recovery-actor\runtime\node.exe" `
-  "$release\recovery-actor\dist\lifecycle-cli.js" install `
+& "$release\lead-agent\runtime\node.exe" `
+  "$release\lead-agent\dist\lifecycle-cli.js" install `
   --install-root $install `
-  --actor-bundle "$release\recovery-actor" `
   --lead-bundle "$release\lead-agent" `
   --config C:\path\to\config.json
 ```
@@ -66,25 +65,22 @@ $install = "$env:LOCALAPPDATA\CMD Riker"
 The installation is deliberately per-user and contained under `%LOCALAPPDATA%\CMD Riker`:
 
 - `launcher\riker.cmd` is the Owner-facing command. It opens Pi in the current terminal.
-- `launcher\supervise-hidden.vbs` starts the Recovery Actor without creating a console window.
 - `versions\` contains immutable Lead Agent releases, including their pinned Node runtime and Pi
   dependencies.
-- `protected\recovery-actor\` contains the separately versioned Recovery Actor and its pinned Node
-  runtime.
 - `state\` contains the authoritative SQLite state.
-- `recovery\` contains activation journals, snapshots, and failed-candidate evidence.
+- `recovery\` contains the lifecycle journal, snapshots, and failed-state evidence.
 
-Installation also registers the per-user Windows Task Scheduler entry
-`\CMD Riker\Recovery Actor`. It has no boot or logon trigger and does not run until CMD Riker is
-started. It is an on-demand singleton with four one-minute restart attempts. Its GUI script-host
-wrapper remains invisible while the Recovery Actor supervises the Lead Agent. It is not a Windows
-service, does not run as `SYSTEM`, and does not require administrator privileges.
+Nothing registers with Windows Task Scheduler and nothing starts at boot or logon. `riker start`
+spawns one detached host process from the active bundle; the host owns the singleton pipe, runs the
+Lead Agent, and restarts it on unexpected exits within a small budget before asking the Owner to
+`riker start` again or `riker rollback`. It is not a Windows service, does not run as `SYSTEM`, and
+does not require administrator privileges.
 
 The visible process chain is the current terminal, `riker.cmd`, and Pi. The background process chain
-is Windows Task Scheduler, `wscript.exe`, the Recovery Actor, and the hosted Lead Agent. The
-supervision layer does not hold provider credentials. Pi or a delegated native harness may access
-configured model providers and forges; their credentials remain in the provider-owned CLI or Pi
-credential store and are not copied into CMD Riker's SQLite state.
+is the detached host and the Lead Agent it runs. The lifecycle layer does not hold provider
+credentials. Pi or a delegated native harness may access configured model providers and forges;
+their credentials remain in the provider-owned CLI or Pi credential store and are not copied into
+CMD Riker's SQLite state.
 
 To make the command available as `riker`, explicitly add its launcher directory to the current
 user's `PATH`, then open a new terminal:
@@ -98,7 +94,7 @@ if (($userPath -split ";") -notcontains $launcher) {
 ```
 
 Running `riker` opens Pi as the single visible Owner interface and reconnects it to the same
-supervised Lead Agent. `stop` durably prevents new effects before supervision ends.
+hosted Lead Agent. `stop` durably prevents new effects before the host exits.
 
 ```powershell
 riker
@@ -111,34 +107,34 @@ Inside the `riker` terminal, `/items` lists every work item with a plain status 
 Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"
 — and the Lead persists the preference durably; nobody edits configuration files by hand.
 
-Upgrade from another trusted local Lead Agent bundle. Compatibility and independent Review evidence
-are explicit inputs:
+Upgrade from another trusted local Lead Agent bundle:
 
 ```powershell
 & "$install\launcher\riker.cmd" upgrade `
   --lead-bundle C:\path\to\next-release\lead-agent `
-  --state-revision before-riker-0.1.1 `
-  --compatibility-evidence "lossless migration and return path verified" `
-  --review-evidence "independent risk-focused review passed"
+  --state-revision before-riker-0.1.1
 ```
 
-The Activation Journal records exact actor, attempt, code, state, baseline, and write-generation
-identity before cutover. A failed or interrupted candidate restores the immediate SQLite-native
-baseline under a fresh generation; stale writers are fenced on every Authoritative State transaction.
-Successful activation does not automatically promote the Recovery Baseline.
+The upgrade stops the host, snapshots the SQLite state, advances the write generation so stale
+writers are fenced, records the previous code with that fresh snapshot in the lifecycle journal,
+and starts the new version. If the new version misbehaves, one command returns to the previous
+pair and restores its state snapshot under a fresh generation:
 
-Uninstall reaches a safe stop, unregisters `\CMD Riker\Recovery Actor`, and removes binaries and
-launcher material. It preserves Authoritative State, journals, snapshots, failed-state evidence,
-and unresolved attempts. Destructive state removal and removing the launcher directory from the
-user `PATH` are separate explicit Owner actions.
+```powershell
+& "$install\launcher\riker.cmd" rollback
+```
+
+Uninstall reaches a safe stop and removes binaries and launcher material. It preserves
+Authoritative State, the lifecycle journal, snapshots, and failed-state evidence. Destructive state
+removal and removing the launcher directory from the user `PATH` are separate explicit Owner
+actions.
 
 ```powershell
 & "$install\launcher\riker.cmd" uninstall
 ```
 
 Local bundles are trusted Owner inputs. Their hashes prove exact identity and detect changes; V1 does
-not claim publisher authenticity, remote acquisition, automatic updates, or Recovery Actor
-self-upgrade.
+not claim publisher authenticity, remote acquisition, or automatic updates.
 
 ## Owner Configuration
 
@@ -156,7 +152,7 @@ An uninitialized installation or development state directory requires a secret-f
   },
   "modelSelection": {
     "provider": "openai-codex",
-    "model": "gpt-5.4-mini",
+    "model": "gpt-5.6-luna",
     "api": "openai-codex-responses"
   },
   "modelFallbacks": [],

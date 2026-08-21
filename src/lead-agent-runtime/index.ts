@@ -250,7 +250,7 @@ async function completeOwnerTurn(input: {
                               verification: {
                                 operation: "test" as const,
                                 workingDirectory: conversation.targetProject.path,
-                                timeoutMs: 120_000,
+                                timeoutMs: 15 * 60_000,
                               },
                             });
                           },
@@ -315,7 +315,7 @@ async function completeOwnerTurn(input: {
               operation: { kind: operation, inputs: {} },
               checkout: conversation.targetProject.path,
               workingDirectory: conversation.targetProject.path,
-              timeoutMs: 120_000,
+              timeoutMs: 15 * 60_000,
             });
             orchestration.observeTargetProjectOperationResult(commitmentId, result);
             return result;

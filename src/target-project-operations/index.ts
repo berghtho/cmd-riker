@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { lstat, readFile, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -190,6 +191,7 @@ export interface TaskCli {
   }): Promise<{
     exitCode: number;
     timedOut: boolean;
+    outputTail?: string;
   }>;
 }
 
@@ -414,6 +416,13 @@ export function createTargetProjectOperations(
           ? "Task exceeded the operation deadline."
           : `Task exited with code ${execution.exitCode}.`,
       });
+      if (execution.exitCode !== 0 && execution.outputTail?.trim()) {
+        diagnostics.push({
+          source: "task-cli",
+          stream: "stdout",
+          message: execution.outputTail.trim(),
+        });
+      }
       if (hostDiagnostic) {
         diagnostics.push({ source: "task-cli", stream: "host", message: hostDiagnostic });
       }
@@ -681,20 +690,61 @@ async function artifactDigest(path: string): Promise<string | null> {
   return hash.digest("hex");
 }
 
+// Node refuses to start .cmd/.bat shims directly (EINVAL), and a bare command name
+// only resolves to an .exe. npm-installed CLIs (e.g. go-task via @go-task/cli) exist
+// solely as .cmd shims on PATH, so route those through ComSpec with a verbatim
+// command line; everything else runs unchanged.
+function resolveInvocation(
+  executable: string,
+  args: string[],
+): { file: string; args: string[]; windowsVerbatimArguments: boolean } {
+  if (process.platform !== "win32") return { file: executable, args, windowsVerbatimArguments: false };
+  const resolved = resolveWindowsExecutable(executable);
+  if (!/\.(cmd|bat)$/i.test(resolved)) {
+    return { file: resolved, args, windowsVerbatimArguments: false };
+  }
+  const quote = (value: string) => (/[\s"]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value);
+  const commandLine = [quote(resolved), ...args.map(quote)].join(" ");
+  return {
+    file: process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", `"${commandLine}"`],
+    windowsVerbatimArguments: true,
+  };
+}
+
+function resolveWindowsExecutable(executable: string): string {
+  if (/[\\/]/.test(executable) || /\.[a-z0-9]+$/i.test(executable)) return executable;
+  const pathValue = process.env.PATH ?? "";
+  for (const directory of pathValue.split(";")) {
+    if (!directory) continue;
+    for (const extension of [".exe", ".com", ".cmd", ".bat"]) {
+      const candidate = join(directory, executable + extension);
+      try {
+        if (existsSync(candidate)) return candidate;
+      } catch {
+        // Unreadable PATH entries must not abort resolution.
+      }
+    }
+  }
+  return executable;
+}
+
 function execute(
   executable: string,
   args: string[],
   cwd: string,
   timeoutMs: number,
 ): Promise<{ exitCode: number; stdout: string; stderr: string; timedOut: boolean }> {
+  const invocation = resolveInvocation(executable, args);
   return new Promise((resolveExecution, reject) => {
     execFile(
-      executable,
-      args,
+      invocation.file,
+      invocation.args,
       {
         cwd,
         timeout: timeoutMs,
         windowsHide: true,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         maxBuffer: 256 * 1024,
         env: safeChildEnvironment(),
       },
@@ -721,14 +771,25 @@ function executeTask(
   args: string[],
   cwd: string,
   timeoutMs: number,
-): Promise<{ exitCode: number; timedOut: boolean }> {
+): Promise<{ exitCode: number; timedOut: boolean; outputTail: string }> {
+  const invocation = resolveInvocation(executable, args);
   return new Promise((resolveExecution, reject) => {
-    const child = spawn(executable, args, {
+    const child = spawn(invocation.file, invocation.args, {
       cwd,
       windowsHide: true,
-      stdio: "ignore",
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      stdio: ["ignore", "pipe", "pipe"],
       env: safeChildEnvironment(),
     });
+    // A failed run whose output is discarded cannot be diagnosed from the durable
+    // record, so keep a bounded tail of the combined output.
+    const outputTailLimit = 8 * 1024;
+    let outputTail = "";
+    const observeOutput = (chunk: Buffer) => {
+      outputTail = (outputTail + chunk.toString("utf8")).slice(-outputTailLimit);
+    };
+    child.stdout?.on("data", observeOutput);
+    child.stderr?.on("data", observeOutput);
     let timedOut = false;
     let settled = false;
     let escalation: NodeJS.Timeout | undefined;
@@ -739,7 +800,7 @@ function executeTask(
       clearTimeout(timeout);
       if (escalation) clearTimeout(escalation);
       if (hardStop) clearTimeout(hardStop);
-      resolveExecution({ exitCode, timedOut });
+      resolveExecution({ exitCode, timedOut, outputTail });
     };
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -783,11 +844,23 @@ function terminateTaskProcess(pid: number | undefined, force: boolean): void {
 function safeChildEnvironment(): NodeJS.ProcessEnv {
   const names = process.platform === "win32"
     ? [
+        "ALLUSERSPROFILE",
         "APPDATA",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
         "ComSpec",
         "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
         "PATH",
         "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        // MSBuild/NuGet resolve SDK fallback folders from the ProgramFiles/ProgramData
+        // family; without them `dotnet test` dies with "Value cannot be null (path1)".
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
         "SystemDrive",
         "SystemRoot",
         "TEMP",

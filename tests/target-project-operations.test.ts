@@ -373,7 +373,7 @@ else writeFileSync(join(process.cwd(), "native-task-call.json"), JSON.stringify(
       task: "test",
       timeoutMs: 5_000,
     }),
-    { exitCode: 0, timedOut: false },
+    { exitCode: 0, timedOut: false, outputTail: "" },
   );
   const call = JSON.parse(await readFile(marker, "utf8")) as { args: string[]; secret: string | null };
   assert.deepEqual(call.args, [
@@ -387,6 +387,42 @@ else writeFileSync(join(process.cwd(), "native-task-call.json"), JSON.stringify(
   ]);
   assert.equal(call.secret, null);
 });
+
+test(
+  "native Task adapter runs npm .cmd shims through ComSpec",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const checkout = await mkdtemp(join(tmpdir(), "cmd-riker-task-shim-test-"));
+    t.after(() => rm(checkout, { recursive: true, force: true }));
+    const taskfile = join(checkout, "Taskfile.yml");
+    const fakeTask = join(checkout, "fake-task.mjs");
+    await writeFile(taskfile, "version: '3'\ntasks:\n  test:\n    cmds: []\n");
+    await writeFile(
+      fakeTask,
+      `import { join } from "node:path";
+const args = process.argv.slice(2);
+if (args.includes("--version")) console.log("Task version: v3.53.1");
+else if (args.includes("--list-all")) console.log(JSON.stringify({ location: join(process.cwd(), "Taskfile.yml"), tasks: [{ name: "test" }] }));
+`,
+    );
+    await writeFile(
+      join(checkout, "fake-task.cmd"),
+      `@echo off\r\n"${process.execPath}" "${fakeTask}" %*\r\n`,
+    );
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${checkout};${previousPath ?? ""}`;
+    t.after(() => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    });
+
+    assert.deepEqual(await new NativeTaskCli("fake-task").inspect({ checkout, timeoutMs: 10_000 }), {
+      version: "Task version: v3.53.1",
+      taskfile,
+      tasks: ["test"],
+    });
+  },
+);
 
 test("native checkout inspector verifies the active Git root", async () => {
   const checkout = process.cwd();

@@ -882,12 +882,24 @@ function wait(milliseconds: number): Promise<void> {
 export function safeChildEnvironment(): NodeJS.ProcessEnv {
   const names = process.platform === "win32"
     ? [
+        "ALLUSERSPROFILE",
         "APPDATA",
         "CODEX_HOME",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
         "ComSpec",
         "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
         "PATH",
         "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        // MSBuild/NuGet resolve SDK fallback folders from the ProgramFiles/ProgramData
+        // family; without them `dotnet test` dies with "Value cannot be null (path1)".
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
         "SystemDrive",
         "SystemRoot",
         "TEMP",

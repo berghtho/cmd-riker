@@ -220,13 +220,11 @@ records durable effect intent before dispatch and succeeds only after an exact p
 Azure remains read-only. CMD Riker never accepts or persists credential values. A missing CLI,
 authentication, or required interaction produces one deduplicated Owner action in the Session View.
 
-The Lead Agent can visibly accept bounded conversational work as a durable Commitment. CMD Riker
-records its `Committed -> Ready -> Active -> Verifying` history, verifies declared response
-postconditions, and grants objective Acceptance itself. Criteria reserved for Owner judgment stop at
-`Awaiting Acceptance` until a later Owner turn explicitly accepts them. Commitment state,
-Verification evidence, Acceptance authority, and the concise conversation status survive restart.
-Interrupted active work becomes reconciling with a recovery action; later Owner turns can resume,
-pause, cancel, or supersede it through the same conversation.
+Work the Lead Agent takes on becomes a durable Work Item that CMD Riker mints internally — the
+Owner never fills a form and never sees an identifier. Verification evidence and plain status
+survive restart; delivery is complete on verified evidence with one report, without an Owner
+acceptance gate. Interrupted work becomes recoverable with a plain next step; later Owner turns can
+resume or cancel it through the same conversation.
 
 For a typed Target Project test operation, install the Task CLI and declare the public Taskfile
 mapping in `cmd-riker.operations.json` at the checkout root:
@@ -252,11 +250,14 @@ contains up to 32 checkout-relative file paths, each at most 16 MiB, whose SHA-2
 attributed to the operation result; use an empty array when the operation has no declared file
 artifact.
 
-With Codex CLI `0.147.0` or newer authenticated through ChatGPT, the Lead Agent can delegate an
-effectful assignment. When the Lead delegates without naming a Commitment, CMD Riker records the
-covering Commitment with its declared `test` criterion automatically. CMD Riker records the
-assignment's targets, effect classes, Authorized Write Root, Command Authority, time and cost
-bounds, isolated-checkout baseline, and no-replay recovery constraint before launching Codex. A
+With Codex CLI `0.147.0` or newer authenticated through ChatGPT — and Claude Code `2.1.229` or
+newer for effectful Claude Workers — the Lead Agent delegates effectful assignments and picks the
+harness and model per task. When the Lead delegates without naming a Work Item, CMD Riker records
+the covering Work Item with its declared `test` criterion automatically, then records the
+assignment's targets, Authorized Write Root, time bounds, isolated-checkout baseline, and no-replay
+recovery constraint before launching the Worker. The Lead watches live Worker output and can steer
+any running Worker mid-run — course corrections, cross-Worker finding delivery, and announcements
+of its own direct edits inside a Worker's checkout. A
 clean secondary worktree or non-default branch executes in place; any other primary checkout —
 dirty, detached, on the default branch, or without a provable default branch — automatically gets a
 managed sibling Execution Checkout instead of a refusal. Work items run as many effectful Workers in
@@ -272,13 +273,13 @@ deadline expires and retains effect uncertainty rather than claiming rollback.
 Only the current Worker generation can settle the effect. A safely terminated, structured Worker
 outcome must agree with a real non-empty Git diff against the recorded baseline and stay inside the
 assigned targets. It then triggers the declared typed `test` operation, whose durable result provides
-Verification and objective Acceptance. The Authorized Write Root remains reserved until that result is
+Verification. The Authorized Write Root remains reserved until that result is
 linked to the Worker effect; restart resumes a not-yet-dispatched Verification without replaying the
 Worker. Connection loss after dispatch leaves the effect unknown and reconciling; it is never
 automatically replayed.
 
 For a managed Execution Checkout, the durable Worker authority and effect intent are recorded before
-`git worktree add`; the Worker receives only that detached, Commitment-attributed sibling worktree as
+`git worktree add`; the Worker receives only that detached, Work-Item-attributed sibling worktree as
 its Authorized Write Root. After a settled Worker result, CMD Riker proves that the Target Project
 HEAD still matches the recorded baseline, reconciles the exact Git patch, disposes the worktree, and
 only then runs Verification. Unrelated uncommitted Owner changes in the Target Project are preserved

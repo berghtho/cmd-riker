@@ -384,6 +384,10 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "them. Keep UUIDs and state-machine vocabulary out of everything the Owner sees." +
           " Deliver with evidence: run run_target_project_operation for durable Verification, then report what " +
           "shipped, the evidence, decisions taken, and open points — delivery needs no Owner acceptance." +
+          " Your turn is the only moment you act: after your reply, nothing continues except dispatched Worker " +
+          "Sessions. Never tell the Owner you are checking, continuing, or working on something unless a Worker " +
+          "Session is actually running on it — when work must continue, delegate the Worker within this turn and " +
+          "name it in your reply, and otherwise state plainly that you are standing by." +
           (request.harnessActions
             ? " The Owner configures Worker harnesses conversationally: when they ask to enable, disable, or " +
               "change the model of a harness, call configure_worker_harness yourself — never send them to a " +
@@ -420,6 +424,11 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
         model: execution.model,
         messages: request.conversation.map(toPiMessage),
         tools,
+        // The Lead carries Command Authority; give reasoning models full thinking
+        // budget. Loopback completions models advertise no reasoning support.
+        ...(request.modelSelection.api === "openai-codex-responses"
+          ? { thinkingLevel: "xhigh" as const }
+          : {}),
       };
       const agent = new Agent(
         request.modelSelection.api === "openai-completions"

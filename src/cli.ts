@@ -203,6 +203,29 @@ async function main(): Promise<void> {
             ? { forgeAuthorities: configuration.forgeAuthorities }
             : {}),
         });
+        // A policy revision never seen durably is the Owner's way to swap the Lead
+        // model via config.json: validate the new policy, then activate it durably.
+        // A revision the durable record already knows is a stale file, not an order.
+        if (
+          configuration.modelPolicyRevision !== durableConfiguration.modelPolicyRevision &&
+          !state.knownModelPolicyRevisions().includes(configuration.modelPolicyRevision)
+        ) {
+          await validatePolicy(adapter, configuration);
+          policyValidated = true;
+          state.replaceOwnerConfiguration({
+            ...durableConfiguration,
+            ...(configuration.forgeAuthorities
+              ? { forgeAuthorities: configuration.forgeAuthorities }
+              : {}),
+            modelSelection: configuration.modelSelection,
+            modelFallbacks: configuration.modelFallbacks ?? [],
+            modelRequirements: configuration.modelRequirements ?? defaultLeadModelRequirements,
+            modelPolicyRevision: configuration.modelPolicyRevision,
+            ...(configuration.workerModelPolicy
+              ? { workerModelPolicy: configuration.workerModelPolicy }
+              : {}),
+          });
+        }
       }
       conversation = state.readOwnerConversation();
     }

@@ -79,6 +79,40 @@ test("Owner CLI continues one canonical conversation in a new process", async (t
   state.close();
 });
 
+test("Owner CLI activates an unseen config.json policy revision durably", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-policy-swap-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel((call) => `Policy turn ${call}.`);
+  t.after(() => localModel.close());
+  const configurationFor = (revision: string, fallbacks: object[] = []) =>
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: localModel.baseUrl,
+      },
+      modelFallbacks: fallbacks,
+      modelPolicyRevision: revision,
+    });
+  await writeFile(join(stateDirectory, "config.json"), configurationFor("owner-policy-1"));
+  const first = await runCli(stateDirectory, "Start the conversation.\n");
+  assert.equal(first.code, 0, first.stderr);
+
+  await writeFile(join(stateDirectory, "config.json"), configurationFor("owner-policy-2"));
+  const second = await runCli(stateDirectory, "Continue with the new policy.\n");
+  assert.equal(second.code, 0, second.stderr);
+
+  const state = openAuthoritativeState(stateDirectory);
+  assert.equal(state.readOwnerConversation()?.modelPolicyRevision, "owner-policy-2");
+  assert.deepEqual(state.knownModelPolicyRevisions().sort(), [
+    "owner-policy-1",
+    "owner-policy-2",
+  ]);
+  state.close();
+});
+
 test("Owner CLI answers without commitment ceremony or paperwork tools", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-commitment-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));

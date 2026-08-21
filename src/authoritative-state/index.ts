@@ -176,6 +176,7 @@ export interface AuthoritativeState {
   probeLifecycle(nonce: string): void;
   initialize(configuration: OwnerConfiguration): void;
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
+  knownModelPolicyRevisions(): string[];
   readOwnerConversation(): OwnerConversation | undefined;
   ownerMessage(ownerTurnId: string): string | undefined;
   latestOwnerTurnId(): string | undefined;
@@ -1075,6 +1076,15 @@ export function openAuthoritativeState(
         "owner.model-policy-activated",
         existing.id,
       );
+    },
+
+    knownModelPolicyRevisions() {
+      const rows = database
+        .prepare("SELECT value_json FROM facts WHERE kind = 'owner.configuration'")
+        .all() as Array<{ value_json: string }>;
+      return [...new Set(rows.map(
+        (row) => (JSON.parse(row.value_json) as { modelPolicyRevision: string }).modelPolicyRevision,
+      ))];
     },
 
     readOwnerConversation() {

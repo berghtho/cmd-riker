@@ -1,4 +1,7 @@
-import { resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 import {
   connectLocalLeadHost,
@@ -9,6 +12,7 @@ import {
 import {
   runPiOwnerInterface,
   type PiOwnerTranscriptEntry,
+  type PiOwnerUpdateStatus,
 } from "./pi-owner-interface.ts";
 import { completeHostedOwnerInput } from "./owner-host-bridge.ts";
 import type { SessionViewSnapshot } from "./session-view/index.ts";
@@ -34,6 +38,7 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
       completeOwnerInput: (ownerInput) => completeHostedOwnerInput(client, ownerInput),
       readSessionView: () => readLatestSessionView(client.transcript),
       readSessionData: () => readLatestSessionData(client.transcript),
+      readUpdateStatus: createUpdateStatusReader(resolve(installationRoot)),
       subscribeNotices: (listener) =>
         client.onTranscriptEntry((entry: LeadHostTranscriptEntry) => {
           const prefix = "CMD_RIKER_WORKER_NOTICE: ";
@@ -45,6 +50,70 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
   } finally {
     await client.detach();
   }
+}
+
+// The installed bundle records its source repository and commit; the client
+// polls that repository's HEAD in the background so the interface can announce
+// a newer version. Git failures or a missing source record simply disable the
+// notice.
+function createUpdateStatusReader(
+  installationRoot: string,
+): () => PiOwnerUpdateStatus | undefined {
+  let status: PiOwnerUpdateStatus | undefined;
+  let source: { repositoryPath: string; commit: string; revision: string } | undefined;
+  try {
+    const launcher = JSON.parse(
+      readFileSync(join(installationRoot, "launcher", "installation.json"), "utf8"),
+    ) as { leadAgent?: { path?: string; identity?: { revision?: string } } };
+    const bundlePath = launcher.leadAgent?.path;
+    if (bundlePath) {
+      const record = JSON.parse(readFileSync(join(bundlePath, "source.json"), "utf8")) as {
+        repositoryPath?: string;
+        commit?: string;
+      };
+      if (record.repositoryPath && record.commit) {
+        source = {
+          repositoryPath: record.repositoryPath,
+          commit: record.commit,
+          revision: launcher.leadAgent?.identity?.revision ?? "installed",
+        };
+      }
+    }
+  } catch {
+    // No durable source record: the update notice stays off.
+  }
+  if (source) {
+    const record = source;
+    const execute = promisify(execFile);
+    let checking = false;
+    const check = async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        const result = await execute(
+          "git",
+          ["-C", record.repositoryPath, "rev-parse", "HEAD"],
+          { encoding: "utf8", timeout: 10_000, windowsHide: true },
+        );
+        const repositoryCommit = result.stdout.trim();
+        status = /^[0-9a-f]{40}$/i.test(repositoryCommit)
+          ? {
+              installedRevision: record.revision,
+              installedCommit: record.commit,
+              repositoryCommit,
+              updateAvailable: repositoryCommit.toLowerCase() !== record.commit.toLowerCase(),
+            }
+          : undefined;
+      } catch {
+        status = undefined;
+      } finally {
+        checking = false;
+      }
+    };
+    void check();
+    setInterval(() => void check(), 60_000).unref();
+  }
+  return () => status;
 }
 
 // The Lead prints its Target Project during boot; a freshly started host has an

@@ -154,7 +154,9 @@ export function localInstallationPaths(installationRoot: string): LocalInstallat
 export function createLocalInstallation(options: LocalInstallationOptions): LocalInstallation {
   const paths = localInstallationPaths(options.installationRoot);
   const hostAddress = localLeadHostAddress(paths.root);
-  const connectHost = options.connectHost ?? ((address) => connectWithRetry(address, 10_000));
+  // The host verifies its bundle (hashing every file) before the pipe listens,
+  // so a fresh start needs well over ten seconds on a real bundle.
+  const connectHost = options.connectHost ?? ((address) => connectWithRetry(address, 60_000));
   const probeHost = options.probeHost ?? (async (address) => {
     try {
       const client = await connectLocalLeadHost(address);

@@ -123,7 +123,7 @@ test("the Session View panel groups Workers under their Work Item with running t
   assert.match(rendered, /One effect needs reconciliation/);
   const itemLine = lines.findIndex((line) => line.includes("CSV export ships"));
   const workerLine = lines.findIndex((line) => line.includes("Implement CSV export"));
-  assert.ok(workerLine === itemLine + 1, "the Worker renders under its Work Item");
+  assert.ok(workerLine === itemLine + 2, "the Worker renders under its Work Item and status line");
 });
 
 test("panel ages read plainly at every magnitude", () => {

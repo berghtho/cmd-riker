@@ -100,6 +100,34 @@ test("refuses unsafe revisions and never replaces an existing output", { skip },
   );
 });
 
+test("records the source repository commit for the update notice", { skip }, async (t) => {
+  const fixture = await releaseFixture(t, "source");
+  const commit = "a".repeat(40);
+  await buildRelease(fixture, "source-1", [
+    "--source-path",
+    fixture.root,
+    "--source-commit",
+    commit,
+  ]);
+
+  const lead = await verifyLocalReleaseCandidate(
+    join(fixture.output, "lead-agent"),
+    "lead-agent",
+  );
+  assert.ok(lead.manifest.files.some((file) => file.path === "source.json"));
+  const record = JSON.parse(
+    await readFile(join(fixture.output, "lead-agent", "source.json"), "utf8"),
+  ) as { repositoryPath: string; commit: string };
+  assert.equal(record.commit, commit);
+  assert.equal(record.repositoryPath, fixture.root);
+
+  const noCommit = await releaseFixture(t, "source-missing");
+  await assert.rejects(
+    buildRelease(noCommit, "source-2", ["--source-path", noCommit.root]),
+    /supplied together/,
+  );
+});
+
 test("rejects a Lead dist without the lifecycle and Owner tools", { skip }, async (t) => {
   const fixture = await releaseFixture(t, "no-lifecycle");
   await rm(join(fixture.leadDist, "lifecycle-cli.js"));
@@ -141,8 +169,13 @@ async function writeFixtureFile(root: string, relativePath: string, contents: st
 async function buildRelease(
   fixture: Awaited<ReturnType<typeof releaseFixture>>,
   revision: string,
-  tools?: string,
+  toolsOrArguments?: string | string[],
 ): Promise<void> {
+  const extraArguments = toolsOrArguments === undefined
+    ? []
+    : typeof toolsOrArguments === "string"
+      ? ["--tools", toolsOrArguments]
+      : toolsOrArguments;
   try {
     await run(process.execPath, [
       script,
@@ -156,7 +189,7 @@ async function buildRelease(
       fixture.leadNodeModules,
       "--output",
       fixture.output,
-      ...(tools === undefined ? [] : ["--tools", tools]),
+      ...extraArguments,
     ]);
   } catch (error) {
     const failure = error as Error & { stderr?: string };

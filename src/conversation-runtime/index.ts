@@ -88,30 +88,34 @@ export type PiTurnRequest = {
     detail: string;
   };
   workerActions?: {
-    capabilities?: {
+    harnesses: Array<{
       nativeHarness: "codex" | "claude" | "copilot";
       effectful: boolean;
       nativeQuestions: boolean;
       cancellation: boolean;
-    };
-    delegate(input: {
-      objective: string;
-      prompt: string;
-      commitmentId?: string;
-      recoveryOfWorkerSessionId?: string;
-      recoveryReason?: string;
-    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
-    delegateEffectful?(input: {
-      objective: string;
-      prompt: string;
-      commitmentId?: string;
-      targets: string[];
-      recoveryOfWorkerSessionId?: string;
-      recoveryReason?: string;
-    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+      delegate(input: {
+        objective: string;
+        prompt: string;
+        model?: string;
+        commitmentId?: string;
+        recoveryOfWorkerSessionId?: string;
+        recoveryReason?: string;
+      }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+      delegateEffectful?(input: {
+        objective: string;
+        prompt: string;
+        model?: string;
+        commitmentId?: string;
+        targets: string[];
+        timeoutMinutes?: number;
+        recoveryOfWorkerSessionId?: string;
+        recoveryReason?: string;
+      }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+    }>;
     delegateReview?(input: {
       implementationWorkerSessionId: string;
       prompt: string;
+      harness?: "codex" | "claude" | "copilot";
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     adjudicateReview?(input: {
       commitmentId: string;
@@ -122,6 +126,8 @@ export type PiTurnRequest = {
       }>;
     }): void;
     reserveOwnerDecision?(questionId: string, reason: string): void;
+    steer?(workerSessionId: string, message: string): Promise<void>;
+    workerOutput?(workerSessionId: string): string | undefined;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -848,27 +854,30 @@ function workerTools(
 ): AgentTool[] {
   if (!request.workerActions) return [];
   const actions = request.workerActions;
-  const capabilities = workerCapabilities(actions);
-  const nativeName = nativeHarnessName(capabilities.nativeHarness);
-  const tools: AgentTool[] = [
-    {
-      name: `delegate_read_only_${capabilities.nativeHarness}`,
+  const tools: AgentTool[] = [];
+  for (const harness of actions.harnesses) {
+    const nativeName = nativeHarnessName(harness.nativeHarness);
+    tools.push({
+      name: `delegate_read_only_${harness.nativeHarness}`,
       label: `Delegate Read-only ${nativeName} Worker`,
       description:
-        `Start one bounded, read-only ${nativeName} Worker Session without waiting for its outcome.`,
+        `Start one bounded, read-only ${nativeName} Worker Session without waiting for its outcome. ` +
+        "Pass model only to override the configured Worker model for this task.",
       parameters: Type.Object({
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
+        model: Type.Optional(Type.String({ minLength: 1 })),
         commitmentId: Type.Optional(Type.String({ minLength: 1 })),
         recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
         recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const result = await actions.delegate(
+        const result = await harness.delegate(
           params as {
             objective: string;
             prompt: string;
+            model?: string;
             commitmentId?: string;
             recoveryOfWorkerSessionId?: string;
             recoveryReason?: string;
@@ -887,45 +896,98 @@ function workerTools(
           details: result,
         };
       },
-    },
-  ];
-  if (capabilities.effectful && actions.delegateEffectful) {
+    });
+    const delegateEffectful = harness.delegateEffectful;
+    if (harness.effectful && delegateEffectful) {
+      tools.push({
+        name: `delegate_effectful_${harness.nativeHarness}`,
+        label: `Delegate Effectful ${nativeName} Worker`,
+        description:
+          `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. ` +
+          "When commitmentId is omitted, CMD Riker records the covering Work Item with its test Verification automatically. " +
+          "Pass model or timeoutMinutes only to override the defaults for this task.",
+        parameters: Type.Object({
+          objective: Type.String({ minLength: 1 }),
+          prompt: Type.String({ minLength: 1 }),
+          model: Type.Optional(Type.String({ minLength: 1 })),
+          commitmentId: Type.Optional(Type.String({ minLength: 1 })),
+          targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
+          timeoutMinutes: Type.Optional(Type.Integer({ minimum: 1, maximum: 180 })),
+          recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
+          recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
+        }),
+        executionMode: "sequential",
+        async execute(_toolCallId, params) {
+          const result = await delegateEffectful(
+            params as {
+              objective: string;
+              prompt: string;
+              model?: string;
+              commitmentId?: string;
+              targets: string[];
+              timeoutMinutes?: number;
+              recoveryOfWorkerSessionId?: string;
+              recoveryReason?: string;
+            },
+          );
+          observer.onMutation();
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Worker Session ${result.workerSessionId} started effectful ` +
+                  `execution attempt ${result.executionAttemptId} inside its Authorized Write Root.`,
+              },
+            ],
+            details: result,
+          };
+        },
+      });
+    }
+  }
+  if (actions.steer) {
     tools.push({
-      name: `delegate_effectful_${capabilities.nativeHarness}`,
-      label: `Delegate Effectful ${nativeName} Worker`,
+      name: "steer_worker",
+      label: "Steer Worker",
       description:
-        `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. When commitmentId is omitted, CMD Riker records the covering Commitment with its test Verification automatically.`,
+        "Send a mid-run Lead message into a live Worker Session: correct its course, deliver another Worker's finding, " +
+        "or announce a direct edit you made inside its checkout before it continues.",
       parameters: Type.Object({
-        objective: Type.String({ minLength: 1 }),
-        prompt: Type.String({ minLength: 1 }),
-        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
-        targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
-        recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
-        recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
+        workerSessionId: Type.String({ minLength: 1 }),
+        message: Type.String({ minLength: 1 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const result = await actions.delegateEffectful!(
-          params as {
-            objective: string;
-            prompt: string;
-            commitmentId?: string;
-            targets: string[];
-            recoveryOfWorkerSessionId?: string;
-            recoveryReason?: string;
-          },
-        );
+        const { workerSessionId, message } = params as {
+          workerSessionId: string;
+          message: string;
+        };
+        await actions.steer!(workerSessionId, message);
         observer.onMutation();
         return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Worker Session ${result.workerSessionId} started effectful ` +
-                `execution attempt ${result.executionAttemptId} inside its Authorized Write Root.`,
-            },
-          ],
-          details: result,
+          content: [{ type: "text", text: "The steering message was delivered to the Worker." }],
+          details: { workerSessionId },
+        };
+      },
+    });
+  }
+  if (actions.workerOutput) {
+    tools.push({
+      name: "read_worker_output",
+      label: "Read Worker Output",
+      description: "Read the live output tail of one running Worker Session.",
+      parameters: Type.Object({ workerSessionId: Type.String({ minLength: 1 }) }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { workerSessionId } = params as { workerSessionId: string };
+        const output = actions.workerOutput!(workerSessionId);
+        return {
+          content: [{
+            type: "text",
+            text: output?.trim() ? output : "The Worker has produced no output yet.",
+          }],
+          details: { workerSessionId },
         };
       },
     });
@@ -939,12 +1001,18 @@ function workerTools(
       parameters: Type.Object({
         implementationWorkerSessionId: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
+        harness: Type.Optional(Type.Union([
+          Type.Literal("codex"),
+          Type.Literal("claude"),
+          Type.Literal("copilot"),
+        ])),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const result = await actions.delegateReview!(params as {
           implementationWorkerSessionId: string;
           prompt: string;
+          harness?: "codex" | "claude" | "copilot";
         });
         observer.onMutation();
         return {
@@ -995,11 +1063,13 @@ function workerTools(
       },
     });
   }
-  if (capabilities.nativeQuestions && actions.answer) {
+  const anyNativeQuestions = actions.harnesses.some((harness) => harness.nativeQuestions);
+  const anyCancellation = actions.harnesses.some((harness) => harness.cancellation);
+  if (anyNativeQuestions && actions.answer) {
     tools.push({
       name: "answer_worker_question",
       label: "Answer Worker Question",
-      description: `Deliver the Owner's answer to one open native ${nativeName} question by durable identity.`,
+      description: "Deliver the decided answer to one open native Worker question by durable identity.",
       parameters: Type.Object({
         questionId: Type.String({ minLength: 1 }),
         answers: Type.Record(
@@ -1029,7 +1099,7 @@ function workerTools(
       },
     });
   }
-  if (capabilities.nativeQuestions && actions.reserveOwnerDecision) {
+  if (anyNativeQuestions && actions.reserveOwnerDecision) {
     tools.push({
       name: "reserve_worker_question_for_owner",
       label: "Reserve Worker Question for Owner",
@@ -1054,12 +1124,12 @@ function workerTools(
       },
     });
   }
-  if (capabilities.cancellation && actions.cancel) {
+  if (anyCancellation && actions.cancel) {
     tools.push({
       name: "cancel_worker_session",
       label: "Cancel Worker Session",
       description:
-        `Record cancellation intent, then interrupt one active ${nativeName} Worker Session. This does not roll back effects.`,
+        "Record cancellation intent, then interrupt one active Worker Session. This does not roll back effects.",
       parameters: Type.Object({
         workerSessionId: Type.String({ minLength: 1 }),
         reason: Type.String({ minLength: 1 }),
@@ -1089,35 +1159,34 @@ function workerTools(
   return tools;
 }
 
-function workerCapabilities(actions: NonNullable<PiTurnRequest["workerActions"]>) {
-  return actions.capabilities ?? {
-    nativeHarness: "codex" as const,
-    effectful: true,
-    nativeQuestions: true,
-    cancellation: true,
-  };
-}
-
 function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {
   return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
 }
 
 function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerActions"]>): string {
-  const capabilities = workerCapabilities(actions);
-  const nativeName = nativeHarnessName(capabilities.nativeHarness);
+  const roster = actions.harnesses
+    .map(
+      (harness) =>
+        `${nativeHarnessName(harness.nativeHarness)} (${harness.effectful ? "implements and reviews" : "read-only research and review"})`,
+    )
+    .join(", ");
   return (
-    `\nA proven ${nativeName} Worker capability is available for bounded read-only work.` +
-    (capabilities.effectful
-      ? " Effectful work is confined to the active Target Project checkout; delegate with checkout-relative targets. When you omit commitmentId, CMD Riker records the covering Commitment and its test Verification automatically, and it resolves any applicable durable authority internally — never ask the Owner for IDs, effect classes, or authorization details. CMD Riker runs typed Verification after the Worker finishes."
-      : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
-    (capabilities.nativeQuestions
-      ? " Native questions are available; reserve only authority or product-judgment questions for Owner attention."
-      : " Native questions are unavailable.") +
-    (capabilities.cancellation ? " Native cancellation is available." : " Native cancellation is unavailable.") +
+    `\nAvailable Worker harnesses: ${roster}. You choose the harness and, when useful, the model per ` +
+    "task — split one feature across parallel Workers freely; the Owner never sees the choice but can " +
+    "override it in plain language. Effectful work is confined to isolated checkouts with " +
+    "checkout-relative targets; when you omit commitmentId, CMD Riker records the covering Work Item " +
+    "and its test Verification automatically. CMD Riker runs typed Verification after a Worker finishes." +
+    (actions.steer
+      ? " You have live visibility (read_worker_output) and can steer any running Worker mid-run " +
+        "(steer_worker): correct a wrong path, deliver one Worker's finding to another, and always " +
+        "announce your own direct edits inside a Worker's checkout before it continues."
+      : "") +
     (actions.adjudicateReview
       ? " Adjudicate every reported Review finding as must-fix, documented exception, or follow-up with Lead rationale."
       : "") +
-    " Never claim resume, deletion, child control, rollback, or effect continuity when the recorded capability facts do not prove it."
+    " Answer routine Worker questions yourself within the mission; reserve only genuine product " +
+    "decisions for the Owner. Never claim resume, deletion, child control, rollback, or effect " +
+    "continuity when the recorded capability facts do not prove it."
   );
 }
 

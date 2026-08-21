@@ -146,13 +146,19 @@ test("production adapter advertises the bounded Codex Worker controls", async (t
     ownerInput: "Delegate a read-only architecture inspection.",
     modelSelection: modelSelection(localModel.baseUrl),
     workerActions: {
-      async delegate(input) {
-        delegated = input;
-        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
-      },
-      async delegateEffectful() {
-        return { workerSessionId: "worker-effectful-1", executionAttemptId: "attempt-effectful-1" };
-      },
+      harnesses: [{
+        nativeHarness: "codex",
+        effectful: true,
+        nativeQuestions: true,
+        cancellation: true,
+        async delegate(input) {
+          delegated = input;
+          return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+        },
+        async delegateEffectful() {
+          return { workerSessionId: "worker-effectful-1", executionAttemptId: "attempt-effectful-1" };
+        },
+      }],
       async answer() {},
       reserveOwnerDecision() {},
       async cancel() {},
@@ -195,15 +201,15 @@ test("production adapter exposes only proven Copilot Worker controls", async (t)
     ownerInput: "Delegate a read-only architecture inspection.",
     modelSelection: modelSelection(localModel.baseUrl),
     workerActions: {
-      capabilities: {
+      harnesses: [{
         nativeHarness: "copilot",
         effectful: false,
         nativeQuestions: false,
         cancellation: false,
-      },
-      async delegate() {
-        return { workerSessionId: "worker-copilot-1", executionAttemptId: "attempt-copilot-1" };
-      },
+        async delegate() {
+          return { workerSessionId: "worker-copilot-1", executionAttemptId: "attempt-copilot-1" };
+        },
+      }],
     },
   });
 
@@ -257,9 +263,15 @@ test("production adapter exposes explicit authority controls and independent Rev
       revokeStandingOrder() {},
     },
     workerActions: {
-      async delegate() {
-        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
-      },
+      harnesses: [{
+        nativeHarness: "codex",
+        effectful: false,
+        nativeQuestions: false,
+        cancellation: false,
+        async delegate() {
+          return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+        },
+      }],
       async delegateReview() {
         return { workerSessionId: "reviewer-1", executionAttemptId: "review-attempt-1" };
       },
@@ -299,13 +311,19 @@ test("production adapter delegates effectful work only through the bounded assig
     ownerInput: "Implement the accepted Target Project change.",
     modelSelection: modelSelection(localModel.baseUrl),
     workerActions: {
-      async delegate() {
-        return { workerSessionId: "worker-read-only", executionAttemptId: "attempt-read-only" };
-      },
-      async delegateEffectful(input) {
-        delegated = input;
-        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
-      },
+      harnesses: [{
+        nativeHarness: "codex",
+        effectful: true,
+        nativeQuestions: true,
+        cancellation: true,
+        async delegate() {
+          return { workerSessionId: "worker-read-only", executionAttemptId: "attempt-read-only" };
+        },
+        async delegateEffectful(input) {
+          delegated = input;
+          return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+        },
+      }],
       async answer() {},
       async cancel() {},
     },

@@ -1103,7 +1103,10 @@ test("the Codex 0.147.0 adapter enforces read-only policy and carries a native q
   await execution.answer(0, { module: ["State"] });
   await waitFor(() => terminalStatus !== undefined);
   assert.equal(terminalStatus, "completed");
-  assert.equal(output, "Read-only result.");
+  // The observer stream is the live tail; the outcome contract line is
+  // stripped later for the durable terminal record.
+  assert.match(output, /^Read-only result\./);
+  assert.match(output, /CMD_RIKER_OUTCOME:/);
   assert.deepEqual(reportedOutcome, {
     status: "completed",
     summary: "Read-only result.",

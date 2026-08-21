@@ -97,9 +97,12 @@ export type NativeWorkerExecution = {
     harnessVersion: string;
     protocolSchemaSha256: string;
     capabilities: WorkerNativeCapabilities;
-    writeIsolation?: "codex-windows-workspace-write";
+    writeIsolation?: "codex-windows-workspace-write" | "claude-write-root-guard";
   };
   answer(providerRequestId: number | string, answers: Record<string, string[]>): Promise<void>;
+  /** Steer the live Worker with a Lead message; absent when the harness cannot
+   * inject guidance mid-run. */
+  send?(text: string): Promise<void>;
   interrupt(): Promise<void>;
   terminate(): Promise<{ gone: boolean }>;
 };
@@ -158,6 +161,10 @@ export interface WorkerSupervisor {
     ownerTurnId: string,
     answers: Record<string, string[]>,
   ): Promise<void>;
+  /** Steer a live Worker mid-run with a Lead message. */
+  steer(workerSessionId: string, message: string): Promise<void>;
+  /** Tail of the live Worker's streamed output for Lead visibility. */
+  workerOutput(workerSessionId: string): string | undefined;
   cancel(workerSessionId: string, ownerTurnId: string, reason: string): Promise<void>;
   recover(): Promise<void>;
 }
@@ -179,6 +186,14 @@ export function createWorkerSupervisor(
     }
   };
   const outputByAttempt = new Map<string, string>();
+  // The live tail may include the CMD_RIKER_OUTCOME contract line; the durable
+  // terminal output stays the plain narration.
+  const stripOutcomeLine = (text: string): string =>
+    text
+      .split(/\r?\n/)
+      .filter((line) => !line.trimStart().startsWith("CMD_RIKER_OUTCOME:"))
+      .join("\n")
+      .trim();
   const commandsByAttempt = new Map<string, string[]>();
   const deadlinesByAttempt = new Map<string, NodeJS.Timeout[]>();
   const clearDeadlines = (executionAttemptId: string): void => {
@@ -490,7 +505,7 @@ export function createWorkerSupervisor(
               status,
               processGone: termination.gone,
               ...(outputByAttempt.get(executionAttempt.id)
-                ? { output: outputByAttempt.get(executionAttempt.id)! }
+                ? { output: stripOutcomeLine(outputByAttempt.get(executionAttempt.id)!) }
                 : {}),
               ...(terminalDetail ? { detail: terminalDetail } : {}),
               ...(commandsByAttempt.get(executionAttempt.id)
@@ -752,6 +767,23 @@ export function createWorkerSupervisor(
         .catch(() => {
           // The durable answer remains bound to the question for continuity recovery.
         });
+    },
+
+    async steer(workerSessionId, message) {
+      const execution = executions.get(workerSessionId);
+      if (!execution) {
+        throw new Error("This Worker has no live execution to steer.");
+      }
+      if (!execution.send) {
+        throw new Error("This Worker's Native Harness cannot receive steering mid-run.");
+      }
+      await execution.send(message);
+    },
+
+    workerOutput(workerSessionId) {
+      const worker = orchestration.workerSessionView(workerSessionId);
+      if (!worker) return undefined;
+      return outputByAttempt.get(worker.currentExecutionAttemptId);
     },
 
     async cancel(workerSessionId, ownerTurnId, reason) {

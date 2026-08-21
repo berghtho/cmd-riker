@@ -33,10 +33,15 @@ export class LeadAgentRuntimeDiagnostic extends Error {
   }
 }
 
+export type WorkerSupervisors = Partial<
+  Record<"codex" | "claude" | "copilot", WorkerSupervisor>
+>;
+
 export function createLeadAgentRuntime(input: {
   state: AuthoritativeState;
   adapter: PiTurnAdapter;
   workerSupervisor?: WorkerSupervisor;
+  workerSupervisors?: WorkerSupervisors;
   targetProjectOperations?: TargetProjectOperations;
   forgeOperations?: ForgeOperations;
 }): LeadAgentRuntime {
@@ -72,6 +77,7 @@ async function completeOwnerTurn(input: {
   adapter: PiTurnAdapter;
   ownerInput: string;
   workerSupervisor?: WorkerSupervisor;
+  workerSupervisors?: WorkerSupervisors;
   targetProjectOperations: TargetProjectOperations;
   forgeOperations: ForgeOperations;
   onOwnerTurnRecorded?: (turnId: string) => void;
@@ -124,20 +130,42 @@ async function completeOwnerTurn(input: {
       ...(index > 0 ? { selectionReason: "fallback-after-ineligible-candidate" as const } : {}),
     });
     try {
-      const workerCapabilities = input.workerSupervisor?.capabilities();
       const harnessSettings = conversation.workerHarnessSettings ?? {};
-      const activeHarness = workerCapabilities?.nativeHarness;
-      const activeSetting = activeHarness ? harnessSettings[activeHarness] : undefined;
-      const workerModel = activeHarness
-        ? activeSetting?.model ??
-          (conversation.workerModelPolicy?.selection.nativeHarness === activeHarness
-            ? conversation.workerModelPolicy.selection.model
-            : undefined)
-        : undefined;
-      const workerDisabled = activeSetting?.enabled === false;
-      const workerAvailable = Boolean(input.workerSupervisor && !workerDisabled && workerModel);
       const workerModelPolicyRevision =
         conversation.workerModelPolicy?.revision ?? "worker-harness-settings";
+      const supervisors = new Map<"codex" | "claude" | "copilot", WorkerSupervisor>();
+      const register = (supervisor: WorkerSupervisor | undefined): void => {
+        if (!supervisor) return;
+        const harness = supervisor.capabilities().nativeHarness;
+        if (!supervisors.has(harness)) supervisors.set(harness, supervisor);
+      };
+      register(input.workerSupervisor);
+      for (const supervisor of Object.values(input.workerSupervisors ?? {})) register(supervisor);
+      const modelFor = (harness: "codex" | "claude" | "copilot"): string | undefined =>
+        harnessSettings[harness]?.model ??
+        (conversation.workerModelPolicy?.selection.nativeHarness === harness
+          ? conversation.workerModelPolicy.selection.model
+          : undefined);
+      const availableHarnesses = [...supervisors.entries()].filter(
+        ([harness]) => harnessSettings[harness]?.enabled !== false && modelFor(harness),
+      );
+      const supervisorOfWorker = (workerSessionId: string): WorkerSupervisor => {
+        const worker = orchestration.workerSessionView(workerSessionId);
+        const attempt = worker
+          ? orchestration.workerExecutionAttemptView(worker.currentExecutionAttemptId)
+          : undefined;
+        const supervisor = attempt
+          ? supervisors.get(attempt.modelSelection.nativeHarness)
+          : undefined;
+        if (!supervisor) {
+          throw new Error("This Worker's Native Harness is not available in this session.");
+        }
+        return supervisor;
+      };
+      const workerAvailable = availableHarnesses.length > 0;
+      const firstSupervisor = supervisors.values().next().value as WorkerSupervisor | undefined;
+      const unavailableHarness = firstSupervisor?.capabilities().nativeHarness ??
+        conversation.workerModelPolicy?.selection.nativeHarness;
       const response = await input.adapter.completeTurn({
         conversation: conversation.messages,
         ownerInput: input.ownerInput,
@@ -156,101 +184,120 @@ async function completeOwnerTurn(input: {
           configure: (configuration) =>
             orchestration.configureWorkerHarness(turnId, configuration),
         },
-        ...(!workerAvailable && (activeHarness || conversation.workerModelPolicy)
+        ...(!workerAvailable && (unavailableHarness || conversation.workerModelPolicy)
           ? {
               workerUnavailability: {
-                nativeHarness: activeHarness ??
+                nativeHarness: unavailableHarness ??
                   conversation.workerModelPolicy!.selection.nativeHarness,
-                detail: workerDisabled
-                  ? "The Owner disabled this harness; enable it again to delegate."
-                  : input.workerSupervisor && !workerModel
-                    ? "No Worker model is configured for the active harness; the Owner can set one conversationally."
-                    : input.state.readCapabilityNotice("codex-worker")?.state === "active"
-                      ? input.state.readCapabilityNotice("codex-worker")!.detail
-                      : "The Worker capability could not be proven at start.",
+                detail: supervisors.size > 0
+                  ? "No enabled harness has a configured Worker model; the Owner can set one conversationally."
+                  : input.state.readCapabilityNotice("codex-worker")?.state === "active"
+                    ? input.state.readCapabilityNotice("codex-worker")!.detail
+                    : "The Worker capability could not be proven at start.",
               },
             }
           : {}),
         ...(workerAvailable
           ? {
               workerActions: {
-                capabilities: {
-                  nativeHarness: workerCapabilities!.nativeHarness,
-                  effectful: workerCapabilities!.effectful,
-                  nativeQuestions: workerCapabilities!.nativeQuestions,
-                  cancellation: workerCapabilities!.cancellation,
-                },
-                delegate: (assignment: {
-                  objective: string;
-                  prompt: string;
-                  commitmentId?: string;
-                  recoveryOfWorkerSessionId?: string;
-                  recoveryReason?: string;
-                }) =>
-                  input.workerSupervisor!.delegate({
-                    ...assignment,
-                    targetProjectPath: conversation.targetProject.path,
-                    model: workerModel!,
-                    modelPolicyRevision: workerModelPolicyRevision,
-                  }),
+                harnesses: availableHarnesses.map(([harness, supervisor]) => {
+                  const capabilities = supervisor.capabilities();
+                  return {
+                    nativeHarness: harness,
+                    effectful: capabilities.effectful,
+                    nativeQuestions: capabilities.nativeQuestions,
+                    cancellation: capabilities.cancellation,
+                    delegate: (assignment: {
+                      objective: string;
+                      prompt: string;
+                      model?: string;
+                      commitmentId?: string;
+                      recoveryOfWorkerSessionId?: string;
+                      recoveryReason?: string;
+                    }) => {
+                      const { model, ...bounded } = assignment;
+                      return supervisor.delegate({
+                        ...bounded,
+                        targetProjectPath: conversation.targetProject.path,
+                        model: model ?? modelFor(harness)!,
+                        modelPolicyRevision: workerModelPolicyRevision,
+                      });
+                    },
+                    ...(capabilities.effectful
+                      ? {
+                          delegateEffectful: (assignment: {
+                            objective: string;
+                            prompt: string;
+                            model?: string;
+                            commitmentId?: string;
+                            targets: string[];
+                            timeoutMinutes?: number;
+                            recoveryOfWorkerSessionId?: string;
+                            recoveryReason?: string;
+                          }) => {
+                            const { model, timeoutMinutes, ...bounded } = assignment;
+                            const commitmentId = workItemFor(
+                              assignment.commitmentId,
+                              assignment.objective,
+                            );
+                            return supervisor.delegateEffectful({
+                              ...bounded,
+                              commitmentId,
+                              targetProjectPath: conversation.targetProject.path,
+                              model: model ?? modelFor(harness)!,
+                              modelPolicyRevision: workerModelPolicyRevision,
+                              timeoutMs: (timeoutMinutes ?? 20) * 60_000,
+                              verification: {
+                                operation: "test" as const,
+                                workingDirectory: conversation.targetProject.path,
+                                timeoutMs: 120_000,
+                              },
+                            });
+                          },
+                        }
+                      : {}),
+                  };
+                }),
                 delegateReview: (assignment: {
                   implementationWorkerSessionId: string;
                   prompt: string;
-                }) =>
-                  input.workerSupervisor!.delegateReview({
-                    ...assignment,
-                    model: workerModel!,
+                  harness?: "codex" | "claude" | "copilot";
+                }) => {
+                  const { harness, ...bounded } = assignment;
+                  const chosen = (harness && supervisors.get(harness)) ??
+                    availableHarnesses[0]?.[1];
+                  if (!chosen) throw new Error("No Worker harness is available for Review.");
+                  const chosenHarness = chosen.capabilities().nativeHarness;
+                  return chosen.delegateReview({
+                    ...bounded,
+                    model: modelFor(chosenHarness) ?? conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: workerModelPolicyRevision,
-                  }),
+                  });
+                },
                 adjudicateReview: (adjudication) =>
                   orchestration.adjudicateReview(adjudication.commitmentId, adjudication.decisions),
                 reserveOwnerDecision: (questionId: string, reason: string) => {
                   orchestration.reserveWorkerQuestionForOwner(questionId, reason);
                 },
-                ...(workerCapabilities!.effectful
-                  ? {
-                      delegateEffectful: (assignment: {
-                        objective: string;
-                        prompt: string;
-                        commitmentId?: string;
-                        targets: string[];
-                        recoveryOfWorkerSessionId?: string;
-                        recoveryReason?: string;
-                      }) => {
-                        const commitmentId = assignment.commitmentId ??
-                          orchestration.recordCommitment(turnId, {
-                            outcome: assignment.objective,
-                            criteria: [{
-                              kind: "target-project-operation",
-                              operation: "test",
-                              description:
-                                "The declared Target Project test operation verifies the delegated change.",
-                            }],
-                          }).id;
-                        return input.workerSupervisor!.delegateEffectful({
-                          ...assignment,
-                          commitmentId,
-                          targetProjectPath: conversation.targetProject.path,
-                          model: workerModel!,
-                          modelPolicyRevision: workerModelPolicyRevision,
-                          timeoutMs: 20 * 60_000,
-                          verification: {
-                            operation: "test" as const,
-                            workingDirectory: conversation.targetProject.path,
-                            timeoutMs: 120_000,
-                          },
-                        });
-                      },
-                      answer: (questionId: string, answers: Record<string, string[]>) =>
-                        input.workerSupervisor!.answer(questionId, turnId, answers),
-                    }
-                  : {}),
-                ...(workerCapabilities!.cancellation
-                  ? {
-                      cancel: (workerSessionId: string, reason: string) =>
-                        input.workerSupervisor!.cancel(workerSessionId, turnId, reason),
-                    }
-                  : {}),
+                steer: async (workerSessionId: string, message: string) =>
+                  supervisorOfWorker(workerSessionId).steer(workerSessionId, message),
+                workerOutput: (workerSessionId: string) => {
+                  try {
+                    return supervisorOfWorker(workerSessionId).workerOutput(workerSessionId);
+                  } catch {
+                    return undefined;
+                  }
+                },
+                answer: (questionId: string, answers: Record<string, string[]>) => {
+                  const question = orchestration
+                    .workerQuestionsView()
+                    .find((candidate) => candidate.id === questionId);
+                  if (!question) throw new Error("Unknown Worker question.");
+                  return supervisorOfWorker(question.workerSessionId)
+                    .answer(questionId, turnId, answers);
+                },
+                cancel: (workerSessionId: string, reason: string) =>
+                  supervisorOfWorker(workerSessionId).cancel(workerSessionId, turnId, reason),
               },
             }
           : {}),

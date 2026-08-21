@@ -11,6 +11,7 @@ import {
   type PiOwnerTranscriptEntry,
 } from "./pi-owner-interface.ts";
 import { completeHostedOwnerInput } from "./owner-host-bridge.ts";
+import type { SessionViewSnapshot } from "./session-view/index.ts";
 
 const installRoot = requiredArgument("--install-root");
 
@@ -32,6 +33,7 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
       transcript: readTranscript(client.transcript),
       completeOwnerInput: (ownerInput) => completeHostedOwnerInput(client, ownerInput),
       readSessionView: () => readLatestSessionView(client.transcript),
+      readSessionData: () => readLatestSessionData(client.transcript),
       subscribeNotices: (listener) =>
         client.onTranscriptEntry((entry: LeadHostTranscriptEntry) => {
           const prefix = "CMD_RIKER_WORKER_NOTICE: ";
@@ -87,6 +89,23 @@ function readLatestSessionView(transcript: readonly LeadHostTranscriptEntry[]): 
     }
   }
   return "Lead starting | Worker Sessions unavailable | status pending";
+}
+
+function readLatestSessionData(
+  transcript: readonly LeadHostTranscriptEntry[],
+): SessionViewSnapshot | undefined {
+  const prefix = "CMD_RIKER_SESSION_JSON:";
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const entry = transcript[index];
+    if (entry?.source !== "lead" || entry.stream !== "stdout") continue;
+    if (!entry.line.startsWith(prefix)) continue;
+    try {
+      return JSON.parse(entry.line.slice(prefix.length)) as SessionViewSnapshot;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function readTranscript(

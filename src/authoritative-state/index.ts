@@ -177,6 +177,7 @@ export interface AuthoritativeState {
   initialize(configuration: OwnerConfiguration): void;
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
   knownModelPolicyRevisions(): string[];
+  commitmentRecordedAt(commitmentId: string): string | undefined;
   readOwnerConversation(): OwnerConversation | undefined;
   ownerMessage(ownerTurnId: string): string | undefined;
   latestOwnerTurnId(): string | undefined;
@@ -1076,6 +1077,17 @@ export function openAuthoritativeState(
         "owner.model-policy-activated",
         existing.id,
       );
+    },
+
+    commitmentRecordedAt(commitmentId) {
+      const row = database
+        .prepare(`
+          SELECT MIN(recorded_at) AS recorded_at
+            FROM facts
+           WHERE kind = 'commitment.snapshot' AND subject_id = ?
+        `)
+        .get(`commitment:${commitmentId}`) as { recorded_at: string | null } | undefined;
+      return row?.recorded_at ?? undefined;
     },
 
     knownModelPolicyRevisions() {

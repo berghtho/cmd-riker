@@ -70,9 +70,19 @@ test("Standing Orders record from plain language, bind to the Owner's words, and
   state = openAuthoritativeState(stateDirectory);
   const reopened = createOrchestrationCore(state);
   assert.equal(reopened.standingOrdersView()[0]?.id, standingOrder.id);
+  // An expired order also leaves the working context without a revocation.
+  state.appendStandingOrderSnapshots([
+    { ...state.readStandingOrders()[0]!, validUntil: new Date(Date.now() - 1_000).toISOString() },
+  ]);
+  assert.deepEqual(reopened.standingOrdersView(), []);
+  state.appendStandingOrderSnapshots([standingOrder]);
+  assert.equal(reopened.standingOrdersView()[0]?.id, standingOrder.id);
+
   const revokeTurnId = state.appendOwnerMessage("Revoke that Standing Order.");
   reopened.revokeStandingOrder(standingOrder.id, revokeTurnId, "The absence ended.");
-  assert.equal(reopened.standingOrdersView()[0]?.state, "revoked");
+  // A revoked order leaves the Lead's working context but stays in the journal.
+  assert.deepEqual(reopened.standingOrdersView(), []);
+  assert.equal(state.readStandingOrders()[0]?.state, "revoked");
   state.close();
 });
 

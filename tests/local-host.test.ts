@@ -53,6 +53,38 @@ test("attached clients share replayed conversation and live output", async (t) =
   assert.deepEqual(second.transcript, first.transcript);
 });
 
+test("a host-side observer sees live entries but never the replayed seed", async (t) => {
+  const observed: LeadHostTranscriptEntry[] = [];
+  const server = await startTestHost({
+    transcriptSeed: [{ source: "owner", line: "seeded history" }],
+    onTranscriptEntry: (entry) => observed.push(entry),
+  });
+  t.after(() => server.stop());
+  const client = await connectLocalLeadHost(server.address);
+  await waitForLeadLine(client, `lead-ready:${server.childPid}`);
+
+  assert(!observed.some((entry) => entry.line === "seeded history"));
+  assert(
+    observed.some(
+      (entry) => entry.source === "lead" && entry.line === `lead-ready:${server.childPid}`,
+    ),
+  );
+});
+
+test("a throwing observer does not disturb the host or its clients", async (t) => {
+  const server = await startTestHost({
+    onTranscriptEntry: () => {
+      throw new Error("observer failure");
+    },
+  });
+  t.after(() => server.stop());
+  const client = await connectLocalLeadHost(server.address);
+  await waitForLeadLine(client, `lead-ready:${server.childPid}`);
+
+  await client.sendOwnerLine("work:despite-observer");
+  await waitForLeadLine(client, "lead-finished:despite-observer");
+});
+
 test("explicit stop durably records intent before closing the Lead Agent input", async () => {
   const stopIntentGate = Promise.withResolvers<void>();
   const stopIntentStarted = Promise.withResolvers<void>();
@@ -184,6 +216,7 @@ async function startTestHost(
     address?: string;
     transcriptSeed?: readonly LeadHostTranscriptEntry[];
     onStopIntent?: () => Promise<void>;
+    onTranscriptEntry?: (entry: LeadHostTranscriptEntry) => void;
   } = {},
 ): Promise<LocalLeadHostServer> {
   return startLocalLeadHost({
@@ -193,6 +226,7 @@ async function startTestHost(
     durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
     ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
     ...(overrides.transcriptSeed ? { transcriptSeed: overrides.transcriptSeed } : {}),
+    ...(overrides.onTranscriptEntry ? { onTranscriptEntry: overrides.onTranscriptEntry } : {}),
     onStopIntent: overrides.onStopIntent ?? (async () => {}),
   });
 }

@@ -44,16 +44,22 @@ async function main() {
   const nodePath = resolve(options.node);
   const leadDist = resolve(options.leadDist);
   const leadNodeModules = resolve(options.leadNodeModules);
+  const tools = options.tools === undefined ? undefined : resolve(options.tools);
   const output = resolve(options.output);
   await assertMissing(output, "Release output");
   await assertPlainDirectory(dirname(output), "Release output parent");
   await assertPlainDirectory(leadDist, "Lead Agent dist");
   await assertPlainDirectory(leadNodeModules, "Lead Agent node_modules");
+  if (tools !== undefined) await assertPlainDirectory(tools, "Bundled tools");
   await assertPlainFile(nodePath, "Supplied Node runtime");
   if (basename(nodePath).toLowerCase() !== "node.exe") {
     throw new Error("--node must reference node.exe.");
   }
-  if (isWithin(leadDist, output) || isWithin(leadNodeModules, output)) {
+  if (
+    isWithin(leadDist, output) ||
+    isWithin(leadNodeModules, output) ||
+    (tools !== undefined && isWithin(tools, output))
+  ) {
     throw new Error("Release output must not be inside a supplied dist tree.");
   }
 
@@ -63,6 +69,9 @@ async function main() {
     leadNodeModules,
     "Lead Agent node_modules",
   );
+  const toolFiles = tools === undefined
+    ? undefined
+    : await collectDistFiles(tools, "Bundled tools");
   requireEntrypoint(leadFiles, "cli.js", "Lead Agent");
   requireEntrypoint(leadFiles, "lifecycle-cli.js", "Lead Agent");
   requireEntrypoint(leadFiles, "owner-launcher.js", "Lead Agent");
@@ -86,6 +95,9 @@ async function main() {
           sourceFiles: leadDependencyFiles,
           destination: "node_modules",
         },
+        ...(toolFiles === undefined
+          ? []
+          : [{ sourceRoot: tools, sourceFiles: toolFiles, destination: "tools" }]),
       ],
       nodePath,
       runtime,
@@ -111,7 +123,9 @@ function parseArguments(argumentsList) {
     ["--lead-dist", "leadDist"],
     ["--lead-node-modules", "leadNodeModules"],
     ["--output", "output"],
+    ["--tools", "tools"],
   ]);
+  const required = ["revision", "node", "leadDist", "leadNodeModules", "output"];
   const values = {};
   for (let index = 0; index < argumentsList.length; index += 2) {
     const flag = argumentsList[index];
@@ -123,7 +137,7 @@ function parseArguments(argumentsList) {
     if (values[key] !== undefined) throw new Error(`Argument ${flag} may be supplied only once.`);
     values[key] = value;
   }
-  if (argumentsList.length !== names.size * 2 || [...names.values()].some((key) => values[key] === undefined)) {
+  if (required.some((key) => values[key] === undefined)) {
     throw usageError();
   }
   return values;
@@ -132,7 +146,8 @@ function parseArguments(argumentsList) {
 function usageError() {
   return new Error(
     "Usage: build-local-release.mjs --revision <revision> --node <node.exe> " +
-      "--lead-dist <directory> --lead-node-modules <directory> --output <directory>",
+      "--lead-dist <directory> --lead-node-modules <directory> --output <directory> " +
+      "[--tools <directory>]",
   );
 }
 

@@ -98,3 +98,9 @@ _Avoid_: Self-deploy, Staged probation
 A minimal observational overview showing plain-language status of the Lead Agent and Worker
 Sessions. It never owns workflow continuation and shows no internal identifiers.
 _Avoid_: Board, Dashboard, Control plane, Attention ledger
+
+**Owner Notice**:
+A push message telling the Owner the moment work needs them or fails, delivered into the
+conversation and as a native Windows notification under CMD Riker's own identity — never labeled
+as a shell process. Durable state carries the fact; the notice itself is best-effort.
+_Avoid_: Alert, Popup, Balloon tip

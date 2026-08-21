@@ -25,6 +25,7 @@ import {
   ensureWriteGenerationSchema,
   readWriteGenerationHighWater,
 } from "../write-generation.ts";
+import { removeOwnerToastRegistration } from "../owner-notifications/index.ts";
 
 export type CodeStatePair = {
   code: {
@@ -405,6 +406,8 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
         await rm(paths.leadAgentVersions, { recursive: true, force: true });
         await rm(paths.launcher, { recursive: true, force: true });
         await rm(join(paths.root, "protected"), { recursive: true, force: true });
+        // The toast identity shortcut is launcher material and leaves with it.
+        await removeOwnerToastRegistration();
         writeLifecycle(paths.lifecycleJournal, {
           ...lifecycle,
           status: "uninstalled",

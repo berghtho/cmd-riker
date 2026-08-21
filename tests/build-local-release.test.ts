@@ -60,6 +60,29 @@ test("builds one complete Lead Agent release bundle with its lifecycle tools", {
   );
 });
 
+test("bundles an optional tools tree into the hashed manifest", { skip }, async (t) => {
+  const fixture = await releaseFixture(t, "tools");
+  const tools = join(fixture.root, "tools-source");
+  await writeFixtureFile(tools, "snoretoast/snoretoast-x64.exe", "not-a-real-binary\n");
+  await writeFixtureFile(tools, "snoretoast/LICENSE", "LGPL-3.0\n");
+
+  await buildRelease(fixture, "release-with-tools", tools);
+
+  const lead = await verifyLocalReleaseCandidate(
+    join(fixture.output, "lead-agent"),
+    "lead-agent",
+  );
+  assert(lead.manifest.files.some((file) => file.path === "tools/snoretoast/snoretoast-x64.exe"));
+  assert(lead.manifest.files.some((file) => file.path === "tools/snoretoast/LICENSE"));
+  assert.equal(
+    await readFile(
+      join(fixture.output, "lead-agent", "tools", "snoretoast", "snoretoast-x64.exe"),
+      "utf8",
+    ),
+    "not-a-real-binary\n",
+  );
+});
+
 test("refuses unsafe revisions and never replaces an existing output", { skip }, async (t) => {
   const fixture = await releaseFixture(t);
 
@@ -118,6 +141,7 @@ async function writeFixtureFile(root: string, relativePath: string, contents: st
 async function buildRelease(
   fixture: Awaited<ReturnType<typeof releaseFixture>>,
   revision: string,
+  tools?: string,
 ): Promise<void> {
   try {
     await run(process.execPath, [
@@ -132,6 +156,7 @@ async function buildRelease(
       fixture.leadNodeModules,
       "--output",
       fixture.output,
+      ...(tools === undefined ? [] : ["--tools", tools]),
     ]);
   } catch (error) {
     const failure = error as Error & { stderr?: string };

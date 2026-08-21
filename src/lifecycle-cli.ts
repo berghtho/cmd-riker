@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { dirname, resolve } from "node:path";
@@ -18,6 +19,7 @@ import {
   type LeadHostTranscriptEntry,
 } from "./local-host/index.ts";
 import { verifyLocalReleaseCandidate } from "./local-release/index.ts";
+import { createWindowsToastNotifier } from "./owner-notifications/index.ts";
 
 const command = process.argv[2];
 
@@ -97,6 +99,16 @@ async function host(installRoot: string): Promise<void> {
       const release = await verifyLocalReleaseCandidate(lifecycle.active.code.path, "lead-agent");
       const generation = readGeneration(paths.state);
       if (shutdownRequested) return;
+      // A bundle without the vendored SnoreToast simply runs without toasts.
+      const toastExecutable = join(release.path, "tools", "snoretoast", "snoretoast-x64.exe");
+      const toasts = existsSync(toastExecutable)
+        ? createWindowsToastNotifier({
+            snoretoastPath: toastExecutable,
+            shortcutTarget: join(paths.launcher, "riker.cmd"),
+          })
+        : undefined;
+      if (toasts) await toasts.ensureRegistered().catch(() => {});
+      const workerNoticePrefix = "CMD_RIKER_WORKER_NOTICE: ";
       try {
         const server = await startLocalLeadHost({
           address: localLeadHostAddress(paths.root),
@@ -112,6 +124,14 @@ async function host(installRoot: string): Promise<void> {
           transcriptSeed: conversationSeed(paths.state, generation),
           durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
           ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
+          onTranscriptEntry(entry) {
+            if (!toasts || entry.source !== "lead" || entry.stream !== "stdout") return;
+            if (!entry.line.startsWith(workerNoticePrefix)) return;
+            toasts.notify({
+              title: "CMD Riker",
+              message: entry.line.slice(workerNoticePrefix.length),
+            });
+          },
           async onStopIntent() {
             const current = readLifecycle(paths.lifecycleJournal);
             if (!current?.stopRequested) {

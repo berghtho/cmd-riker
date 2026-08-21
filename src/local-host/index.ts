@@ -55,6 +55,8 @@ export type StartLocalLeadHostOptions = {
   ownerHandledMarker?: string;
   durableOwnerAckTimeoutMs?: number;
   onStopIntent: () => Promise<void>;
+  /** Observes live transcript entries (not the seed); must not disturb the host. */
+  onTranscriptEntry?: (entry: LeadHostTranscriptEntry) => void;
 };
 
 type ClientRequest =
@@ -158,6 +160,11 @@ export async function startLocalLeadHost(
 
   const recordEntry = (entry: LeadHostTranscriptEntry): void => {
     appendTranscript(entry);
+    try {
+      options.onTranscriptEntry?.(entry);
+    } catch {
+      // A failing observer must never take the Lead Agent host down with it.
+    }
     broadcast({ type: "entry", entry });
   };
 

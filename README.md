@@ -41,12 +41,15 @@ npm run build:local-release -- `
   --node "C:\Program Files\nodejs\node.exe" `
   --lead-dist dist\lead-agent `
   --lead-node-modules node_modules `
+  --tools vendor `
   --output release\riker-0.1.0-local.1
 ```
 
 The builder refuses an unsupported Node runtime, records the exact supplied version, hashes every
 final file, and emits a strict manifest. The bundle carries its own pinned Node runtime and Pi
-dependencies.
+dependencies. The optional `--tools` tree bundles `vendor\snoretoast` (see
+`vendor\snoretoast\PROVENANCE.md`), which enables native Owner Notices; a bundle built without it
+simply runs without toasts.
 
 Prepare the secret-free configuration below, then install:
 
@@ -69,6 +72,8 @@ The installation is deliberately per-user and contained under `%LOCALAPPDATA%\CM
   dependencies.
 - `state\` contains the authoritative SQLite state.
 - `recovery\` contains the lifecycle journal, snapshots, and failed-state evidence.
+- One Start Menu shortcut, `CMD Riker`, carries the toast identity so Owner Notices appear as
+  "CMD Riker" instead of a raw executable. `uninstall` removes it.
 
 Nothing registers with Windows Task Scheduler and nothing starts at boot or logon. `riker start`
 spawns one detached host process from the active bundle; the host owns the singleton pipe, runs the
@@ -282,7 +287,11 @@ only then runs Verification. Unrelated uncommitted Owner changes in the Target P
 and tolerated; only a change that touches the Worker's own paths differently stops automatic effects
 and surfaces one material Owner intervention while preserving both checkouts. Each lifecycle step is
 read back before retry after restart. Worker completion, failure, and required interventions are
-pushed to the Owner interface as they happen instead of waiting for the next Owner turn.
+pushed to the Owner interface as they happen instead of waiting for the next Owner turn. When the
+bundle carries the vendored SnoreToast tool, each of these Owner Notices also raises one silent
+native Windows toast from the detached host — branded "CMD Riker" through the registered Start Menu
+shortcut, with no PowerShell involved — so a Worker that needs the Owner is noticed even while the
+`riker` terminal is in the background.
 
 ## Lead Agent tools and skills
 

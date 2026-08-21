@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, posix, win32 } from "node:path";
 
-export type LocalReleaseKind = "lead-agent" | "recovery-actor";
+export type LocalReleaseKind = "lead-agent";
 
 export type LocalReleaseManifest = {
   formatVersion: 1;
@@ -70,7 +70,7 @@ export function parseLocalReleaseManifest(json: string): LocalReleaseManifest {
   if (value.formatVersion !== 1) {
     throw new Error("Local release manifest formatVersion must be exactly 1.");
   }
-  if (value.kind !== "lead-agent" && value.kind !== "recovery-actor") {
+  if (value.kind !== "lead-agent") {
     throw new Error("Local release manifest kind is invalid.");
   }
   if (typeof value.revision !== "string" || !revisionPattern.test(value.revision)) {

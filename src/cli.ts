@@ -182,7 +182,6 @@ async function main(): Promise<void> {
   }
   const adapter: PiTurnAdapter = new PiAgentTurnAdapter();
   try {
-    const activationProvisional = process.argv.includes("--activation-provisional");
     let policyValidated = false;
     let conversation = state.readOwnerConversation();
     const configuration = await readStartupConfiguration(stateDirectory, !conversation);
@@ -231,7 +230,7 @@ async function main(): Promise<void> {
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
     createOrchestrationCore(state).reconcileInterruptedCommitments();
-    if (!policyValidated && !activationProvisional) {
+    if (!policyValidated) {
       await validatePolicy(adapter, conversation);
     }
     const ownerNotices: OwnerNoticeSink = {
@@ -240,7 +239,6 @@ async function main(): Promise<void> {
     };
     const workerSupervisors = await availableWorkerSupervisors(state, conversation, ownerNotices);
     for (const supervisor of Object.values(workerSupervisors)) await supervisor.recover();
-    emitActivationReady();
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
       await runInteractiveConversation(
@@ -546,19 +544,6 @@ function requiredArgument(name: string): string {
     throw new HostDiagnostic("CMD_RIKER_ARGUMENT_INVALID", `${name} is required.`);
   }
   return value;
-}
-
-function emitActivationReady(): void {
-  const nonce = argumentValue("--activation-handshake-nonce");
-  if (!nonce) return;
-  process.stdout.write(`${JSON.stringify({
-    type: "CMD_RIKER_ACTIVATION_READY",
-    attemptId: requiredArgument("--activation-attempt-id"),
-    candidateRevision: requiredArgument("--candidate-revision"),
-    artifactDigest: requiredArgument("--artifact-digest"),
-    handshakeNonce: nonce,
-    pid: process.pid,
-  })}\n`);
 }
 
 class HostDiagnostic extends Error {

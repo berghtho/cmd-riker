@@ -26,7 +26,7 @@ const skip = runtimeSupported
   ? false
   : `requires Node ${minimumNodeVersion.join(".")} or newer on x64/arm64`;
 
-test("builds separate complete Lead Agent and Recovery Actor release bundles", { skip }, async (t) => {
+test("builds one complete Lead Agent release bundle with its lifecycle tools", { skip }, async (t) => {
   const fixture = await releaseFixture(t);
 
   await buildRelease(fixture, "release-37");
@@ -35,32 +35,25 @@ test("builds separate complete Lead Agent and Recovery Actor release bundles", {
     join(fixture.output, "lead-agent"),
     "lead-agent",
   );
-  const actor = await verifyLocalReleaseCandidate(
-    join(fixture.output, "recovery-actor"),
-    "recovery-actor",
-  );
   assert.equal(lead.manifest.entrypoint, "dist/cli.js");
-  assert.equal(actor.manifest.entrypoint, "dist/lifecycle-cli.js");
   assert.deepEqual(
     lead.manifest.files.map((file) => file.path),
     [
       "dist/cli.js",
       "dist/lead-support.js",
+      "dist/lifecycle-cli.js",
+      "dist/owner-client.js",
+      "dist/owner-launcher.js",
       "node_modules/runtime-dependency/index.js",
       "node_modules/runtime-dependency/package.json",
       "runtime/node.exe",
     ],
-  );
-  assert.deepEqual(
-    actor.manifest.files.map((file) => file.path),
-    ["dist/lifecycle-cli.js", "dist/recovery-actor/index.js", "runtime/node.exe"],
   );
   assert.deepEqual(lead.manifest.runtime, {
     version: process.version.slice(1),
     architecture: process.arch,
     path: "runtime/node.exe",
   });
-  assert.deepEqual(actor.manifest.runtime, lead.manifest.runtime);
   assert.deepEqual(
     await readFile(join(fixture.output, "lead-agent", "runtime", "node.exe")),
     await readFile(fixture.node),
@@ -84,43 +77,23 @@ test("refuses unsafe revisions and never replaces an existing output", { skip },
   );
 });
 
-test("rejects Recovery Actor trees containing node_modules or non-built-in imports", { skip }, async (t) => {
-  const nodeModules = await releaseFixture(t, "node-modules");
-  await mkdir(join(nodeModules.actorDist, "node_modules"));
-  await assert.rejects(buildRelease(nodeModules, "actor-node-modules"), /node_modules/);
-
-  const piImport = await releaseFixture(t, "pi-import");
-  await writeFile(
-    join(piImport.actorDist, "lifecycle-cli.js"),
-    'import "@earendil-works/pi-ai";\n',
-  );
-  await assert.rejects(buildRelease(piImport, "actor-pi-import"), /forbidden Pi\/Codex import/);
-
-  const codexImport = await releaseFixture(t, "codex-import");
-  await writeFile(
-    join(codexImport.actorDist, "lifecycle-cli.js"),
-    'import "./worker-supervisor/codex-app-server.js";\n',
-  );
-  await assert.rejects(buildRelease(codexImport, "actor-codex-import"), /forbidden Pi\/Codex import/);
-
-  const otherImport = await releaseFixture(t, "other-import");
-  await writeFile(
-    join(otherImport.actorDist, "lifecycle-cli.js"),
-    'import "typebox";\n',
-  );
-  await assert.rejects(buildRelease(otherImport, "actor-other-import"), /non-built-in import/);
+test("rejects a Lead dist without the lifecycle and Owner tools", { skip }, async (t) => {
+  const fixture = await releaseFixture(t, "no-lifecycle");
+  await rm(join(fixture.leadDist, "lifecycle-cli.js"));
+  await assert.rejects(buildRelease(fixture, "no-lifecycle"), /lifecycle-cli\.js/);
 });
 
 async function releaseFixture(t: test.TestContext, suffix = "release") {
   const root = await mkdtemp(join(tmpdir(), `cmd-riker-build-${suffix}-`));
   t.after(() => rm(root, { recursive: true, force: true }));
   const leadDist = join(root, "lead-dist");
-  const actorDist = join(root, "actor-dist");
   const leadNodeModules = join(root, "lead-node-modules");
   const node = join(root, "runtime", "node.exe");
   await writeFixtureFile(leadDist, "cli.js", "import './lead-support.js';\n");
   await writeFixtureFile(leadDist, "lead-support.js", "export const lead = true;\n");
-  await writeFixtureFile(actorDist, "lifecycle-cli.js", "import './recovery-actor/index.js';\n");
+  await writeFixtureFile(leadDist, "lifecycle-cli.js", "export const lifecycle = true;\n");
+  await writeFixtureFile(leadDist, "owner-launcher.js", "export const launcher = true;\n");
+  await writeFixtureFile(leadDist, "owner-client.js", "export const client = true;\n");
   await writeFixtureFile(
     leadNodeModules,
     "runtime-dependency/index.js",
@@ -131,14 +104,9 @@ async function releaseFixture(t: test.TestContext, suffix = "release") {
     "runtime-dependency/package.json",
     '{"name":"runtime-dependency","type":"module"}\n',
   );
-  await writeFixtureFile(
-    actorDist,
-    "recovery-actor/index.js",
-    "export const actor = true;\n",
-  );
   await mkdir(dirname(node), { recursive: true });
   await copyFile(process.execPath, node);
-  return { root, leadDist, leadNodeModules, actorDist, node, output: join(root, "output") };
+  return { root, leadDist, leadNodeModules, node, output: join(root, "output") };
 }
 
 async function writeFixtureFile(root: string, relativePath: string, contents: string): Promise<void> {
@@ -162,8 +130,6 @@ async function buildRelease(
       fixture.leadDist,
       "--lead-node-modules",
       fixture.leadNodeModules,
-      "--actor-dist",
-      fixture.actorDist,
       "--output",
       fixture.output,
     ]);

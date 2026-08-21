@@ -250,46 +250,11 @@ test("Owner CLI reports a fenced installed generation without opening conversati
   active.close();
 });
 
-test("provisional activation reports readiness without requiring live Model availability", async (t) => {
-  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-provisional-test-"));
-  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
-  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
-  state.initialize({
-    targetProject: { path: "C:\\target-project" },
-    modelSelection: {
-      provider: "local-openai",
-      model: "owner-model",
-      api: "openai-completions",
-      baseUrl: "http://127.0.0.1:1/v1",
-    },
-    modelPolicyRevision: "owner-policy-1",
-  });
-  state.close();
-
-  const result = await runCli(stateDirectory, "", [
-    "--write-generation",
-    "1",
-    "--activation-provisional",
-    "--activation-handshake-nonce",
-    "nonce-1",
-    "--activation-attempt-id",
-    "attempt-1",
-    "--candidate-revision",
-    "candidate-1",
-    "--artifact-digest",
-    "digest-1",
-  ]);
-
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(
-    result.stdout,
-    /"type":"CMD_RIKER_ACTIVATION_READY".*"attemptId":"attempt-1".*"handshakeNonce":"nonce-1"/,
-  );
-});
-
 test("hosted Session View inspection acknowledges handling without inventing a durable Owner turn", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-hosted-session-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel(() => "unused");
+  t.after(() => localModel.close());
   const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
   state.initialize({
     targetProject: { path: "C:\\target-project" },
@@ -297,7 +262,7 @@ test("hosted Session View inspection acknowledges handling without inventing a d
       provider: "local-openai",
       model: "owner-model",
       api: "openai-completions",
-      baseUrl: "http://127.0.0.1:1/v1",
+      baseUrl: localModel.baseUrl,
     },
     modelPolicyRevision: "owner-policy-1",
   });
@@ -306,7 +271,6 @@ test("hosted Session View inspection acknowledges handling without inventing a d
   const result = await runCli(stateDirectory, "/session workers\n", [
     "--write-generation",
     "1",
-    "--activation-provisional",
     "--hosted",
   ]);
 

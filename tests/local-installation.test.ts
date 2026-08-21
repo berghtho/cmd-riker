@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,472 +9,55 @@ import test from "node:test";
 
 import {
   createLocalInstallation,
-  LocalInstallationError,
-  type LocalInstallationSupervision,
+  localInstallationPaths,
+  readGeneration,
+  type CodeStatePair,
+  type LocalInstallation,
 } from "../src/local-installation/index.ts";
-import type {
-  LocalReleaseKind,
-  LocalReleaseManifest,
-} from "../src/local-release/index.ts";
 import type { LocalLeadHostClient } from "../src/local-host/index.ts";
-import type {
-  ActivationEffects,
-  CodeStatePair,
-  HealthAssessment,
-} from "../src/recovery-actor/index.ts";
-import { advanceWriteGeneration } from "../src/write-generation.ts";
+import type { LocalReleaseManifest } from "../src/local-release/index.ts";
 
 const bundlePayload = {
-  "dist/main.js": Buffer.from("console.log('local installation');\n"),
-  "dist/owner-launcher.js": Buffer.from("console.log('owner launcher');\n"),
-  "runtime/node.exe": Buffer.from("bundled Node runtime"),
+  "dist/cli.js": Buffer.from("console.log('lead');\n"),
+  "dist/lifecycle-cli.js": Buffer.from("console.log('lifecycle');\n"),
+  "dist/owner-launcher.js": Buffer.from("console.log('launcher');\n"),
+  "dist/owner-client.js": Buffer.from("console.log('client');\n"),
+  "runtime/node.exe": Buffer.from("fake pinned node runtime"),
 };
 
-test("happy install stages exact protected identities before register and verifies the per-user task", async (t) => {
-  const fixture = await installationFixture(t);
+type Harness = {
+  installation: LocalInstallation;
+  root: string;
+  spawns: CodeStatePair[];
+  hostRunning: { value: boolean };
+};
 
-  const installed = await fixture.installation.initialInstall(fixture.initialInput);
-
-  assert.equal(installed.status, "installed");
-  assert.equal(installed.stopRequested, false);
-  assert.equal(installed.stopped, true);
-  assert.equal(installed.actor?.revision, "actor-1");
-  assert.equal(installed.active?.code.revision, "lead-1");
-  assert.equal(installed.active?.state.revision, "state-1");
-  assert.equal(installed.writeGeneration, 1);
-  assert.equal(fixture.supervision.events.join(","), "register,verify,inspect");
-  assert(installed.actor?.path.startsWith(installed.paths.protectedRecoveryActorVersions));
-  assert(installed.active?.code.path.startsWith(installed.paths.leadAgentVersions));
-  assert(!installed.actor?.path.startsWith(installed.paths.leadAgentVersions));
-  await access(join(installed.actor!.path, "runtime", "node.exe"));
-  await access(join(installed.active!.code.path, "runtime", "node.exe"));
-  await access(installed.paths.activationJournal);
-  await access(installed.paths.lifecycleJournal);
-  const launcher = JSON.parse(
-    await readFile(join(installed.paths.launcher, "installation.json"), "utf8"),
-  ) as { actor: { identity: { digest: string } }; leadAgent: { identity: { digest: string } } };
-  assert.equal(launcher.actor.identity.digest, installed.actor?.digest);
-  assert.equal(launcher.leadAgent.identity.digest, installed.active?.code.digest);
-  assert.match(
-    await readFile(join(installed.paths.launcher, "riker.cmd"), "utf8"),
-    /owner-launcher\.js" --install-root .* %\*/,
-  );
-});
-
-test("duplicate start delegates singleton launch and reconnects to the same local host", async (t) => {
-  const connections: string[] = [];
-  const fixture = await installationFixture(t, {
-    connectHost: async (address) => {
-      connections.push(address);
-      return hostClient(connections.length, address);
-    },
-  });
-  await fixture.installation.initialInstall(fixture.initialInput);
-
-  const first = await fixture.installation.start();
-  const second = await fixture.installation.start();
-
-  assert.equal(first.address, second.address);
-  assert.deepEqual(connections, [first.address, first.address]);
-  assert.equal(fixture.supervision.events.filter((event) => event === "start").length, 2);
-  assert.equal((await fixture.installation.inspect()).stopRequested, false);
-});
-
-test("a durable lifecycle operation serializes start against upgrade and uninstall", async (t) => {
-  const connecting = Promise.withResolvers<void>();
-  const releaseConnection = Promise.withResolvers<void>();
-  const fixture = await installationFixture(t, {
-    connectHost: async (address) => {
-      connecting.resolve();
-      await releaseConnection.promise;
-      return hostClient(1, address);
-    },
-  });
-  await fixture.installation.initialInstall(fixture.initialInput);
-
-  const starting = fixture.installation.start();
-  await connecting.promise;
-  await assert.rejects(
-    fixture.installation.uninstall(),
-    (error: unknown) => {
-      assert(error instanceof LocalInstallationError);
-      const messages: string[] = [];
-      let current: unknown = error;
-      while (current instanceof Error) {
-        messages.push(current.message);
-        current = current.cause;
-      }
-      assert.match(messages.join("\n"), /operation start is already in progress/);
-      return true;
-    },
-  );
-  assert.equal((await fixture.installation.inspect()).currentOperation?.kind, "start");
-
-  releaseConnection.resolve();
-  await starting;
-  assert.equal((await fixture.installation.inspect()).currentOperation, undefined);
-});
-
-test("manual start reclaims an abandoned upgrade operation and lets the protected actor recover", async (t) => {
-  const fixture = await installationFixture(t);
-  const installed = await fixture.installation.initialInstall(fixture.initialInput);
-  const database = new DatabaseSync(installed.paths.lifecycleJournal);
-  database
-    .prepare("UPDATE local_installation SET operation_json = ? WHERE singleton = 1")
-    .run(JSON.stringify({
-      id: "abandoned-upgrade",
-      kind: "upgrade",
-      pid: 2_000_000_000,
-      startedAt: "2026-08-20T12:00:00.000Z",
-    }));
-  database.close();
-
-  const client = await fixture.installation.start();
-
-  assert.equal(client.childPid, 1);
-  assert.equal((await fixture.installation.inspect()).currentOperation, undefined);
-});
-
-test("stop intent remains durable when the Lead host cannot be contacted", async (t) => {
-  const fixture = await installationFixture(t, {
-    requestStop: async () => {
-      throw new Error("pipe unavailable");
-    },
-  });
-  await fixture.installation.initialInstall(fixture.initialInput);
-  await fixture.installation.start();
-
-  await fixture.installation.stop();
-
-  const inspection = await fixture.installation.inspect();
-  assert.equal(inspection.stopRequested, true);
-  assert.equal(inspection.stopped, true);
-  assert.equal(fixture.supervision.events.includes("stop"), true);
-});
-
-test("registration verification rollback unregisters the task but preserves state and recovery", async (t) => {
-  const fixture = await installationFixture(t);
-  fixture.supervision.verifyError = new Error("configured task drifted");
-
-  await assert.rejects(
-    fixture.installation.initialInstall(fixture.initialInput),
-    (error: unknown) => {
-      assert(error instanceof LocalInstallationError);
-      assert.equal(error.operation, "install");
-      assert.equal(
-        error.message,
-        "Local installation scheduler registration failed and was rolled back.",
-      );
-      return true;
-    },
-  );
-
-  assert.deepEqual(fixture.supervision.events, ["register", "verify", "unregister"]);
-  assert.equal(fixture.supervision.registered, false);
-  const inspection = await fixture.installation.inspect();
-  assert.equal(inspection.status, "registration-failed");
-  await access(join(inspection.paths.state, "authoritative-state.sqlite"));
-  await access(inspection.paths.activationJournal);
-  await access(inspection.active!.state.snapshotPath);
-});
-
-test("Owner upgrade snapshots SQLite state before handing the exact candidate pair to activation", async (t) => {
-  let verifiedCandidate: CodeStatePair | undefined;
-  const fixture = await installationFixture(t, {
-    effectsHooks: {
-      verifyCandidate(candidate) {
-        verifiedCandidate = candidate;
-      },
-    },
-  });
-  await fixture.installation.initialInstall(fixture.initialInput);
-  const lead2 = join(fixture.root, "candidate-lead-2");
-  await writeBundle(lead2, "lead-agent", "lead-2");
-
-  const result = await fixture.installation.upgrade({
-    leadAgentCandidateDirectory: lead2,
-    stateRevision: "state-for-lead-2",
-    stateProvenance: "owner-upgrade-lead-2",
-    activation: activationRequest(),
-  });
-
-  assert.equal(result.outcome, "activated");
-  assert.deepEqual(verifiedCandidate, result.candidate);
-  assert.deepEqual(result.candidate.state, {
-    revision: result.snapshot.revision,
-    digest: result.snapshot.digest,
-    snapshotPath: result.snapshot.path,
-  });
-  assert.equal(result.snapshot.writeGeneration, 1);
-  const snapshotDatabase = new DatabaseSync(result.snapshot.path, { readOnly: true });
-  assert.equal(
-    (snapshotDatabase.prepare("PRAGMA integrity_check").get() as { integrity_check: string })
-      .integrity_check,
-    "ok",
-  );
-  snapshotDatabase.close();
-  const inspection = await fixture.installation.inspect();
-  assert.deepEqual(inspection.active, result.candidate);
-  assert.equal(inspection.currentAttempt?.candidate.state.digest, result.snapshot.digest);
-  assert.equal(inspection.currentAttempt?.baseline.state.digest, result.snapshot.digest);
-  assert.equal(inspection.currentAttempt?.baseline.code.revision, "lead-1");
-});
-
-test("upgrade restarts protected supervision before transferring Authoritative State", async (t) => {
-  const events: string[] = [];
-  const fixture = await installationFixture(t, {
-    supervisionEvents: events,
-    effectsHooks: {
-      beforeGenerationTransfer() {
-        assert.equal(events.includes("start"), true);
-      },
-    },
-  });
-  await fixture.installation.initialInstall(fixture.initialInput);
-  const lead2 = join(fixture.root, "candidate-lead-supervised");
-  await writeBundle(lead2, "lead-agent", "lead-supervised");
-  events.length = 0;
-
-  await fixture.installation.upgrade({
-    leadAgentCandidateDirectory: lead2,
-    stateRevision: "state-supervised",
-    stateProvenance: "supervised-upgrade",
-    activation: activationRequest(),
-  });
-
-  assert.equal(events[0], "start");
-  assert.equal((await fixture.installation.inspect()).stopped, false);
-});
-
-test("invalid upgrade preparation leaves the accepted Lead Agent running", async (t) => {
-  const events: string[] = [];
-  const fixture = await installationFixture(t, { supervisionEvents: events });
-  await fixture.installation.initialInstall(fixture.initialInput);
-  await fixture.installation.start();
-  const invalid = join(fixture.root, "invalid-candidate");
-  await writeBundle(invalid, "lead-agent", "invalid-lead");
-  await writeFile(join(invalid, "dist", "main.js"), "tampered after manifest");
-  events.length = 0;
-
-  await assert.rejects(
-    fixture.installation.upgrade({
-      leadAgentCandidateDirectory: invalid,
-      stateRevision: "invalid-preparation",
-      stateProvenance: "must not cut over",
-      activation: activationRequest(),
-    }),
-    /upgrade failed/,
-  );
-
-  assert.equal(events.includes("stop"), false);
-  assert.equal((await fixture.installation.inspect()).stopped, false);
-});
-
-test("uninstall safely stops and removes launch material while preserving all durable evidence", async (t) => {
-  const order: string[] = [];
-  const fixture = await installationFixture(t, {
-    supervisionEvents: order,
-    requestStop: async () => {
-      order.push("record-stop-intent");
-    },
-  });
-  const installed = await fixture.installation.initialInstall(fixture.initialInput);
-  await fixture.installation.start();
-  order.length = 0;
-  const failedEvidence = join(installed.paths.failedEvidence, "failed.sqlite");
-  await writeFile(failedEvidence, "failed generation evidence");
-  const stateBefore = await readFile(join(installed.paths.state, "authoritative-state.sqlite"));
-  const journalBefore = await readFile(installed.paths.activationJournal);
-
-  await fixture.installation.uninstall();
-
-  assert.deepEqual(order, ["record-stop-intent", "stop", "unregister"]);
-  await assert.rejects(access(installed.paths.leadAgentVersions), { code: "ENOENT" });
-  await assert.rejects(access(join(installed.paths.root, "protected")), { code: "ENOENT" });
-  await assert.rejects(access(installed.paths.launcher), { code: "ENOENT" });
-  assert.deepEqual(
-    await readFile(join(installed.paths.state, "authoritative-state.sqlite")),
-    stateBefore,
-  );
-  assert.deepEqual(await readFile(installed.paths.activationJournal), journalBefore);
-  assert.equal(await readFile(failedEvidence, "utf8"), "failed generation evidence");
-  await access(installed.active!.state.snapshotPath);
-  const inspection = await fixture.installation.inspect();
-  assert.equal(inspection.status, "uninstalled");
-  assert.equal(inspection.stopRequested, true);
-  assert.equal(inspection.stopped, true);
-});
-
-class FakeSupervision implements LocalInstallationSupervision {
-  readonly events: string[];
-  registered = false;
-  verifyError?: Error;
-
-  constructor(events: string[] = []) {
-    this.events = events;
-  }
-
-  async register(): Promise<void> {
-    this.events.push("register");
-    this.registered = true;
-  }
-
-  async verify() {
-    this.events.push("verify");
-    if (this.verifyError) throw this.verifyError;
-    return supervisionInspection();
-  }
-
-  async inspect() {
-    this.events.push("inspect");
-    return supervisionInspection();
-  }
-
-  async start(): Promise<void> {
-    this.events.push("start");
-  }
-
-  async stop(): Promise<void> {
-    this.events.push("stop");
-  }
-
-  async unregister(): Promise<void> {
-    this.events.push("unregister");
-    this.registered = false;
-  }
-}
-
-async function installationFixture(
-  t: test.TestContext,
-  overrides: {
-    connectHost?: (address: string) => Promise<LocalLeadHostClient>;
-    requestStop?: (address: string) => Promise<void>;
-    supervisionEvents?: string[];
-    effectsHooks?: {
-      verifyCandidate?: (candidate: CodeStatePair) => void;
-      beforeGenerationTransfer?: () => void;
-    };
-  } = {},
-) {
-  const root = await mkdtemp(join(tmpdir(), "cmd-riker-installation-"));
+async function harness(t: { after(callback: () => void | Promise<void>): void }): Promise<Harness> {
+  const root = await mkdtemp(join(tmpdir(), "cmd-riker-lifecycle-v2-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const actor = join(root, "candidate-actor-1");
-  const lead = join(root, "candidate-lead-1");
-  await writeBundle(actor, "recovery-actor", "actor-1");
-  await writeBundle(lead, "lead-agent", "lead-1");
-  const supervision = new FakeSupervision(overrides.supervisionEvents);
+  const spawns: CodeStatePair[] = [];
+  const hostRunning = { value: false };
   const installation = createLocalInstallation({
-    installationRoot: join(root, "installed"),
-    supervision,
-    activationEffects: activationEffects(join(root, "installed", "state"), overrides.effectsHooks),
-    connectHost: overrides.connectHost ?? (async (address) => hostClient(1, address)),
-    ...(overrides.requestStop ? { requestStop: overrides.requestStop } : {}),
+    installationRoot: root,
+    spawnHost: async (active) => {
+      spawns.push(active);
+      hostRunning.value = true;
+    },
+    probeHost: async () => hostRunning.value,
+    connectHost: async () => fakeClient(hostRunning),
   });
-  return {
-    root,
-    supervision,
-    installation,
-    initialInput: {
-      recoveryActorCandidateDirectory: actor,
-      leadAgentCandidateDirectory: lead,
-      stateRevision: "state-1",
-      stateProvenance: "initial-install",
-    },
-  };
+  return { installation, root, spawns, hostRunning };
 }
 
-function activationEffects(
-  stateDirectory: string,
-  hooks: {
-    verifyCandidate?: (candidate: CodeStatePair) => void;
-    beforeGenerationTransfer?: () => void;
-  } = {},
-): ActivationEffects {
-  const healthy: HealthAssessment = {
-    verdict: "healthy",
-    subject: "candidate",
-    scope: "installation-test",
-    observedAt: "2026-08-20T12:01:00.000Z",
-    evidence: ["fixed-health-contract"],
-  };
+function fakeClient(hostRunning: { value: boolean }): LocalLeadHostClient {
   return {
-    async verifyCandidate(candidate) {
-      hooks.verifyCandidate?.(candidate);
-    },
-    async verifyRecoveryBaseline() {
-      return healthy;
-    },
-    async assessBarrier() {
-      return { ready: true, blockers: [] };
-    },
-    async snapshotState() {},
-    async transferWriteGeneration(expected) {
-      hooks.beforeGenerationTransfer?.();
-      return advanceWriteGeneration(stateDirectory, expected);
-    },
-    async currentWriteGeneration() {
-      const database = new DatabaseSync(join(stateDirectory, "authoritative-state.sqlite"), {
-        readOnly: true,
-      });
-      const row = database
-        .prepare("SELECT write_generation FROM lifecycle_metadata WHERE singleton = 1")
-        .get() as { write_generation: number };
-      database.close();
-      return row.write_generation;
-    },
-    async launch(_pair, context) {
-      return { pid: 42, startedAt: "2026-08-20T12:00:30.000Z", nonce: context.nonce };
-    },
-    async assessHealth() {
-      return healthy;
-    },
-    async awaitProbation() {
-      return healthy;
-    },
-    async terminate() {},
-    async restoreBaseline(_pair, failedGeneration) {
-      return advanceWriteGeneration(stateDirectory, failedGeneration);
-    },
-    async restoredBaselineGeneration() {
-      return undefined;
-    },
-  };
-}
-
-function activationRequest() {
-  return {
-    authority: {
-      kind: "owner-supplied-upgrade" as const,
-      authorizedAt: "2026-08-20T12:00:00.000Z",
-    },
-    compatibility: {
-      stateSchema: "lossless-return-proven" as const,
-      evidence: "sqlite-native-baseline",
-    },
-    verification: { verdict: "passed" as const, evidence: ["bundle-digest", "snapshot"] },
-    review: { verdict: "passed" as const, evidence: ["owner-supplied"] },
-    healthCriteria: [
-      "exact-identity",
-      "artifact-integrity",
-      "authoritative-state",
-      "write-generation",
-      "conversation-context",
-      "write-read-probe",
-      "recovery-handshake",
-    ],
-    budget: { deadline: "2099-08-20T12:05:00.000Z", probationChecks: 2 },
-    recoveryPath: "restore-exact-baseline-pair" as const,
-  };
-}
-
-function hostClient(id: number, address = "test-host-address"): LocalLeadHostClient {
-  return {
-    address,
-    childPid: id,
+    address: "fake",
+    childPid: 1,
     transcript: [],
     exit: new Promise(() => {}),
     async sendOwnerLine() {},
     async stop() {
+      hostRunning.value = false;
       return { kind: "explicit-stop", code: 0, signal: null };
     },
     async detach() {},
@@ -486,53 +70,242 @@ function hostClient(id: number, address = "test-host-address"): LocalLeadHostCli
   };
 }
 
-function supervisionInspection() {
-  return {
-    xml: "<Task />",
-    userId: "WORKSTATION\\owner",
-    logonType: "InteractiveToken",
-    runLevel: "LeastPrivilege",
-    actionContext: "CurrentUser",
-    command: "node.exe",
-    arguments: "actor.js",
-    actionType: "Exec",
-    multipleInstancesPolicy: "IgnoreNew",
-    restartCount: 4,
-    restartIntervalMinutes: 2,
-    allowStartOnDemand: true,
-    enabled: true,
-    hasTriggers: false,
-    disallowStartIfOnBatteries: false,
-    stopIfGoingOnBatteries: false,
-    runOnlyIfIdle: false,
-    stopOnIdleEnd: false,
-    restartOnIdle: false,
-    executionTimeLimit: "PT0S",
-  };
-}
-
-async function writeBundle(
-  directory: string,
-  kind: LocalReleaseKind,
+async function writeCandidate(
+  parent: string,
   revision: string,
-): Promise<void> {
+  marker = "lead",
+): Promise<string> {
+  const directory = join(parent, `candidate-${revision}`);
+  const files = {
+    ...bundlePayload,
+    "dist/cli.js": Buffer.from(`console.log('${marker}');\n`),
+  };
   const manifest: LocalReleaseManifest = {
     formatVersion: 1,
-    kind,
+    kind: "lead-agent",
     revision,
-    entrypoint: "dist/main.js",
+    entrypoint: "dist/cli.js",
     runtime: { version: "24.17.0", architecture: "x64", path: "runtime/node.exe" },
-    files: Object.entries(bundlePayload).map(([path, bytes]) => ({
+    files: Object.entries(files).map(([path, bytes]) => ({
       path,
       size: bytes.byteLength,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     })),
   };
   await mkdir(directory, { recursive: true });
-  for (const [path, bytes] of Object.entries(bundlePayload)) {
+  for (const [path, bytes] of Object.entries(files)) {
     const destination = join(directory, ...path.split("/"));
     await mkdir(dirname(destination), { recursive: true });
     await writeFile(destination, bytes);
   }
   await writeFile(join(directory, "manifest.json"), JSON.stringify(manifest));
+  return directory;
+}
+
+async function installed(t: Parameters<typeof harness>[0]): Promise<Harness> {
+  const context = await harness(t);
+  const candidate = await writeCandidate(context.root, "rev-1");
+  await context.installation.initialInstall({
+    leadAgentCandidateDirectory: candidate,
+    stateRevision: "initial-state",
+    stateProvenance: "test install",
+  });
+  return context;
+}
+
+test("install stages the bundle, snapshots initial state, and writes the v2 launcher", async (t) => {
+  const { installation, root } = await harness(t);
+  const candidate = await writeCandidate(root, "rev-1");
+  const result = await installation.initialInstall({
+    leadAgentCandidateDirectory: candidate,
+    stateRevision: "initial-state",
+    stateProvenance: "test install",
+  });
+
+  assert.equal(result.status, "installed");
+  assert.equal(result.active?.code.revision, "rev-1");
+  assert.equal(result.active?.state.revision, "initial-state");
+  const paths = localInstallationPaths(root);
+  assert.ok(existsSync(join(paths.leadAgentVersions, "rev-1", "manifest.json")));
+  assert.ok(existsSync(result.active!.state.snapshotPath));
+  assert.equal(readGeneration(paths.state), 1);
+
+  const manifest = JSON.parse(
+    await readFile(join(paths.launcher, "installation.json"), "utf8"),
+  ) as { formatVersion: number; leadAgent: { lifecyclePath: string; runtimePath: string } };
+  assert.equal(manifest.formatVersion, 2);
+  assert.ok(manifest.leadAgent.lifecyclePath.endsWith("lifecycle-cli.js"));
+  const riker = await readFile(join(paths.launcher, "riker.cmd"), "utf8");
+  assert.match(riker, /owner-launcher\.js/);
+
+  await assert.rejects(
+    installation.initialInstall({
+      leadAgentCandidateDirectory: candidate,
+      stateRevision: "initial-state",
+      stateProvenance: "test install",
+    }),
+    /already installed/,
+  );
+});
+
+test("start spawns the detached host once and reuses a live host", async (t) => {
+  const context = await installed(t);
+  const first = await context.installation.start();
+  await first.detach();
+  assert.equal(context.spawns.length, 1);
+
+  const second = await context.installation.start();
+  await second.detach();
+  assert.equal(context.spawns.length, 1, "a live host is reused, not respawned");
+
+  const inspection = await context.installation.inspect();
+  assert.equal(inspection.hostRunning, true);
+  assert.equal(inspection.stopRequested, false);
+});
+
+test("stop records the durable stop intent even when no host is reachable", async (t) => {
+  const context = await installed(t);
+  await context.installation.stop();
+  const inspection = await context.installation.inspect();
+  assert.equal(inspection.stopRequested, true);
+  assert.equal(inspection.hostRunning, false);
+
+  await context.installation.start();
+  assert.equal((await context.installation.inspect()).stopRequested, false);
+});
+
+test("upgrade snapshots state, fences the old generation, and records the previous pair", async (t) => {
+  const context = await installed(t);
+  await context.installation.start();
+  const paths = localInstallationPaths(context.root);
+  const generationBefore = readGeneration(paths.state);
+
+  const candidate = await writeCandidate(context.root, "rev-2", "lead-2");
+  const result = await context.installation.upgrade({
+    leadAgentCandidateDirectory: candidate,
+    stateRevision: "before-rev-2",
+    stateProvenance: "test upgrade",
+  });
+
+  assert.equal(result.outcome, "activated");
+  assert.equal(result.active.code.revision, "rev-2");
+  assert.equal(result.previous.code.revision, "rev-1");
+  assert.equal(result.snapshot.revision, "before-rev-2");
+  assert.ok(existsSync(result.snapshot.path));
+  assert.equal(readGeneration(paths.state), generationBefore + 1, "old hosts are fenced");
+  assert.equal(context.hostRunning.value, false, "the old host was stopped");
+
+  const inspection = await context.installation.inspect();
+  assert.equal(inspection.active?.code.revision, "rev-2");
+  assert.equal(inspection.previous?.code.revision, "rev-1");
+});
+
+test("rollback restores the previous pair and state with a fresh generation", async (t) => {
+  const context = await installed(t);
+  const paths = localInstallationPaths(context.root);
+
+  // Put a marker into state, upgrade (which snapshots it), then mutate state again.
+  const stateDb = () => new DatabaseSync(join(paths.state, "authoritative-state.sqlite"));
+  let database = stateDb();
+  database.exec("CREATE TABLE marker (value TEXT); INSERT INTO marker VALUES ('before-upgrade');");
+  database.close();
+
+  const candidate = await writeCandidate(context.root, "rev-2", "lead-2");
+  await context.installation.upgrade({
+    leadAgentCandidateDirectory: candidate,
+    stateRevision: "before-rev-2",
+    stateProvenance: "test upgrade",
+  });
+  database = stateDb();
+  database.exec("UPDATE marker SET value = 'after-upgrade'");
+  database.close();
+  const generationBefore = readGeneration(paths.state);
+
+  const result = await context.installation.rollback();
+  assert.equal(result.outcome, "rolled-back");
+  assert.equal(result.active.code.revision, "rev-1");
+  assert.ok(result.restoredWriteGeneration > generationBefore);
+
+  database = stateDb();
+  const marker = database.prepare("SELECT value FROM marker").get() as { value: string };
+  database.close();
+  assert.equal(marker.value, "before-upgrade", "state returned to the pre-upgrade snapshot");
+  assert.equal((await context.installation.inspect()).active?.code.revision, "rev-1");
+  assert.equal((await context.installation.inspect()).previous?.code.revision, "rev-2");
+});
+
+test("rollback without a previous version is refused", async (t) => {
+  const context = await installed(t);
+  await assert.rejects(context.installation.rollback(), /No previous version/);
+});
+
+test("a durable lifecycle operation serializes upgrade against other operations", async (t) => {
+  const context = await installed(t);
+  const paths = localInstallationPaths(context.root);
+  const journal = new DatabaseSync(paths.lifecycleJournal);
+  const row = journal
+    .prepare("SELECT active_json FROM local_lifecycle_v2 WHERE singleton = 1")
+    .get() as { active_json: string };
+  journal
+    .prepare("UPDATE local_lifecycle_v2 SET operation_json = ? WHERE singleton = 1")
+    .run(JSON.stringify({
+      id: "held",
+      kind: "upgrade",
+      pid: process.pid,
+      startedAt: await currentProcessStartedAt(),
+    }));
+  journal.close();
+  assert.ok(JSON.parse(row.active_json));
+
+  await assert.rejects(context.installation.stop(), /already in progress/);
+
+  // An operation held by a dead process is reclaimed instead of blocking forever.
+  const stale = new DatabaseSync(paths.lifecycleJournal);
+  stale
+    .prepare("UPDATE local_lifecycle_v2 SET operation_json = ? WHERE singleton = 1")
+    .run(JSON.stringify({
+      id: "stale",
+      kind: "upgrade",
+      pid: 4_000_000,
+      startedAt: "2000-01-01T00:00:00.000Z",
+    }));
+  stale.close();
+  await context.installation.stop();
+  assert.equal((await context.installation.inspect()).stopRequested, true);
+});
+
+test("uninstall removes launch material and preserves state and recovery", async (t) => {
+  const context = await installed(t);
+  const paths = localInstallationPaths(context.root);
+  await context.installation.uninstall();
+
+  assert.equal(existsSync(paths.leadAgentVersions), false);
+  assert.equal(existsSync(paths.launcher), false);
+  assert.ok(existsSync(join(paths.state, "authoritative-state.sqlite")));
+  assert.ok(existsSync(paths.snapshots));
+  const inspection = await context.installation.inspect();
+  assert.equal(inspection.status, "uninstalled");
+
+  const candidate = await writeCandidate(context.root, "rev-3");
+  const reinstalled = await context.installation.initialInstall({
+    leadAgentCandidateDirectory: candidate,
+    stateRevision: "reinstall-state",
+    stateProvenance: "test reinstall",
+  });
+  assert.equal(reinstalled.status, "installed");
+  assert.equal(reinstalled.active?.code.revision, "rev-3");
+});
+
+async function currentProcessStartedAt(): Promise<string> {
+  const { execFileSync } = await import("node:child_process");
+  return execFileSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-Process -Id ${process.pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`,
+    ],
+    { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+  ).trim();
 }

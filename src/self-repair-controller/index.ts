@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 
-import {
-  requiredActivationHealthCriteria,
-  protectedRecoveryPolicyIdentity,
-  type ActivationAttempt,
-  type CodeStatePair,
-  type RecoveryActor,
-  type RecoveryActorIdentity,
-  type RecoveryPolicyIdentity,
-} from "../recovery-actor/index.ts";
+import type { CodeStatePair } from "../local-installation/index.ts";
 import type { WorkerExecutionAttempt, WorkerSession } from "../orchestration-core/index.ts";
 
 type AllowedSelfRepairEffect =
@@ -32,17 +24,11 @@ export type SelfRepairWorkerCandidate = {
 
 export type SelfRepairCandidateOutcome = {
   candidateKind: "lead-agent";
-  candidate: CodeStatePair;
+  candidate: SelfRepairWorkerCandidate["code"];
   changedTargets: string[];
-  baseline: CodeStatePair;
-  compatibility: { stateSchema: "lossless-return-proven"; evidence: string };
+  // Verification is green tests on the candidate; rollback stays available
+  // through the versioned install the activation records.
   verification: { verdict: "passed"; evidence: string[] };
-  recoveryPath: "restore-exact-baseline-pair";
-};
-
-export type SelfRepairReviewOutcome = {
-  verdict: "passed" | "changes-requested";
-  evidence: string[];
 };
 
 export type SelfRepairAttempt = {
@@ -53,8 +39,6 @@ export type SelfRepairAttempt = {
   status:
     | "candidate-delegation-pending"
     | "candidate-delegated"
-    | "review-delegation-pending"
-    | "review-delegated"
     | "activation-pending"
     | "activated"
     | "rolled-back"
@@ -67,16 +51,10 @@ export type SelfRepairAttempt = {
     allowedEffects: AllowedSelfRepairEffect[];
   };
   implementationWorker?: SelfRepairWorkerReference;
-  candidate?: CodeStatePair;
-  baseline?: CodeStatePair;
+  candidate?: SelfRepairWorkerCandidate["code"];
   changedTargets?: string[];
-  compatibility?: SelfRepairCandidateOutcome["compatibility"];
   verification?: SelfRepairCandidateOutcome["verification"];
-  reviewWorker?: SelfRepairWorkerReference;
-  review?: SelfRepairReviewOutcome;
-  recoveryPath?: SelfRepairCandidateOutcome["recoveryPath"];
   activation?: {
-    attemptId: string;
     outcome: "activated" | "rolled-back";
     evidence: string[];
     observedAt: string;
@@ -86,7 +64,7 @@ export type SelfRepairAttempt = {
 };
 
 export type SelfRepairRecord = {
-  version: 1;
+  version: 2;
   id: string;
   commitmentId: string;
   defect: {
@@ -99,8 +77,6 @@ export type SelfRepairRecord = {
     kind: "lead-agent-command-authority";
     authorizedAt: string;
     authorizedWriteRoot: string;
-    protectedRecoveryActor: RecoveryActorIdentity;
-    protectedRecoveryPolicy: RecoveryPolicyIdentity;
   };
   envelope: {
     maximumAttempts: number;
@@ -130,18 +106,7 @@ export interface SelfRepairWorkers {
     defect: SelfRepairRecord["defect"];
     hypothesis: string;
     authorizedWriteRoot: string;
-    protectedRecoveryActor: RecoveryActorIdentity;
     budget: SelfRepairAttempt["budget"];
-  }): Promise<SelfRepairWorkerReference>;
-  reviewDelegation(attemptId: string): Promise<SelfRepairWorkerReference | undefined>;
-  delegateReview(input: {
-    selfRepairId: string;
-    attemptId: string;
-    attemptNumber: number;
-    commitmentId: string;
-    implementationWorker: SelfRepairWorkerReference;
-    candidate: CodeStatePair;
-    verification: SelfRepairCandidateOutcome["verification"];
   }): Promise<SelfRepairWorkerReference>;
 }
 
@@ -151,34 +116,23 @@ export interface SelfRepairPreparation {
     selfRepairId: string;
     attemptId: string;
     candidate: SelfRepairWorkerCandidate;
-    protectedRecoveryActor: RecoveryActorIdentity;
   }): Promise<SelfRepairCandidateOutcome>;
 }
 
-export type SelfRepairActivationRequest = Pick<
-  ActivationAttempt,
-  | "baseline"
-  | "candidate"
-  | "compatibility"
-  | "verification"
-  | "review"
-  | "healthCriteria"
-  | "budget"
-  | "recoveryPath"
-> & {
-  authority: Extract<ActivationAttempt["authority"], { kind: "lead-agent-self-repair" }>;
+export type SelfRepairActivationRequest = {
+  selfRepairId: string;
+  attemptId: string;
+  candidate: SelfRepairWorkerCandidate["code"];
 };
 
 export interface SelfRepairActivation {
-  protectedRecovery(): { actor: RecoveryActorIdentity; policy: RecoveryPolicyIdentity };
-  // Reconciliation reaches a terminal actor phase before a paused Commitment can stop new effects.
+  // Reconciliation answers whether this attempt's candidate already cut over,
+  // so restart never re-activates.
   reconcile(request: SelfRepairActivationRequest): Promise<{
-    activationAttemptId: string;
     outcome: "activated" | "rolled-back";
     evidence: string[];
   } | undefined>;
   activate(request: SelfRepairActivationRequest): Promise<{
-    activationAttemptId: string;
     outcome: "activated" | "rolled-back";
     evidence: string[];
   }>;
@@ -189,7 +143,7 @@ export interface SelfRepairController {
     commitmentId: string;
     defect: { subject: string; description: string; evidence: string[] };
     hypothesis: string;
-    authority: Omit<SelfRepairRecord["authority"], "protectedRecoveryActor" | "protectedRecoveryPolicy">;
+    authority: SelfRepairRecord["authority"];
     envelope: SelfRepairRecord["envelope"];
   }): SelfRepairRecord;
   advance(selfRepairId: string): Promise<SelfRepairRecord>;
@@ -200,19 +154,13 @@ export interface SelfRepairController {
   view(selfRepairId: string): SelfRepairRecord | undefined;
 }
 
-const activationHealthCriteria: SelfRepairActivationRequest["healthCriteria"] = [
-  "exact-identity",
-  "artifact-integrity",
-  "authoritative-state",
-  "write-generation",
-  "conversation-context",
-  "write-read-probe",
-  "recovery-handshake",
-];
-
 export function createSelfRepairController(
   state: SelfRepairState,
-  dependencies: { workers: SelfRepairWorkers; preparation: SelfRepairPreparation } & SelfRepairActivation,
+  dependencies: {
+    workers: SelfRepairWorkers;
+    preparation: SelfRepairPreparation;
+    activation: SelfRepairActivation;
+  },
 ): SelfRepairController {
   const appendAttempt = (
     repair: SelfRepairRecord,
@@ -231,25 +179,20 @@ export function createSelfRepairController(
       validateBeginInput(input);
       const commitment = state.readCommitment(input.commitmentId);
       if (!commitment || commitment.state !== "active") {
-        throw new Error("Self-repair requires one active Commitment.");
-      }
-      const id = randomUUID();
-      const diagnosedAt = new Date().toISOString();
-      const protectedRecovery = dependencies.protectedRecovery();
-      validateProtectedRecovery(protectedRecovery);
-      if (pathsOverlap(input.authority.authorizedWriteRoot, protectedRecovery.actor.path)) {
-        throw new Error("The Self-repair Authorized Write Root cannot overlap the protected Recovery Actor.");
+        throw new Error("Self-repair requires one active Work Item.");
       }
       const repair: SelfRepairRecord = {
-        version: 1,
-        id,
+        version: 2,
+        id: randomUUID(),
         commitmentId: input.commitmentId,
-        defect: { ...input.defect, evidence: [...input.defect.evidence], diagnosedAt },
+        defect: {
+          ...input.defect,
+          evidence: [...input.defect.evidence],
+          diagnosedAt: new Date().toISOString(),
+        },
         authority: {
           ...input.authority,
           authorizedWriteRoot: resolve(input.authority.authorizedWriteRoot),
-          protectedRecoveryActor: protectedRecovery.actor,
-          protectedRecoveryPolicy: protectedRecovery.policy,
         },
         envelope: {
           ...input.envelope,
@@ -282,18 +225,10 @@ export function createSelfRepairController(
                 defect: repair.defect,
                 hypothesis: attempt.hypothesis,
                 authorizedWriteRoot: repair.authority.authorizedWriteRoot,
-                protectedRecoveryActor: repair.authority.protectedRecoveryActor,
                 budget: attempt.budget,
               });
-            validateWorkerReference(implementationWorker, false);
-            validateDurableWorker(
-              state,
-              repair,
-              attempt,
-              implementationWorker,
-              false,
-              false,
-            );
+            validateWorkerReference(implementationWorker);
+            validateDurableWorker(state, repair, attempt, implementationWorker, false);
             repair = appendAttempt(repair, {
               ...attempt,
               status: "candidate-delegated",
@@ -308,7 +243,6 @@ export function createSelfRepairController(
               attempt,
               attempt.implementationWorker!,
               false,
-              false,
             );
             if (pendingWorker.worker.state !== "completed" || pendingWorker.execution.status !== "completed") {
               return repair;
@@ -318,7 +252,6 @@ export function createSelfRepairController(
               repair,
               attempt,
               attempt.implementationWorker!,
-              false,
               true,
             );
             const workerCandidate = workerEvidence.worker.outcome?.selfRepairCandidate;
@@ -332,138 +265,45 @@ export function createSelfRepairController(
                 selfRepairId: repair.id,
                 attemptId: attempt.id,
                 candidate: workerCandidate,
-                protectedRecoveryActor: repair.authority.protectedRecoveryActor,
               });
             validateCandidateOutcome(outcome, workerCandidate);
             repair = appendAttempt(repair, {
               ...attempt,
-              status: "review-delegation-pending",
-              candidate: outcome.candidate,
-              baseline: outcome.baseline,
-              changedTargets: [...outcome.changedTargets],
-              compatibility: outcome.compatibility,
-              verification: outcome.verification,
-              recoveryPath: outcome.recoveryPath,
-            });
-            continue;
-          }
-          case "review-delegation-pending": {
-            const reviewWorker =
-              await dependencies.workers.reviewDelegation(attempt.id) ??
-              await dependencies.workers.delegateReview({
-                selfRepairId: repair.id,
-                attemptId: attempt.id,
-                attemptNumber: attempt.budget.attemptNumber,
-                commitmentId: repair.commitmentId,
-                implementationWorker: attempt.implementationWorker!,
-                candidate: attempt.candidate!,
-                verification: attempt.verification!,
-              });
-            validateWorkerReference(reviewWorker, true);
-            if (reviewWorker.workerSessionId === attempt.implementationWorker!.workerSessionId) {
-              throw new Error("Self-repair Review must use an independent Worker Session.");
-            }
-            validateDurableWorker(state, repair, attempt, reviewWorker, true, false);
-            repair = appendAttempt(repair, {
-              ...attempt,
-              status: "review-delegated",
-              reviewWorker,
-            });
-            continue;
-          }
-          case "review-delegated": {
-            const pendingWorker = validateDurableWorker(
-              state,
-              repair,
-              attempt,
-              attempt.reviewWorker!,
-              true,
-              false,
-            );
-            if (pendingWorker.worker.state !== "completed" || pendingWorker.execution.status !== "completed") {
-              return repair;
-            }
-            const workerEvidence = validateDurableWorker(
-              state,
-              repair,
-              attempt,
-              attempt.reviewWorker!,
-              true,
-              true,
-            );
-            const findings = workerEvidence.worker.outcome?.reviewFindings;
-            if (!findings) {
-              throw new Error("The reviewing Worker did not durably report independent Review findings.");
-            }
-            const review: SelfRepairReviewOutcome = {
-              verdict: findings.some((finding) => finding.disposition === "must-fix")
-                ? "changes-requested"
-                : "passed",
-              evidence: workerEvidence.worker.outcome!.verificationResults,
-            };
-            validateEvidence(review.evidence, "Self-repair Review");
-            validateReviewOutcome(review, workerEvidence.worker);
-            if (review.verdict !== "passed") {
-              return appendAttempt(repair, { ...attempt, status: "blocked", review });
-            }
-            repair = appendAttempt(repair, {
-              ...attempt,
               status: "activation-pending",
-              review,
+              candidate: outcome.candidate,
+              changedTargets: [...outcome.changedTargets],
+              verification: outcome.verification,
             });
             continue;
           }
           case "activation-pending": {
             const request: SelfRepairActivationRequest = {
+              selfRepairId: repair.id,
+              attemptId: attempt.id,
               candidate: attempt.candidate!,
-              baseline: attempt.baseline!,
-              authority: {
-                kind: "lead-agent-self-repair",
-                selfRepairId: repair.id,
-                selfRepairAttemptId: attempt.id,
-                commitmentId: repair.commitmentId,
-                recoveryActorRevision: repair.authority.protectedRecoveryActor.revision,
-                recoveryActorDigest: repair.authority.protectedRecoveryActor.digest,
-                recoveryActorPath: repair.authority.protectedRecoveryActor.path,
-                recoveryPolicyRevision: repair.authority.protectedRecoveryPolicy.revision,
-                recoveryPolicyDigest: repair.authority.protectedRecoveryPolicy.digest,
-                authorizedAt: repair.authority.authorizedAt,
-              },
-              compatibility: attempt.compatibility!,
-              verification: attempt.verification!,
-              review: { verdict: "passed", evidence: attempt.review!.evidence },
-              healthCriteria: [...activationHealthCriteria],
-              budget: { deadline: attempt.budget.deadline, probationChecks: 2 },
-              recoveryPath: attempt.recoveryPath!,
             };
-            let result = await dependencies.reconcile(request);
+            let result = await dependencies.activation.reconcile(request);
             if (!result) {
               requireActiveCommitment(state, repair.commitmentId);
               assertWithinDeadline(attempt);
-              await dependencies.activate(request);
-              return repair;
-            }
-            if (!result.activationAttemptId.trim()) {
-              throw new Error("Self-repair activation requires an exact Activation Attempt identity.");
+              result = await dependencies.activation.activate(request);
             }
             validateEvidence(result.evidence, "Self-repair activation");
             const observedAt = new Date().toISOString();
-            const status = result.outcome;
             return appendAttempt(repair, {
               ...attempt,
-              status,
+              status: result.outcome,
               activation: {
-                attemptId: result.activationAttemptId,
                 outcome: result.outcome,
                 evidence: result.evidence,
                 observedAt,
                 account: result.outcome === "activated"
-                  ? `Self-repair activated revision ${attempt.candidate!.code.revision} for ${repair.defect.subject}. ` +
+                  ? `Self-repair activated revision ${attempt.candidate!.revision} for ${repair.defect.subject}. ` +
                     `Evidence: ${result.evidence.join("; ")}. Effects: ${attempt.changedTargets!.join(", ")}. ` +
-                    "Residual uncertainty: Recovery Baseline promotion remains a later decision."
-                  : `Self-repair revision ${attempt.candidate!.code.revision} for ${repair.defect.subject} ` +
-                    `failed health under hypothesis ${attempt.hypothesis} and rolled back before another attempt. ` +
-                    `Evidence: ${result.evidence.join("; ")}. Effects: candidate cutover was reverted. ` +
+                    "Rollback to the previous version stays one command away."
+                  : `Self-repair revision ${attempt.candidate!.revision} for ${repair.defect.subject} ` +
+                    `did not activate under hypothesis ${attempt.hypothesis}. ` +
+                    `Evidence: ${result.evidence.join("; ")}. ` +
                     "Residual uncertainty: the diagnosed defect remains unresolved.",
               },
             });
@@ -476,7 +316,7 @@ export function createSelfRepairController(
       const repair = requireRepair(state, selfRepairId);
       const previous = repair.attempts.at(-1)!;
       if (previous.status !== "rolled-back" && previous.status !== "blocked") {
-        throw new Error("Self-repair retry requires a completed rollback or blocked reviewed candidate.");
+        throw new Error("Self-repair retry requires a rolled-back or blocked previous attempt.");
       }
       if (!input.hypothesis.trim() || input.hypothesis.trim() === previous.hypothesis.trim()) {
         throw new Error("Every Self-repair retry requires a changed hypothesis.");
@@ -530,7 +370,7 @@ function validateBeginInput(input: Parameters<SelfRepairController["begin"]>[0])
     !input.defect.description.trim() ||
     !input.hypothesis.trim()
   ) {
-    throw new Error("Self-repair requires a Commitment, concrete defect, and repair hypothesis.");
+    throw new Error("Self-repair requires a Work Item, concrete defect, and repair hypothesis.");
   }
   validateEvidence(input.defect.evidence, "Self-repair diagnosis");
   if (
@@ -538,7 +378,7 @@ function validateBeginInput(input: Parameters<SelfRepairController["begin"]>[0])
     !input.authority.authorizedWriteRoot.trim() ||
     !Number.isFinite(Date.parse(input.authority.authorizedAt))
   ) {
-    throw new Error("Self-repair requires exact Command Authority and protected recovery identities.");
+    throw new Error("Self-repair requires exact Command Authority.");
   }
   if (
     !Number.isSafeInteger(input.envelope.maximumAttempts) ||
@@ -569,10 +409,9 @@ function validateWorkerCandidate(
     outcome.candidateKind !== "lead-agent" ||
     !outcome.code.revision.trim() ||
     !isDigest(outcome.code.digest) ||
-    !outcome.code.path.trim() ||
-    pathsOverlap(outcome.code.path, repair.authority.protectedRecoveryActor.path)
+    !outcome.code.path.trim()
   ) {
-    throw new Error("A Self-repair candidate must be immutable and cannot replace the Recovery Actor.");
+    throw new Error("A Self-repair candidate must be an exact immutable Lead Agent bundle.");
   }
   if (
     outcome.changedTargets.length === 0 ||
@@ -595,21 +434,9 @@ function validateWorkerCandidate(
   if (
     assignment.readOnly ||
     assignment.costBound.maximumIncrementalSpendUsd !== repair.envelope.maximumIncrementalSpendUsd ||
-    assignment.effectClasses.length !== 2 ||
-    !assignment.effectClasses.includes("filesystem-write") ||
-    !assignment.effectClasses.includes("bounded-process-execution") ||
     assignment.authorizedWriteRoots.length !== 1 ||
     !samePath(assignment.authorizedWriteRoots[0]!, repair.authority.authorizedWriteRoot) ||
-    !samePath(assignment.checkoutIsolation.root, repair.authority.authorizedWriteRoot) ||
-    assignment.authority.commitmentId !== repair.commitmentId ||
-    Date.parse(assignment.authority.validatedAt) + assignment.timeoutMs > Date.parse(repair.envelope.deadline) ||
-    outcome.changedTargets.some((changedTarget) =>
-      !assignment.targets.some((target) => {
-        const targetPath = resolve(repair.authority.authorizedWriteRoot, target);
-        const changedPath = resolve(repair.authority.authorizedWriteRoot, changedTarget);
-        return samePath(targetPath, changedPath) || isWithin(targetPath, changedPath);
-      })
-    )
+    assignment.authority.commitmentId !== repair.commitmentId
   ) {
     throw new Error("Self-repair candidate work exceeded its durable authority or effect envelope.");
   }
@@ -620,50 +447,22 @@ function validateCandidateOutcome(
   workerCandidate: SelfRepairWorkerCandidate,
 ): void {
   if (
-    JSON.stringify(outcome.candidate.code) !== JSON.stringify(workerCandidate.code) ||
+    JSON.stringify(outcome.candidate) !== JSON.stringify(workerCandidate.code) ||
     JSON.stringify(outcome.changedTargets) !== JSON.stringify(workerCandidate.changedTargets)
   ) {
     throw new Error("Prepared Self-repair evidence does not match the implementing Worker candidate.");
   }
-  if (outcome.compatibility.stateSchema !== "lossless-return-proven" || !outcome.compatibility.evidence.trim()) {
-    throw new Error("Self-repair activation requires a lossless state recovery path.");
-  }
   if (outcome.verification.verdict !== "passed") {
-    throw new Error("Self-repair candidate Verification must pass before Review.");
+    throw new Error("Self-repair candidate Verification must pass before activation.");
   }
   validateEvidence(outcome.verification.evidence, "Self-repair Verification");
-  if (outcome.recoveryPath !== "restore-exact-baseline-pair") {
-    throw new Error("Self-repair requires exact Recovery Baseline restoration.");
-  }
-  if (
-    outcome.baseline.code.revision === outcome.candidate.code.revision ||
-    outcome.baseline.state.digest !== outcome.candidate.state.digest ||
-    !samePath(outcome.baseline.state.snapshotPath, outcome.candidate.state.snapshotPath)
-  ) {
-    throw new Error("Self-repair rollback requires trusted prior code with fresh pre-cutover state.");
-  }
 }
 
-function validateReviewOutcome(review: SelfRepairReviewOutcome, worker: WorkerSession): void {
-  const findings = worker.outcome?.reviewFindings;
-  const expectedVerdict = findings?.some((finding) => finding.disposition === "must-fix")
-    ? "changes-requested"
-    : "passed";
-  if (
-    !worker.outcome ||
-    !findings ||
-    review.verdict !== expectedVerdict ||
-    review.evidence.some((evidence) => !worker.outcome!.verificationResults.includes(evidence))
-  ) {
-    throw new Error("Self-repair Review must match the durable reviewing Worker outcome.");
-  }
-}
-
-function validateWorkerReference(worker: SelfRepairWorkerReference, expectedReadOnly: boolean): void {
+function validateWorkerReference(worker: SelfRepairWorkerReference): void {
   if (
     !worker.workerSessionId.trim() ||
     !worker.executionAttemptId.trim() ||
-    worker.readOnly !== expectedReadOnly
+    worker.readOnly !== false
   ) {
     throw new Error("Self-repair delegation requires exact Worker Session and execution identities.");
   }
@@ -674,7 +473,6 @@ function validateDurableWorker(
   repair: SelfRepairRecord,
   attempt: SelfRepairAttempt,
   reference: SelfRepairWorkerReference,
-  expectedReadOnly: boolean,
   requireCompleted: boolean,
 ): { worker: WorkerSession; execution: WorkerExecutionAttempt } {
   const worker = state.readWorkerSession(reference.workerSessionId);
@@ -685,15 +483,10 @@ function validateDurableWorker(
     worker.currentExecutionAttemptId !== reference.executionAttemptId ||
     execution.workerSessionId !== reference.workerSessionId ||
     execution.modelSelection.nativeHarness !== reference.nativeHarness ||
-    worker.assignment.readOnly !== expectedReadOnly ||
+    worker.assignment.readOnly !== false ||
     worker.assignment.commitmentId !== repair.commitmentId ||
     worker.assignment.selfRepair?.selfRepairId !== repair.id ||
-    worker.assignment.selfRepair.attemptId !== attempt.id ||
-    (!expectedReadOnly && worker.assignment.coordination?.role !== "implementer") ||
-    (expectedReadOnly &&
-      (worker.assignment.coordination?.role !== "reviewer" ||
-        worker.assignment.coordination.reviewOfWorkerSessionId !==
-          attempt.implementationWorker?.workerSessionId))
+    worker.assignment.selfRepair.attemptId !== attempt.id
   ) {
     throw new Error("Self-repair evidence requires one exact durable native Worker execution.");
   }
@@ -728,7 +521,7 @@ function requireRepair(state: SelfRepairState, selfRepairId: string): SelfRepair
 
 function requireActiveCommitment(state: SelfRepairState, commitmentId: string): void {
   if (state.readCommitment(commitmentId)?.state !== "active") {
-    throw new Error("Self-repair effects stop while their Commitment is not active.");
+    throw new Error("Self-repair effects stop while their Work Item is not active.");
   }
 }
 
@@ -751,86 +544,52 @@ function isWithin(root: string, candidate: string): boolean {
   return path !== "" && path !== ".." && !path.startsWith("../") && !path.startsWith("..\\") && !isAbsolute(path);
 }
 
-function pathsOverlap(left: string, right: string): boolean {
-  return samePath(left, right) || isWithin(left, right) || isWithin(right, left);
-}
-
-function validateProtectedRecovery(input: {
-  actor: RecoveryActorIdentity;
-  policy: RecoveryPolicyIdentity;
-}): void {
-  if (
-    !input.actor.revision.trim() ||
-    !isDigest(input.actor.digest) ||
-    !input.actor.path.trim() ||
-    input.policy.revision !== protectedRecoveryPolicyIdentity.revision ||
-    input.policy.digest !== protectedRecoveryPolicyIdentity.digest
-  ) {
-    throw new Error("Self-repair requires exact protected Recovery Actor and policy identity.");
-  }
-}
-
-export function createRecoveryActorSelfRepairActivation(
-  actor: RecoveryActor,
-): SelfRepairActivation {
-  const result = (attempt: ActivationAttempt) => ({
-    activationAttemptId: attempt.id,
-    outcome: attempt.phase === "activated" ? "activated" as const : "rolled-back" as const,
-    evidence: attempt.health?.evidence.length
-      ? attempt.health.evidence
-      : [attempt.failure ?? `Activation Attempt ${attempt.id} reached ${attempt.phase}.`],
-  });
-  const matchingAttempt = (request: SelfRepairActivationRequest): ActivationAttempt | undefined => {
-    const attempt = actor.inspectSelfRepairAttempt(
-      request.authority.selfRepairId,
-      request.authority.selfRepairAttemptId,
-    );
-    if (!attempt) return undefined;
-    const authority = attempt?.authority;
-    if (
-      authority?.kind !== "lead-agent-self-repair" ||
-      authority.selfRepairId !== request.authority.selfRepairId ||
-      authority.selfRepairAttemptId !== request.authority.selfRepairAttemptId
-    ) return undefined;
-    const exactRequest =
-      JSON.stringify(attempt.candidate) === JSON.stringify(request.candidate) &&
-      JSON.stringify(attempt.baseline) === JSON.stringify(request.baseline) &&
-      JSON.stringify(attempt.authority) === JSON.stringify(request.authority) &&
-      JSON.stringify(attempt.compatibility) === JSON.stringify(request.compatibility) &&
-      JSON.stringify(attempt.verification) === JSON.stringify(request.verification) &&
-      JSON.stringify(attempt.review) === JSON.stringify(request.review) &&
-      JSON.stringify(attempt.healthCriteria) === JSON.stringify(request.healthCriteria) &&
-      JSON.stringify(attempt.budget) === JSON.stringify(request.budget) &&
-      attempt.recoveryPath === request.recoveryPath;
-    if (!exactRequest) {
-      throw new Error("Self-repair activation reconciliation found ambiguous request evidence.");
-    }
-    return attempt;
-  };
+// Activation through Lifecycle v2: the upgrade records the previous version, so
+// rollback stays one command away; reconciliation reads the lifecycle journal.
+export function createLifecycleSelfRepairActivation(installation: {
+  inspect(): Promise<{ active?: CodeStatePair; previous?: CodeStatePair }>;
+  upgrade(input: {
+    leadAgentCandidateDirectory: string;
+    stateRevision: string;
+    stateProvenance: string;
+  }): Promise<{ outcome: "activated"; active: CodeStatePair }>;
+}): SelfRepairActivation {
   return {
-    protectedRecovery() {
-      const identity = actor.inspect().actor;
-      if (!identity) throw new Error("Recovery Actor is not initialized.");
-      return { actor: identity, policy: protectedRecoveryPolicyIdentity };
-    },
     async reconcile(request) {
-      let attempt = matchingAttempt(request);
-      if (!attempt) return undefined;
-      if (attempt.phase !== "activated" && attempt.phase !== "rolled-back") {
-        await actor.recover();
-        attempt = matchingAttempt(request);
+      const inspection = await installation.inspect();
+      if (
+        inspection.active?.code.revision === request.candidate.revision &&
+        inspection.active.code.digest === request.candidate.digest
+      ) {
+        return {
+          outcome: "activated",
+          evidence: ["The lifecycle journal shows the Self-repair candidate is active."],
+        };
       }
-      return attempt && (attempt.phase === "activated" || attempt.phase === "rolled-back")
-        ? result(attempt)
-        : undefined;
+      return undefined;
     },
     async activate(request) {
-      const activation = await actor.activate(request);
-      const attempt = actor.inspect().currentAttempt;
-      if (!attempt || attempt.id !== activation.attemptId) {
-        throw new Error("Recovery Actor did not retain the exact Self-repair Activation Attempt.");
+      try {
+        const result = await installation.upgrade({
+          leadAgentCandidateDirectory: request.candidate.path,
+          stateRevision: `self-repair-${request.attemptId.slice(0, 8)}`,
+          stateProvenance: `Self-repair ${request.selfRepairId}`,
+        });
+        return {
+          outcome: "activated",
+          evidence: [
+            `Activated revision ${result.active.code.revision}; the previous version remains available for rollback.`,
+          ],
+        };
+      } catch (error) {
+        return {
+          outcome: "rolled-back",
+          evidence: [
+            `Activation failed before cutover: ${error instanceof Error ? error.message : String(error)}. ` +
+              "The previously active version keeps running.",
+          ],
+        };
       }
-      return result(attempt);
     },
   };
 }

@@ -25,7 +25,7 @@ try {
 
 async function runOwnerClient(installationRoot: string): Promise<void> {
   const client = await connectWithRetry(localLeadHostAddress(resolve(installationRoot)), 10_000);
-  const targetProjectPath = readTargetProjectPath(client.transcript);
+  const targetProjectPath = await waitForTargetProjectPath(client, 60_000);
   try {
     await runPiOwnerInterface({
       targetProjectPath,
@@ -45,14 +45,34 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
   }
 }
 
-function readTargetProjectPath(transcript: readonly LeadHostTranscriptEntry[]): string {
-  for (let index = transcript.length - 1; index >= 0; index -= 1) {
-    const entry = transcript[index];
-    if (entry?.source !== "lead" || entry.stream !== "stdout") continue;
-    const prefix = "CMD Riker | Target Project:";
-    if (entry.line.startsWith(prefix)) return entry.line.slice(prefix.length).trim();
+// The Lead prints its Target Project during boot; a freshly started host has an
+// open pipe before that line exists, so wait for it instead of reading once.
+function waitForTargetProjectPath(
+  client: LocalLeadHostClient,
+  timeoutMs: number,
+): Promise<string> {
+  const prefix = "CMD Riker | Target Project:";
+  const parse = (entry: LeadHostTranscriptEntry): string | undefined =>
+    entry.source === "lead" && entry.stream === "stdout" && entry.line.startsWith(prefix)
+      ? entry.line.slice(prefix.length).trim()
+      : undefined;
+  for (let index = client.transcript.length - 1; index >= 0; index -= 1) {
+    const found = parse(client.transcript[index]!);
+    if (found !== undefined) return Promise.resolve(found);
   }
-  throw new Error("The protected Lead Agent did not identify its Target Project.");
+  return new Promise((resolvePromise, reject) => {
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(new Error("The Lead Agent did not identify its Target Project in time."));
+    }, timeoutMs);
+    const unsubscribe = client.onTranscriptEntry((entry) => {
+      const found = parse(entry);
+      if (found === undefined) return;
+      clearTimeout(timeout);
+      unsubscribe();
+      resolvePromise(found);
+    });
+  });
 }
 
 function readLatestSessionView(transcript: readonly LeadHostTranscriptEntry[]): string {

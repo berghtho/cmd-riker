@@ -163,19 +163,33 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
       return false;
     }
   });
+  // Start-Process launches the host without inheriting any handle from this
+  // process chain. A plain detached spawn silently inherits the caller's
+  // inheritable stdout pipe on Windows, so `riker upgrade` would never see EOF
+  // and hang in the Owner's terminal until the host exits.
   const spawnHost = options.spawnHost ?? (async (active) => {
     const release = await verifyLocalReleaseCandidate(active.code.path, "lead-agent");
-    const child = spawn(
-      release.runtime.path,
-      [
-        join(active.code.path, "dist", "lifecycle-cli.js"),
-        "host",
-        "--install-root",
-        paths.root,
-      ],
-      { detached: true, stdio: "ignore", windowsHide: true },
-    );
-    child.unref();
+    const lifecyclePath = join(active.code.path, "dist", "lifecycle-cli.js");
+    await new Promise<void>((resolvePromise, reject) => {
+      const child = spawn(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Start-Process -FilePath '${release.runtime.path}' ` +
+            `-ArgumentList @('"${lifecyclePath}"','host','--install-root','"${paths.root}"') ` +
+            "-WindowStyle Hidden",
+        ],
+        { stdio: "ignore", windowsHide: true },
+      );
+      child.once("error", reject);
+      child.once("exit", (code) =>
+        code === 0
+          ? resolvePromise()
+          : reject(new Error(`The host launcher exited with code ${code ?? "none"}.`)),
+      );
+    });
   });
 
   const inspect = async (): Promise<LocalInstallationInspection> => {

@@ -10,7 +10,7 @@ import {
   type ExtensionContext,
   type InlineExtension,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { SessionViewSnapshot } from "./session-view/index.ts";
 
@@ -95,31 +95,54 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
   });
 
   let panelOpen = false;
-  let panelRendered = false;
+  let sidebar: SessionSidebar | undefined;
+  let closeSidebar: (() => void) | undefined;
+  let requestRender: (() => void) | undefined;
 
-  const updatePanel = (ctx: ExtensionContext) => {
-    if (!input.readSessionData) return;
-    if (!panelOpen) {
-      if (panelRendered) {
-        ctx.ui.setWidget("riker-session", undefined);
-        panelRendered = false;
-      }
-      return;
-    }
-    const snapshot = input.readSessionData();
-    ctx.ui.setWidget("riker-session", (_tui, theme) => {
-      const box = new Box(0, 0);
-      for (const line of renderSessionPanel(theme, snapshot)) {
-        box.addChild(new Text(line, 1, 0));
-      }
-      return box;
+  const openPanel = (ctx: ExtensionContext) => {
+    if (panelOpen || !input.readSessionData) return;
+    panelOpen = true;
+    // The sidebar is a non-capturing full-height overlay on the left, so the
+    // Owner keeps typing while it stays visible - the Copilot CLI layout.
+    void ctx.ui.custom<void>(
+      (tui, theme, _keybindings, done) => {
+        requestRender = () => tui.requestRender();
+        closeSidebar = () => done(undefined);
+        sidebar = new SessionSidebar(theme, input.readSessionData!);
+        return sidebar;
+      },
+      {
+        overlay: true,
+        overlayOptions: () => ({
+          anchor: "top-left" as const,
+          width: "32%" as const,
+          minWidth: 34,
+          maxHeight: "100%" as const,
+          nonCapturing: true,
+          visible: (termWidth: number, termHeight: number) => {
+            sidebar?.setViewport(termHeight);
+            return termWidth >= 72;
+          },
+        }),
+      },
+    ).finally(() => {
+      panelOpen = false;
+      sidebar = undefined;
+      closeSidebar = undefined;
+      requestRender = undefined;
     });
-    panelRendered = true;
+  };
+
+  const closePanel = () => {
+    closeSidebar?.();
   };
 
   const updateFooter = (ctx: ExtensionContext, nextStatus = status) => {
     status = nextStatus;
-    updatePanel(ctx);
+    if (panelOpen && sidebar) {
+      sidebar.invalidate();
+      requestRender?.();
+    }
     if (!footer || !footerTheme) return;
     footer.setText(
       renderFooter(footerTheme, input.targetProjectPath, status, input.readSessionView(), panelOpen),
@@ -182,27 +205,26 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
   });
 
   pi.registerCommand("view", {
-    description: "Toggle the Session View panel (shift+left / shift+right)",
+    description: "Toggle the Session View sidebar (shift+left / shift+right)",
     handler: async (_args, ctx) => {
-      panelOpen = !panelOpen;
+      if (panelOpen) closePanel();
+      else openPanel(ctx);
       updateFooter(ctx);
     },
   });
 
   pi.registerShortcut("shift+left", {
-    description: "Open the Session View panel",
+    description: "Open the Session View sidebar",
     handler: async (ctx) => {
-      if (panelOpen) return;
-      panelOpen = true;
+      openPanel(ctx);
       updateFooter(ctx);
     },
   });
 
   pi.registerShortcut("shift+right", {
-    description: "Close the Session View panel",
+    description: "Close the Session View sidebar",
     handler: async (ctx) => {
-      if (!panelOpen) return;
-      panelOpen = false;
+      closePanel();
       updateFooter(ctx);
     },
   });
@@ -228,9 +250,48 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     refreshTimer = undefined;
     unsubscribeNotices?.();
     unsubscribeNotices = undefined;
+    closePanel();
     footer = undefined;
     footerTheme = undefined;
   });
+}
+
+// A left-anchored, full-height, non-capturing overlay: the Copilot-style
+// sidebar. It renders live from the freshest Session View snapshot on every
+// frame; the 500ms refresh loop only requests renders.
+class SessionSidebar {
+  private viewportHeight = 0;
+  private readonly theme: Theme;
+  private readonly readSessionData: () => SessionViewSnapshot | undefined;
+
+  constructor(theme: Theme, readSessionData: () => SessionViewSnapshot | undefined) {
+    this.theme = theme;
+    this.readSessionData = readSessionData;
+  }
+
+  setViewport(termHeight: number): void {
+    this.viewportHeight = termHeight;
+  }
+
+  render(width: number): string[] {
+    const usable = Math.max(20, width);
+    const pad = (line: string) => {
+      const cut = truncateToWidth(line, usable - 2);
+      return this.theme.bg(
+        "customMessageBg",
+        ` ${cut}${" ".repeat(Math.max(0, usable - 2 - visibleWidth(cut)))} `,
+      );
+    };
+    const lines = renderSessionPanel(this.theme, this.readSessionData(), Date.now(), usable - 4)
+      .map(pad);
+    lines.push(pad(""));
+    lines.push(pad(this.theme.fg("dim", "shift+→ schließen · /view")));
+    const targetHeight = Math.max(lines.length, this.viewportHeight);
+    while (lines.length < targetHeight) lines.push(pad(""));
+    return lines;
+  }
+
+  invalidate(): void {}
 }
 
 function send(pi: ExtensionAPI, customType: string, content: string): void {
@@ -305,7 +366,10 @@ export function renderSessionPanel(
   theme: Theme,
   snapshot: SessionViewSnapshot | undefined,
   now = Date.now(),
+  contentWidth = 78,
 ): string[] {
+  const wide = Math.max(24, contentWidth - 2);
+  const narrow = Math.max(18, contentWidth - 6);
   const lines: string[] = [theme.bold(theme.fg("accent", "Session View"))];
   if (!snapshot) {
     lines.push(theme.fg("dim", "Noch keine Session-Daten vom Lead."));
@@ -331,7 +395,7 @@ export function renderSessionPanel(
       "  " +
       theme.fg("accent", "⚙ ") +
       theme.fg("dim", `${worker.status} · `) +
-      truncate(worker.label, 56) +
+      truncate(worker.label, narrow) +
       (age ? theme.fg("dim", ` · seit ${age}`) : "")
     );
   };
@@ -342,13 +406,12 @@ export function renderSessionPanel(
         ? theme.fg("success", "● ")
         : theme.fg("accent", "● ");
     const age = item.since ? formatAge(item.since, now) : "";
+    lines.push(marker + truncate(item.outcome, wide));
     lines.push(
-      marker +
-        truncate(item.outcome, 60) +
-        theme.fg("dim", `  ${item.status}${age ? ` · seit ${age}` : ""}`),
+      "  " + theme.fg("dim", `${item.status}${age ? ` · seit ${age}` : ""}`),
     );
     if (item.detail && item.needsOwner) {
-      lines.push("  " + theme.fg("dim", truncate(item.detail, 76)));
+      lines.push("  " + theme.fg("dim", truncate(item.detail, narrow)));
     }
     for (const worker of workersByItem.get(item.workItemId) ?? []) {
       lines.push(workerLine(worker));
@@ -356,7 +419,7 @@ export function renderSessionPanel(
   }
   for (const worker of unattachedWorkers) lines.push(workerLine(worker));
   for (const notice of snapshot.notices) {
-    lines.push(theme.fg("error", "! ") + truncate(notice, 76));
+    lines.push(theme.fg("error", "! ") + truncate(notice, wide));
   }
   return lines;
 }

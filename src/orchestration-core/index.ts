@@ -821,7 +821,11 @@ export interface OrchestrationCore {
 export function createOrchestrationCore(state: OrchestrationState): OrchestrationCore {
   return {
     standingOrdersView() {
-      return state.readStandingOrders();
+      // An expired or revoked order is history, not authority; it stays in the
+      // journal but leaves the Lead's working context.
+      return state.readStandingOrders().filter(
+        (order) => order.state === "active" && Date.parse(order.validUntil) > Date.now(),
+      );
     },
 
     coordinationMessagesView() {

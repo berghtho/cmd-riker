@@ -78,6 +78,28 @@ test("the Session View shows plain numbered status without identifiers", () => {
   assert.match(rendered, /1 item/);
 });
 
+test("the Session View carries item age and per-worker start times for the panel", () => {
+  const startedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  const since = new Date(Date.now() - 60 * 60_000).toISOString();
+  const running = {
+    ...worker("11111111-aaaa-bbbb-cccc-dddddddddddd", "Implement CSV export", "running"),
+  };
+  (running.assignment as { commitmentId?: string }).commitmentId =
+    "33333333-aaaa-bbbb-cccc-dddddddddddd";
+  const snapshot = projectSessionView(stateWith({
+    readWorkerSessions: () => [running],
+    readWorkerExecutionAttempt: () => ({ process: { pid: 1, startedAt } }),
+    readCommitments: () => [
+      item("33333333-aaaa-bbbb-cccc-dddddddddddd", "CSV export ships with column selection"),
+    ],
+    commitmentRecordedAt: () => since,
+  }));
+
+  assert.equal(snapshot.workers[0]?.startedAt, startedAt);
+  assert.equal(snapshot.workers[0]?.workItemId, "33333333-aaaa-bbbb-cccc-dddddddddddd");
+  assert.equal(snapshot.items[0]?.since, since);
+});
+
 test("problems arrive as plain notices instead of an attention ledger", () => {
   const snapshot = projectSessionView(stateWith({
     readEffectIntents: () => [{

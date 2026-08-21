@@ -179,6 +179,7 @@ function conversationSeed(stateDirectory: string, writeGeneration: number): Lead
 
 function renderEntry(entry: LeadHostTranscriptEntry): void {
   if (entry.source === "owner") process.stdout.write(`Owner: ${entry.line}\n`);
+  else if (entry.line.startsWith("CMD_RIKER_SESSION_JSON:")) return;
   else process[entry.stream === "stderr" ? "stderr" : "stdout"].write(`${entry.line}\n`);
 }
 

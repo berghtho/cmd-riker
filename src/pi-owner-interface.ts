@@ -12,6 +12,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 
+import type { SessionViewSnapshot } from "./session-view/index.ts";
+
 // Pi intentionally does not export its CLI composition root. CMD Riker pins the
 // package version and uses that root so Pi, rather than a look-alike TUI, owns the
 // terminal lifecycle and interactive experience.
@@ -32,6 +34,7 @@ export type PiOwnerInterfaceInput = {
   transcript: PiOwnerTranscriptEntry[];
   completeOwnerInput(ownerInput: string): Promise<PiOwnerResponse>;
   readSessionView(): string;
+  readSessionData?(): SessionViewSnapshot | undefined;
   subscribeNotices?(listener: (content: string) => void): () => void;
 };
 
@@ -91,10 +94,36 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     return box;
   });
 
+  let panelOpen = false;
+  let panelRendered = false;
+
+  const updatePanel = (ctx: ExtensionContext) => {
+    if (!input.readSessionData) return;
+    if (!panelOpen) {
+      if (panelRendered) {
+        ctx.ui.setWidget("riker-session", undefined);
+        panelRendered = false;
+      }
+      return;
+    }
+    const snapshot = input.readSessionData();
+    ctx.ui.setWidget("riker-session", (_tui, theme) => {
+      const box = new Box(0, 0);
+      for (const line of renderSessionPanel(theme, snapshot)) {
+        box.addChild(new Text(line, 1, 0));
+      }
+      return box;
+    });
+    panelRendered = true;
+  };
+
   const updateFooter = (ctx: ExtensionContext, nextStatus = status) => {
     status = nextStatus;
+    updatePanel(ctx);
     if (!footer || !footerTheme) return;
-    footer.setText(renderFooter(footerTheme, input.targetProjectPath, status, input.readSessionView()));
+    footer.setText(
+      renderFooter(footerTheme, input.targetProjectPath, status, input.readSessionView(), panelOpen),
+    );
     ctx.ui.setTitle(`CMD Riker — ${input.targetProjectPath}`);
   };
 
@@ -105,7 +134,9 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     ));
     ctx.ui.setFooter((_tui, theme) => {
       footerTheme = theme;
-      footer = new Text(renderFooter(theme, input.targetProjectPath, status, input.readSessionView()));
+      footer = new Text(
+        renderFooter(theme, input.targetProjectPath, status, input.readSessionView(), false),
+      );
       return footer;
     });
     ctx.ui.setWorkingMessage("Riker arbeitet …");
@@ -147,6 +178,32 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     description: "Show CMD Riker's authoritative Session View",
     handler: async (_args, ctx) => {
       ctx.ui.notify(input.readSessionView(), "info");
+    },
+  });
+
+  pi.registerCommand("view", {
+    description: "Toggle the Session View panel (shift+left / shift+right)",
+    handler: async (_args, ctx) => {
+      panelOpen = !panelOpen;
+      updateFooter(ctx);
+    },
+  });
+
+  pi.registerShortcut("shift+left", {
+    description: "Open the Session View panel",
+    handler: async (ctx) => {
+      if (panelOpen) return;
+      panelOpen = true;
+      updateFooter(ctx);
+    },
+  });
+
+  pi.registerShortcut("shift+right", {
+    description: "Close the Session View panel",
+    handler: async (ctx) => {
+      if (!panelOpen) return;
+      panelOpen = false;
+      updateFooter(ctx);
     },
   });
 
@@ -216,6 +273,7 @@ function renderFooter(
   targetProjectPath: string,
   status: "available" | "responding" | "error",
   sessionView: string,
+  panelOpen: boolean,
 ): string {
   const label = status === "available"
     ? theme.fg("success", "● bereit")
@@ -223,5 +281,82 @@ function renderFooter(
     ? theme.fg("accent", "● arbeitet")
     : theme.fg("error", "● Fehler");
   const compactView = sessionView.replace(/\s+/g, " ").trim();
-  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}`;
+  const hint = panelOpen ? "shift+→ Session-View zu" : "shift+← Session-View";
+  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}  ${theme.fg("dim", hint)}`;
+}
+
+export function formatAge(fromIso: string, now = Date.now()): string {
+  const elapsedMs = now - Date.parse(fromIso);
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "";
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 1) return "unter 1 min";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ${minutes % 60} min`;
+  return `${Math.floor(hours / 24)} d ${hours % 24} h`;
+}
+
+function truncate(text: string, maximum: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length <= maximum ? compact : `${compact.slice(0, maximum - 1)}…`;
+}
+
+export function renderSessionPanel(
+  theme: Theme,
+  snapshot: SessionViewSnapshot | undefined,
+  now = Date.now(),
+): string[] {
+  const lines: string[] = [theme.bold(theme.fg("accent", "Session View"))];
+  if (!snapshot) {
+    lines.push(theme.fg("dim", "Noch keine Session-Daten vom Lead."));
+    return lines;
+  }
+  if (snapshot.items.length === 0) {
+    lines.push(theme.fg("dim", "Keine Work Items."));
+  }
+  const workersByItem = new Map<string, SessionViewSnapshot["workers"]>();
+  const unattachedWorkers: SessionViewSnapshot["workers"] = [];
+  for (const worker of snapshot.workers) {
+    if (worker.workItemId) {
+      const list = workersByItem.get(worker.workItemId) ?? [];
+      list.push(worker);
+      workersByItem.set(worker.workItemId, list);
+    } else {
+      unattachedWorkers.push(worker);
+    }
+  }
+  const workerLine = (worker: SessionViewSnapshot["workers"][number]): string => {
+    const age = worker.startedAt ? formatAge(worker.startedAt, now) : "";
+    return (
+      "  " +
+      theme.fg("accent", "⚙ ") +
+      theme.fg("dim", `${worker.status} · `) +
+      truncate(worker.label, 56) +
+      (age ? theme.fg("dim", ` · seit ${age}`) : "")
+    );
+  };
+  for (const item of snapshot.items) {
+    const marker = item.needsOwner
+      ? theme.fg("error", "● ")
+      : item.status.startsWith("done")
+        ? theme.fg("success", "● ")
+        : theme.fg("accent", "● ");
+    const age = item.since ? formatAge(item.since, now) : "";
+    lines.push(
+      marker +
+        truncate(item.outcome, 60) +
+        theme.fg("dim", `  ${item.status}${age ? ` · seit ${age}` : ""}`),
+    );
+    if (item.detail && item.needsOwner) {
+      lines.push("  " + theme.fg("dim", truncate(item.detail, 76)));
+    }
+    for (const worker of workersByItem.get(item.workItemId) ?? []) {
+      lines.push(workerLine(worker));
+    }
+  }
+  for (const worker of unattachedWorkers) lines.push(workerLine(worker));
+  for (const notice of snapshot.notices) {
+    lines.push(theme.fg("error", "! ") + truncate(notice, 76));
+  }
+  return lines;
 }

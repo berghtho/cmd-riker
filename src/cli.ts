@@ -239,6 +239,13 @@ async function main(): Promise<void> {
     };
     const workerSupervisors = await availableWorkerSupervisors(state, conversation, ownerNotices);
     for (const supervisor of Object.values(workerSupervisors)) await supervisor.recover();
+    // A Worker notice implies changed session state; hosted clients keep their
+    // structured Session View current from the same transcript stream.
+    const deliverNotice = ownerNotices.deliver;
+    ownerNotices.deliver = (content) => {
+      deliverNotice(content);
+      emitSessionData(state, workerSupervisors);
+    };
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
       await runInteractiveConversation(
@@ -269,6 +276,7 @@ async function runScriptableConversation(
 ): Promise<void> {
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
   process.stdout.write(`${currentSessionView(state, workerSupervisors)}\n`);
+  emitSessionData(state, workerSupervisors);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInput of lines) {
     if (!ownerInput.trim()) continue;
@@ -291,7 +299,14 @@ async function runScriptableConversation(
     }
     process.stdout.write(`${output.source}: ${output.content}\n`);
     process.stdout.write(`${currentSessionView(state, workerSupervisors)}\n`);
+    emitSessionData(state, workerSupervisors);
   }
+}
+
+function emitSessionData(state: AuthoritativeState, workerSupervisors: WorkerSupervisors): void {
+  process.stdout.write(
+    `CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionViewSnapshot(state, workerSupervisors))}\n`,
+  );
 }
 
 function runInteractiveConversation(
@@ -317,6 +332,7 @@ function runInteractiveConversation(
     completeOwnerInput: (ownerInput) =>
       completeOwnerInteraction(state, adapter, ownerInput, workerSupervisors),
     readSessionView: () => currentSessionView(state, workerSupervisors),
+    readSessionData: () => sessionViewSnapshot(state, workerSupervisors),
     subscribeNotices: (listener) => {
       const previous = ownerNotices.deliver;
       ownerNotices.deliver = listener;

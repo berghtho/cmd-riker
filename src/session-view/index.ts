@@ -14,6 +14,8 @@ export type SessionViewWorker = {
   label: string;
   status: WorkerSession["state"];
   cancellable: boolean;
+  workItemId?: string;
+  startedAt?: string;
 };
 
 export type SessionViewItem = {
@@ -23,6 +25,7 @@ export type SessionViewItem = {
   status: string;
   needsOwner: boolean;
   detail?: string;
+  since?: string;
 };
 
 export type SessionViewSnapshot = {
@@ -43,6 +46,7 @@ export interface SessionViewState {
   readCommitment(commitmentId: string): Commitment | undefined;
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
+  commitmentRecordedAt?(commitmentId: string): string | undefined;
 }
 
 export function projectSessionView(
@@ -63,18 +67,31 @@ export function projectSessionView(
   }
   const visibleWorkers = workers
     .filter((worker) => !isTerminalWorker(worker))
-    .map((worker, index) => ({
-      number: index + 1,
-      workerSessionId: worker.id,
-      label: worker.assignment.objective,
-      status: worker.state,
-      cancellable: cancellationAvailable && worker.state !== "cancellation-requested",
-    }));
+    .map((worker, index) => {
+      const startedAt = state
+        .readWorkerExecutionAttempt(worker.currentExecutionAttemptId)
+        ?.process?.startedAt;
+      return {
+        number: index + 1,
+        workerSessionId: worker.id,
+        label: worker.assignment.objective,
+        status: worker.state,
+        cancellable: cancellationAvailable && worker.state !== "cancellation-requested",
+        ...(worker.assignment.commitmentId
+          ? { workItemId: worker.assignment.commitmentId }
+          : {}),
+        ...(startedAt ? { startedAt } : {}),
+      };
+    });
   const items = commitments
     .filter((commitment) => !["cancelled", "superseded"].includes(commitment.state))
-    .map((commitment, index) =>
-      sessionViewItem(index + 1, commitment, unsettledWorkerByCommitment.get(commitment.id)),
-    );
+    .map((commitment, index) => {
+      const since = state.commitmentRecordedAt?.(commitment.id);
+      return {
+        ...sessionViewItem(index + 1, commitment, unsettledWorkerByCommitment.get(commitment.id)),
+        ...(since ? { since } : {}),
+      };
+    });
 
   const notices: string[] = [];
   for (const effect of state.readEffectIntents()) {

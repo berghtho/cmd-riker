@@ -29,12 +29,20 @@ export type PiOwnerResponse = {
   content: string;
 };
 
+export type PiOwnerUpdateStatus = {
+  installedRevision: string;
+  installedCommit: string;
+  repositoryCommit: string;
+  updateAvailable: boolean;
+};
+
 export type PiOwnerInterfaceInput = {
   targetProjectPath: string;
   transcript: PiOwnerTranscriptEntry[];
   completeOwnerInput(ownerInput: string): Promise<PiOwnerResponse>;
   readSessionView(): string;
   readSessionData?(): SessionViewSnapshot | undefined;
+  readUpdateStatus?(): PiOwnerUpdateStatus | undefined;
   subscribeNotices?(listener: (content: string) => void): () => void;
 };
 
@@ -108,7 +116,7 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
       (tui, theme, _keybindings, done) => {
         requestRender = () => tui.requestRender();
         closeSidebar = () => done(undefined);
-        sidebar = new SessionSidebar(theme, input.readSessionData!);
+        sidebar = new SessionSidebar(theme, input.readSessionData!, input.readUpdateStatus);
         return sidebar;
       },
       {
@@ -145,7 +153,14 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     }
     if (!footer || !footerTheme) return;
     footer.setText(
-      renderFooter(footerTheme, input.targetProjectPath, status, input.readSessionView(), panelOpen),
+      renderFooter(
+        footerTheme,
+        input.targetProjectPath,
+        status,
+        input.readSessionView(),
+        panelOpen,
+        input.readUpdateStatus?.(),
+      ),
     );
     ctx.ui.setTitle(`CMD Riker — ${input.targetProjectPath}`);
   };
@@ -158,7 +173,7 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     ctx.ui.setFooter((_tui, theme) => {
       footerTheme = theme;
       footer = new Text(
-        renderFooter(theme, input.targetProjectPath, status, input.readSessionView(), false),
+        renderFooter(theme, input.targetProjectPath, status, input.readSessionView(), false, undefined),
       );
       return footer;
     });
@@ -263,10 +278,16 @@ class SessionSidebar {
   private viewportHeight = 0;
   private readonly theme: Theme;
   private readonly readSessionData: () => SessionViewSnapshot | undefined;
+  private readonly readUpdateStatus: (() => PiOwnerUpdateStatus | undefined) | undefined;
 
-  constructor(theme: Theme, readSessionData: () => SessionViewSnapshot | undefined) {
+  constructor(
+    theme: Theme,
+    readSessionData: () => SessionViewSnapshot | undefined,
+    readUpdateStatus?: () => PiOwnerUpdateStatus | undefined,
+  ) {
     this.theme = theme;
     this.readSessionData = readSessionData;
+    this.readUpdateStatus = readUpdateStatus;
   }
 
   setViewport(termHeight: number): void {
@@ -284,6 +305,11 @@ class SessionSidebar {
     };
     const lines = renderSessionPanel(this.theme, this.readSessionData(), Date.now(), usable - 4)
       .map(pad);
+    const update = this.readUpdateStatus?.();
+    if (update?.updateAvailable) {
+      lines.push(pad(""));
+      lines.push(pad(this.theme.fg("accent", `⬆ ${renderUpdateNotice(update)}`)));
+    }
     lines.push(pad(""));
     lines.push(pad(this.theme.fg("dim", "shift+→ schließen · /view")));
     const targetHeight = Math.max(lines.length, this.viewportHeight);
@@ -335,6 +361,7 @@ function renderFooter(
   status: "available" | "responding" | "error",
   sessionView: string,
   panelOpen: boolean,
+  update: PiOwnerUpdateStatus | undefined,
 ): string {
   const label = status === "available"
     ? theme.fg("success", "● bereit")
@@ -343,7 +370,17 @@ function renderFooter(
     : theme.fg("error", "● Fehler");
   const compactView = sessionView.replace(/\s+/g, " ").trim();
   const hint = panelOpen ? "shift+→ Session-View zu" : "shift+← Session-View";
-  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}  ${theme.fg("dim", hint)}`;
+  const updateHint = update?.updateAvailable
+    ? `  ${theme.fg("accent", `⬆ ${renderUpdateNotice(update)}`)}`
+    : "";
+  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}  ${theme.fg("dim", hint)}${updateHint}`;
+}
+
+export function renderUpdateNotice(update: PiOwnerUpdateStatus): string {
+  return (
+    `neue Version im Repo (${update.repositoryCommit.slice(0, 7)}; ` +
+    `installiert ${update.installedRevision} @ ${update.installedCommit.slice(0, 7)}) — riker upgrade`
+  );
 }
 
 export function formatAge(fromIso: string, now = Date.now()): string {

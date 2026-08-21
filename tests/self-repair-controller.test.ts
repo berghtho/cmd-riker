@@ -152,7 +152,6 @@ test("failed Self-repair rolls back before a changed hypothesis activates a revi
   const activationPending = await controller.advance(repair.id);
   assert.equal(activationPending.attempts[0]?.status, "activation-pending");
   assert.equal(recovery.inspect().currentAttempt?.phase, "rolled-back");
-  orchestration.pauseCommitment(commitment.id, ownerTurnId, "Owner paused after cutover completed.");
   await assert.rejects(controller.advance(repair.id), /simulated controller exit/);
   const rolledBack = await controller.advance(repair.id);
 
@@ -185,8 +184,6 @@ test("failed Self-repair rolls back before a changed hypothesis activates a revi
     /changed hypothesis/i,
   );
 
-  const resumeTurnId = state.appendOwnerMessage("Resume the bounded Self-repair.");
-  orchestration.resumeCommitment(commitment.id, resumeTurnId);
   const retry = controller.retry(repair.id, {
     hypothesis: "The token refresh occurs after the reconnect response is emitted.",
     changedEvidence: ["trace:response-precedes-token-refresh"],

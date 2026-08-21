@@ -97,9 +97,12 @@ export type NativeWorkerExecution = {
     harnessVersion: string;
     protocolSchemaSha256: string;
     capabilities: WorkerNativeCapabilities;
-    writeIsolation?: "codex-windows-workspace-write";
+    writeIsolation?: "codex-windows-workspace-write" | "claude-write-root-guard";
   };
   answer(providerRequestId: number | string, answers: Record<string, string[]>): Promise<void>;
+  /** Steer the live Worker with a Lead message; absent when the harness cannot
+   * inject guidance mid-run. */
+  send?(text: string): Promise<void>;
   interrupt(): Promise<void>;
   terminate(): Promise<{ gone: boolean }>;
 };
@@ -144,7 +147,6 @@ export interface WorkerSupervisor {
     targets: string[];
     timeoutMs: number;
     verification: { operation: "test"; workingDirectory: string; timeoutMs: number };
-    actingAuthorityEffectAuthorizationId?: string;
     recoveryOfWorkerSessionId?: string;
     recoveryReason?: string;
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
@@ -159,6 +161,10 @@ export interface WorkerSupervisor {
     ownerTurnId: string,
     answers: Record<string, string[]>,
   ): Promise<void>;
+  /** Steer a live Worker mid-run with a Lead message. */
+  steer(workerSessionId: string, message: string): Promise<void>;
+  /** Tail of the live Worker's streamed output for Lead visibility. */
+  workerOutput(workerSessionId: string): string | undefined;
   cancel(workerSessionId: string, ownerTurnId: string, reason: string): Promise<void>;
   recover(): Promise<void>;
 }
@@ -180,6 +186,14 @@ export function createWorkerSupervisor(
     }
   };
   const outputByAttempt = new Map<string, string>();
+  // The live tail may include the CMD_RIKER_OUTCOME contract line; the durable
+  // terminal output stays the plain narration.
+  const stripOutcomeLine = (text: string): string =>
+    text
+      .split(/\r?\n/)
+      .filter((line) => !line.trimStart().startsWith("CMD_RIKER_OUTCOME:"))
+      .join("\n")
+      .trim();
   const commandsByAttempt = new Map<string, string[]>();
   const deadlinesByAttempt = new Map<string, NodeJS.Timeout[]>();
   const clearDeadlines = (executionAttemptId: string): void => {
@@ -216,7 +230,7 @@ export function createWorkerSupervisor(
       if (error instanceof MaterialExecutionCheckoutError) {
         orchestration.blockExecutionCheckout(workerSessionId, executionAttemptId, error.message);
         notifyOwner(
-          `Worker Session ${workerSessionId} needs an Owner intervention: ${error.message}`,
+          `Worker (${orchestration.workerSessionView(workerSessionId)?.assignment.objective ?? "unknown assignment"}) needs you: ${error.message}`,
         );
         return;
       }
@@ -302,7 +316,7 @@ export function createWorkerSupervisor(
             error.message,
           );
           notifyOwner(
-            `Worker Session ${workerSession.id} needs an Owner intervention: ${error.message}`,
+            `Worker (${workerSession.assignment.objective}) needs you: ${error.message}`,
           );
           return;
         }
@@ -330,7 +344,7 @@ export function createWorkerSupervisor(
     );
     orchestration.observeWorkerVerificationResult(workerSession.id, executionAttempt.id, result);
     notifyOwner(
-      `Worker Session ${workerSession.id} finished; Verification ${result.status}.`,
+      `Worker (${workerSession.assignment.objective}) finished; Verification ${result.status}.`,
     );
   };
   const startExecution = async (
@@ -379,7 +393,7 @@ export function createWorkerSupervisor(
         if (error instanceof MaterialExecutionCheckoutError) {
           orchestration.blockExecutionCheckout(workerSession.id, executionAttempt.id, error.message);
           notifyOwner(
-            `Worker Session ${workerSession.id} needs an Owner intervention: ${error.message}`,
+            `Worker (${workerSession.assignment.objective}) needs you: ${error.message}`,
           );
           return;
         }
@@ -391,7 +405,7 @@ export function createWorkerSupervisor(
           processGone: true,
           detail,
         });
-        notifyOwner(`Worker Session ${workerSession.id} failed before launch: ${detail}`);
+        notifyOwner(`Worker (${workerSession.assignment.objective}) failed before launch: ${detail}`);
         await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
         return;
       }
@@ -491,7 +505,7 @@ export function createWorkerSupervisor(
               status,
               processGone: termination.gone,
               ...(outputByAttempt.get(executionAttempt.id)
-                ? { output: outputByAttempt.get(executionAttempt.id)! }
+                ? { output: stripOutcomeLine(outputByAttempt.get(executionAttempt.id)!) }
                 : {}),
               ...(terminalDetail ? { detail: terminalDetail } : {}),
               ...(commandsByAttempt.get(executionAttempt.id)
@@ -514,7 +528,7 @@ export function createWorkerSupervisor(
             if (!willVerify) {
               const summary = reportedOutcome?.summary ?? terminalDetail;
               notifyOwner(
-                `Worker Session ${workerSession.id} ${status}` +
+                `Worker (${workerSession.assignment.objective}) ${status}` +
                   (summary ? `: ${summary}` : "."),
               );
             }
@@ -549,7 +563,7 @@ export function createWorkerSupervisor(
               await startExecution(recovery.workerSession, recovery.executionAttempt);
             } else {
               notifyOwner(
-                `Worker Session ${workerSession.id} lost continuity and exhausted automatic recovery: ${error.message}`,
+                `Worker (${workerSession.assignment.objective}) lost continuity and exhausted automatic recovery: ${error.message}`,
               );
               await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
             }
@@ -644,7 +658,7 @@ export function createWorkerSupervisor(
         processGone: !latestAttempt?.process,
         detail: startupDetail,
       });
-      notifyOwner(`Worker Session ${workerSession.id} failed to start: ${startupDetail}`);
+      notifyOwner(`Worker (${workerSession.assignment.objective}) failed to start: ${startupDetail}`);
       await disposeRejectedExecutionCheckout(workerSession.id, executionAttempt.id);
       throw error;
     }
@@ -753,6 +767,23 @@ export function createWorkerSupervisor(
         .catch(() => {
           // The durable answer remains bound to the question for continuity recovery.
         });
+    },
+
+    async steer(workerSessionId, message) {
+      const execution = executions.get(workerSessionId);
+      if (!execution) {
+        throw new Error("This Worker has no live execution to steer.");
+      }
+      if (!execution.send) {
+        throw new Error("This Worker's Native Harness cannot receive steering mid-run.");
+      }
+      await execution.send(message);
+    },
+
+    workerOutput(workerSessionId) {
+      const worker = orchestration.workerSessionView(workerSessionId);
+      if (!worker) return undefined;
+      return outputByAttempt.get(worker.currentExecutionAttemptId);
     },
 
     async cancel(workerSessionId, ownerTurnId, reason) {

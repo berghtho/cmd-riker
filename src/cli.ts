@@ -46,12 +46,11 @@ import {
   commitmentNotice,
   createLeadAgentRuntime,
   LeadAgentRuntimeDiagnostic,
+  type WorkerSupervisors,
 } from "./lead-agent-runtime/index.ts";
 import { runPiOwnerInterface } from "./pi-owner-interface.ts";
 import {
   parseSessionViewControl,
-  parseSessionViewInspection,
-  parseSessionViewWorkerInspection,
   projectSessionView,
   renderSessionItems,
   renderSessionView,
@@ -216,8 +215,8 @@ async function main(): Promise<void> {
       deliver: (content) =>
         process.stdout.write(`CMD_RIKER_WORKER_NOTICE: ${singleLine(content)}\n`),
     };
-    const workerSupervisor = await availableWorkerSupervisor(state, conversation, ownerNotices);
-    if (workerSupervisor) await workerSupervisor.recover();
+    const workerSupervisors = await availableWorkerSupervisors(state, conversation, ownerNotices);
+    for (const supervisor of Object.values(workerSupervisors)) await supervisor.recover();
     emitActivationReady();
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
@@ -225,7 +224,7 @@ async function main(): Promise<void> {
         state,
         adapter,
         conversation.targetProject.path,
-        workerSupervisor,
+        workerSupervisors,
         ownerNotices,
       );
     } else {
@@ -233,7 +232,7 @@ async function main(): Promise<void> {
         state,
         adapter,
         conversation.targetProject.path,
-        workerSupervisor,
+        workerSupervisors,
       );
     }
   } finally {
@@ -245,10 +244,10 @@ async function runScriptableConversation(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   targetProjectPath: string,
-  workerSupervisor: WorkerSupervisor | undefined,
+  workerSupervisors: WorkerSupervisors,
 ): Promise<void> {
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
-  process.stdout.write(`${currentSessionView(state, workerSupervisor)}\n`);
+  process.stdout.write(`${currentSessionView(state, workerSupervisors)}\n`);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInput of lines) {
     if (!ownerInput.trim()) continue;
@@ -258,7 +257,7 @@ async function runScriptableConversation(
       state,
       adapter,
       ownerInput,
-      workerSupervisor,
+      workerSupervisors,
       hosted
         ? (turnId) => {
             ownerTurnRecorded = true;
@@ -270,7 +269,7 @@ async function runScriptableConversation(
       process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
     }
     process.stdout.write(`${output.source}: ${output.content}\n`);
-    process.stdout.write(`${currentSessionView(state, workerSupervisor)}\n`);
+    process.stdout.write(`${currentSessionView(state, workerSupervisors)}\n`);
   }
 }
 
@@ -278,7 +277,7 @@ function runInteractiveConversation(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   targetProjectPath: string,
-  workerSupervisor: WorkerSupervisor | undefined,
+  workerSupervisors: WorkerSupervisors,
   ownerNotices: OwnerNoticeSink,
 ): Promise<void> {
   const conversation = state.readOwnerConversation();
@@ -295,8 +294,8 @@ function runInteractiveConversation(
     targetProjectPath,
     transcript,
     completeOwnerInput: (ownerInput) =>
-      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisor),
-    readSessionView: () => currentSessionView(state, workerSupervisor),
+      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisors),
+    readSessionView: () => currentSessionView(state, workerSupervisors),
     subscribeNotices: (listener) => {
       const previous = ownerNotices.deliver;
       ownerNotices.deliver = listener;
@@ -316,7 +315,7 @@ async function completeOwnerInteraction(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   ownerInput: string,
-  workerSupervisor?: WorkerSupervisor,
+  workerSupervisors: WorkerSupervisors = {},
   onOwnerTurnRecorded?: (turnId: string) => void,
 ): Promise<OwnerInteractionOutput> {
   if (!/^\/session\s+/i.test(ownerInput)) {
@@ -325,12 +324,12 @@ async function completeOwnerInteraction(
       content: await createLeadAgentRuntime({
         state,
         adapter,
-        ...(workerSupervisor ? { workerSupervisor } : {}),
+        workerSupervisors,
       })
         .completeOwnerTurn(ownerInput, onOwnerTurnRecorded),
     };
   }
-  const snapshot = sessionViewSnapshot(state, workerSupervisor);
+  const snapshot = sessionViewSnapshot(state, workerSupervisors);
   if (/^\/session\s+items\s*$/i.test(ownerInput)) {
     return {
       source: "Session View",
@@ -343,79 +342,58 @@ async function completeOwnerInteraction(
       content: renderSessionWorkers(snapshot),
     };
   }
-  const workerInspection = parseSessionViewWorkerInspection(snapshot, ownerInput);
-  if (workerInspection) {
-    return {
-      source: "Session View",
-      content: renderSessionWorkers(snapshot, workerInspection.id),
-    };
-  }
-  const inspection = parseSessionViewInspection(snapshot, ownerInput);
-  if (inspection) {
-    const detailedSnapshot = sessionViewSnapshot(
-      state,
-      workerSupervisor,
-      "available",
-      true,
-    );
-    return {
-      source: "Session View",
-      content: renderSessionView(detailedSnapshot, inspection.id),
-    };
-  }
   const action = parseSessionViewControl(snapshot, ownerInput);
   if (!action) {
     return {
       source: "Session View",
-      content: "That intervention is not available for the current authoritative state.",
+      content: "That control is not available right now.",
     };
   }
   const ownerTurnId = state.appendOwnerMessage(ownerInput);
   onOwnerTurnRecorded?.(ownerTurnId);
-  if (action.kind === "pause") {
-    createOrchestrationCore(state).pauseCommitment(
-      action.targetId,
-      ownerTurnId,
-      "Owner requested a pause from the Session View.",
-    );
-    state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
-    return {
-      source: "Session View",
-      content: "Pause recorded. Linked Worker activity and any effects remain separate facts.",
-    };
-  }
-  if (!workerSupervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
-  await workerSupervisor.cancel(
-    action.targetId,
+  const supervisor = supervisorOfWorker(state, workerSupervisors, action.workerSessionId);
+  if (!supervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
+  await supervisor.cancel(
+    action.workerSessionId,
     ownerTurnId,
     "Owner requested cancellation from the Session View.",
   );
   state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
   return {
     source: "Session View",
-    content: "Cancellation intent recorded and sent. Existing effects are not rolled back.",
+    content: "Cancellation requested. Changes already made are not rolled back.",
   };
 }
 
 function currentSessionView(
   state: AuthoritativeState,
-  workerSupervisor?: WorkerSupervisor,
+  workerSupervisors: WorkerSupervisors = {},
   leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
 ): string {
-  return renderSessionView(sessionViewSnapshot(state, workerSupervisor, leadAvailability));
+  return renderSessionView(sessionViewSnapshot(state, workerSupervisors, leadAvailability));
 }
 
 function sessionViewSnapshot(
   state: AuthoritativeState,
-  workerSupervisor?: WorkerSupervisor,
+  workerSupervisors: WorkerSupervisors = {},
   leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
-  includeHealthAssessments = false,
 ): SessionViewSnapshot {
   return projectSessionView(state, {
     leadAvailability,
-    cancellationAvailable: Boolean(workerSupervisor),
-    includeHealthAssessments,
+    cancellationAvailable: Object.keys(workerSupervisors).length > 0,
   });
+}
+
+function supervisorOfWorker(
+  state: AuthoritativeState,
+  workerSupervisors: WorkerSupervisors,
+  workerSessionId: string,
+): WorkerSupervisor | undefined {
+  const worker = state.readWorkerSession(workerSessionId);
+  const attempt = worker
+    ? state.readWorkerExecutionAttempt(worker.currentExecutionAttemptId)
+    : undefined;
+  return attempt ? workerSupervisors[attempt.modelSelection.nativeHarness] : undefined;
 }
 
 type OwnerNoticeSink = { deliver: (content: string) => void };
@@ -424,11 +402,11 @@ function singleLine(content: string): string {
   return content.replaceAll(/\s*\r?\n\s*/g, " | ").trim();
 }
 
-async function availableWorkerSupervisor(
+async function availableWorkerSupervisors(
   state: AuthoritativeState,
   configuration: OwnerConfiguration,
   ownerNotices: OwnerNoticeSink,
-): Promise<WorkerSupervisor | undefined> {
+): Promise<WorkerSupervisors> {
   const settings = configuration.workerHarnessSettings ?? {};
   const configured = configuration.workerModelPolicy?.selection.nativeHarness;
   const candidates: Array<"codex" | "claude" | "copilot"> = [];
@@ -439,9 +417,10 @@ async function availableWorkerSupervisor(
       candidates.push(harnessName);
     }
   }
-  if (candidates.length === 0) return undefined;
   const orchestration = createOrchestrationCore(state);
-  let lastFailure: { harness: "codex" | "claude" | "copilot"; detail: string } | undefined;
+  const operations = createTargetProjectOperations(state);
+  const supervisors: WorkerSupervisors = {};
+  const failures: Array<{ harness: "codex" | "claude" | "copilot"; detail: string }> = [];
   for (const harnessName of candidates) {
     try {
       let harness: NativeWorkerHarness;
@@ -460,40 +439,44 @@ async function availableWorkerSupervisor(
           "CMD_RIKER_CODEX_AVAILABLE: Codex Worker capability is available again.\n",
         );
       }
-      return createWorkerSupervisor(
+      supervisors[harnessName] = createWorkerSupervisor(
         state,
         harness,
-        createTargetProjectOperations(state),
+        operations,
         undefined,
         (notice) => ownerNotices.deliver(notice),
       );
     } catch (error) {
-      lastFailure = {
+      failures.push({
         harness: harnessName,
         detail: error instanceof Error ? error.message : "capability probe failed",
-      };
+      });
     }
   }
-  const failed = lastFailure!;
-  orchestration.reconcileInterruptedWorkers(
-    `The ${nativeHarnessName(failed.harness)} capability could not be proven after host restart.`,
-  );
-  const notice = failed.harness === "codex"
-    ? orchestration.observeCodexCapabilityUnavailable(
-        failed.detail,
-        configuration.targetProject.path,
-      )
-    : "recorded";
-  if (notice === "recorded") {
-    const code = `CMD_RIKER_${failed.harness.toUpperCase()}_UNAVAILABLE`;
-    process.stderr.write(
-      `${code}: ` +
-        `${nativeHarnessName(failed.harness)} with expected native identity for Target Project ` +
-        `${configuration.targetProject.path} is unavailable: ` +
-        `${failed.detail}\n`,
+  if (Object.keys(supervisors).length === 0 && failures.length > 0) {
+    const failed = failures[0]!;
+    orchestration.reconcileInterruptedWorkers(
+      `The ${nativeHarnessName(failed.harness)} capability could not be proven after host restart.`,
     );
   }
-  return undefined;
+  for (const failed of failures) {
+    const notice = failed.harness === "codex"
+      ? orchestration.observeCodexCapabilityUnavailable(
+          failed.detail,
+          configuration.targetProject.path,
+        )
+      : "recorded";
+    if (notice === "recorded") {
+      const code = `CMD_RIKER_${failed.harness.toUpperCase()}_UNAVAILABLE`;
+      process.stderr.write(
+        `${code}: ` +
+          `${nativeHarnessName(failed.harness)} with expected native identity for Target Project ` +
+          `${configuration.targetProject.path} is unavailable: ` +
+          `${failed.detail}\n`,
+      );
+    }
+  }
+  return supervisors;
 }
 
 function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {

@@ -138,12 +138,14 @@ test("an effectful delegation without a Commitment records its covering Commitme
       throw new Error("Review delegation is not part of this test.");
     },
     async answer() {},
+    async steer() {},
+    workerOutput: () => undefined,
     async cancel() {},
     async recover() {},
   };
   class DelegatingAdapter extends DeterministicTurnAdapter {
     override async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
-      await request.workerActions!.delegateEffectful!({
+      await request.workerActions!.harnesses[0]!.delegateEffectful!({
         objective: "Fix the reported bug in src/app.ts.",
         prompt: "Fix the bug.",
         targets: ["src/app.ts"],

@@ -79,32 +79,15 @@ test("installed Lead runtime completes one real Target Project Commitment throug
   const localModel = await startLocalModel((_call, requestBody) => {
     modelCall += 1;
     if (modelCall === 1) {
-      return {
-        toolCall: {
-          id: "record-v1-commitment",
-          name: "record_commitment",
-          arguments: {
-            outcome: "The bounded Target Project change passes its declared tests.",
-            criteria: [{
-              kind: "target-project-operation",
-              description: "The declared Target Project tests pass.",
-              operation: "test",
-            }],
-          },
-        },
-      };
-    }
-    if (modelCall === 2) {
-      commitmentId = JSON.stringify(requestBody).match(/[0-9a-f-]{36}/)?.[0] ?? "";
-      assert.match(commitmentId, /^[0-9a-f-]{36}$/);
+      // No commitment ceremony: the delegation itself mints the Work Item.
       return effectfulDelegation(
         "delegate-v1-unready",
-        commitmentId,
+        undefined,
         "Initial hypothesis: implement after the current isolation readiness probe.",
       );
     }
-    if (modelCall === 3) return "The first bounded Worker Session has started.";
-    if (modelCall === 4) {
+    if (modelCall === 2) return "The first bounded Worker Session has started.";
+    if (modelCall === 3) {
       assert.match(JSON.stringify(requestBody), new RegExp(commitmentId));
       return effectfulDelegation(
         "delegate-v1-recovered",
@@ -117,9 +100,9 @@ test("installed Lead runtime completes one real Target Project Commitment throug
         },
       );
     }
-    if (modelCall === 5) return "The recovery Worker Session has started.";
-    if (modelCall === 6) return "I remain available while implementation continues.";
-    if (modelCall === 7) return "The accepted outcome is ready to report.";
+    if (modelCall === 4) return "The recovery Worker Session has started.";
+    if (modelCall === 5) return "I remain available while implementation continues.";
+    if (modelCall === 6) return "The accepted outcome is ready to report.";
     return "No additional outcome is pending.";
   });
   t.after(() => localModel.close());
@@ -160,6 +143,8 @@ test("installed Lead runtime completes one real Target Project Commitment throug
     targetProjectOperations: operations,
   }).completeOwnerTurn("Implement the small requested Target Project change and verify it.");
   assert.match(firstResponse, /first bounded Worker Session has started/);
+  commitmentId = state.readCommitments()[0]?.id ?? "";
+  assert.match(commitmentId, /^[0-9a-f-]{36}$/);
   await waitFor(() => state.readWorkerSessions()[0]?.state === "failed");
   const failedWorker = state.readWorkerSessions()[0]!;
   failedWorkerSessionId = failedWorker.id;
@@ -265,7 +250,7 @@ test("installed Lead runtime completes one real Target Project Commitment throug
 
 function effectfulDelegation(
   id: string,
-  commitmentId: string,
+  commitmentId: string | undefined,
   prompt: string,
   recovery?: { recoveryOfWorkerSessionId: string; recoveryReason: string },
 ): {
@@ -278,7 +263,7 @@ function effectfulDelegation(
       arguments: {
         objective: "Implement the bounded Target Project change.",
         prompt,
-        commitmentId,
+        ...(commitmentId ? { commitmentId } : {}),
         targets: ["src/index.ts"],
         ...recovery,
       },

@@ -27,9 +27,6 @@ import type {
   Commitment,
   CommitmentDraft,
   ConversationMessage,
-  ActingAuthority,
-  ActingAuthorityEvent,
-  ActingAuthorityHandoff,
   StandingOrder,
   StandingOrderDraft,
   WorkerQuestion,
@@ -53,55 +50,23 @@ export type PiTurnRequest = {
   modelSelection: ModelSelection;
   commitments?: readonly Commitment[];
   commitmentActions?: {
-    record(draft: CommitmentDraft): Commitment;
-    recordOwnerAttention(
-      commitmentId: string,
-      input: {
-        kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
-        reason: string;
-        nextAction: string;
-        cause?: { kind: "worker-recovery-exhausted"; workerSessionId: string };
-      },
-    ): void;
-    accept(commitmentId: string): void;
     resume(commitmentId: string): void;
-    control(
-      commitmentId: string,
-      action: "pause" | "cancel" | "supersede",
-      reason: string,
-      replacementCommitmentId?: string,
-    ): void;
+    cancel(commitmentId: string, reason: string): void;
     executeOperation(
-      commitmentId: string,
+      commitmentId: string | undefined,
       operation: "test",
     ): Promise<TargetProjectOperationResult>;
   };
   forgeActions?: {
     commentOnGitHubIssue?(
-      input: { commitmentId: string; issueNumber: number; body: string },
+      input: { commitmentId?: string; issueNumber: number; body: string },
     ): Promise<ForgeOperationResult>;
-    inspectAzureSubscription?(commitmentId: string): Promise<ForgeOperationResult>;
+    inspectAzureSubscription?(commitmentId?: string): Promise<ForgeOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
-  actingAuthority?: ActingAuthority;
   authorityActions?: {
     recordStandingOrder(draft: StandingOrderDraft): StandingOrder;
     revokeStandingOrder(standingOrderId: string, reason: string): void;
-    beginActingAuthority(input: {
-      commitmentIds: string[];
-      standingOrderIds: string[];
-      ownerInstructionQuote: string;
-    }): ActingAuthority;
-    recordActingAuthorityEvent(
-      actingAuthorityId: string,
-      input: Omit<ActingAuthorityEvent, "id" | "recordedAt" | "effect" | "decision"> & {
-        effect?: Omit<NonNullable<ActingAuthorityEvent["effect"]>, "standingOrderId">;
-        decision?: Omit<NonNullable<ActingAuthorityEvent["decision"]>, "standingOrderId">;
-      },
-    ): ActingAuthorityEvent;
-    prepareActingAuthorityHandoff(
-      actingAuthorityId: string,
-    ): ActingAuthorityHandoff;
   };
   /** Grants the Lead its full native tool belt (read, bash, edit, write, grep,
    * find, ls) rooted in the Target Project, plus installed skills and project
@@ -123,30 +88,34 @@ export type PiTurnRequest = {
     detail: string;
   };
   workerActions?: {
-    capabilities?: {
+    harnesses: Array<{
       nativeHarness: "codex" | "claude" | "copilot";
       effectful: boolean;
       nativeQuestions: boolean;
       cancellation: boolean;
-    };
-    delegate(input: {
-      objective: string;
-      prompt: string;
-      commitmentId?: string;
-      recoveryOfWorkerSessionId?: string;
-      recoveryReason?: string;
-    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
-    delegateEffectful?(input: {
-      objective: string;
-      prompt: string;
-      commitmentId?: string;
-      targets: string[];
-      recoveryOfWorkerSessionId?: string;
-      recoveryReason?: string;
-    }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+      delegate(input: {
+        objective: string;
+        prompt: string;
+        model?: string;
+        commitmentId?: string;
+        recoveryOfWorkerSessionId?: string;
+        recoveryReason?: string;
+      }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+      delegateEffectful?(input: {
+        objective: string;
+        prompt: string;
+        model?: string;
+        commitmentId?: string;
+        targets: string[];
+        timeoutMinutes?: number;
+        recoveryOfWorkerSessionId?: string;
+        recoveryReason?: string;
+      }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
+    }>;
     delegateReview?(input: {
       implementationWorkerSessionId: string;
       prompt: string;
+      harness?: "codex" | "claude" | "copilot";
     }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
     adjudicateReview?(input: {
       commitmentId: string;
@@ -157,6 +126,8 @@ export type PiTurnRequest = {
       }>;
     }): void;
     reserveOwnerDecision?(questionId: string, reason: string): void;
+    steer?(workerSessionId: string, message: string): Promise<void>;
+    workerOutput?(workerSessionId: string): string | undefined;
     answer?(questionId: string, answers: Record<string, string[]>): Promise<void>;
     cancel?(workerSessionId: string, reason: string): Promise<void>;
   };
@@ -392,30 +363,27 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           `irreversible ${order.allowIrreversibleEffects}; externally binding ${order.allowExternallyBindingEffects}`
         )
         .join("\n");
-      const actingAuthorityContext = request.actingAuthority
-        ? `${request.actingAuthority.id}: ${request.actingAuthority.state}; Commitments ` +
-          `${request.actingAuthority.commitmentIds.join(", ")}; ${request.actingAuthority.events.length} event(s)`
-        : "none";
       const initialState = {
         systemPrompt:
           "You are CMD Riker's Lead Agent: confident, composed, warm, observant, decisive, candid, " +
           "occasionally witty, proactive, and loyal to the Owner's intent without becoming passive. " +
           "Enjoy the work, challenge weak plans professionally, and serve the Owner without theatrical role-play. " +
-          "Distinguish conversation from accepted outcome-oriented work. When you visibly accept work that can " +
-          "be completed in this response, call record_commitment before the final response. Use objective " +
-          "response-includes criteria only for exact observable response postconditions. Reserve subjective " +
-          "quality and Owner choices with owner-judgment. Never call accept_commitment unless this Owner input " +
-          "explicitly accepts the named waiting Commitment. Use resume_commitment only for a blocked or paused " +
-          "Commitment the Owner asks to continue. Use control_commitment only for the Owner's explicit pause, " +
-          "cancel, or supersede instruction." +
+          "You hold full Command Authority within the mission and Standing Orders, whether the Owner is " +
+          "present or absent; absence changes only your reporting duty — report decisions, effects, and open " +
+          "points when the Owner returns. Take the reversible variant of any irreversible action that lacks " +
+          "explicit coverage." +
           " Act on the Owner's intent immediately: a plain imperative like 'start', 'fix it', or 'go ahead' is " +
-          "sufficient authority to begin the obvious next unit of work. Fill routine parameters (Commitments, " +
-          "targets, criteria) from the conversation and durable state yourself. Never ask the Owner for internal " +
-          "IDs, effect classes, authorization structures, or restatements of what they already said; if exactly " +
-          "one material decision is genuinely missing, propose a concrete default and ask one short question." +
+          "sufficient authority to begin the obvious next unit of work. Split a feature into parallel Worker " +
+          "assignments yourself, pick the harness per task, and fill routine parameters from the conversation " +
+          "and durable state. Never ask the Owner for internal IDs, forms, or restatements of what they already " +
+          "said; if exactly one genuine product decision is missing, propose a concrete default and ask one " +
+          "short question. Use resume_work_item for blocked work the Owner asks to continue and " +
+          "cancel_work_item only on their explicit instruction." +
           " When the Owner asks how things stand, answer in their language and in plain terms: name each " +
           "work item by what it is, say what is happening right now, and say what (if anything) you need from " +
-          "them. Keep internal IDs and state-machine vocabulary out of the answer unless the Owner asks for them." +
+          "them. Keep UUIDs and state-machine vocabulary out of everything the Owner sees." +
+          " Deliver with evidence: run run_target_project_operation for durable Verification, then report what " +
+          "shipped, the evidence, decisions taken, and open points — delivery needs no Owner acceptance." +
           (request.harnessActions
             ? " The Owner configures Worker harnesses conversationally: when they ask to enable, disable, or " +
               "change the model of a harness, call configure_worker_harness yourself — never send them to a " +
@@ -423,30 +391,22 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
             : "") +
           (request.nativeTools
             ? " You hold your full native tool belt (read, bash, edit, write, grep, find, ls) rooted in the " +
-              "Target Project under your own Command Authority. Act directly whenever that serves the mission " +
-              "best; delegating to a Worker Session is one option, never a prerequisite. Record a Commitment " +
-              "for outcome-oriented work you accept, and use run_target_project_operation when durable " +
-              "Verification evidence is wanted."
+              "Target Project. Act directly whenever that serves the mission best; delegating to a Worker " +
+              "Session is one option, never a prerequisite. When you edit files inside a running Worker's " +
+              "checkout, announce the change to that Worker before it continues, so it never reacts to " +
+              "unexplained changes."
             : "") +
-          " For a Target Project test outcome, record one Commitment with a target-project-operation " +
-           "criterion and then call run_target_project_operation for durable Verification evidence." +
            (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.inspectAzureSubscription
-             ? " For a GitHub comment or Azure inspection, record one Commitment with the matching forge-operation criterion before calling its typed tool. " +
-               "Use typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
-               "CMD Riker resolves applicable Standing Order authorization internally; a public GitHub comment still requires one to exist. " +
+             ? " Use the typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
                "Treat an unavailable result as one Owner action and do not retry blindly."
              : "") +
-           (commitmentContext ? `\nCurrent Commitments:\n${commitmentContext}` : "") +
+           (commitmentContext ? `\nCurrent Work Items:\n${commitmentContext}` : "") +
            (request.authorityActions
-             ? "\nStanding Orders are created or revoked only from explicit Owner instructions. Silence never begins Acting Authority. " +
-               "When the Owner grants standing authority in plain language, summarize the bounds you understood " +
-               "(effects, targets, spend, expiration) in your response and record the Standing Order from their words; " +
-               "quote the Owner's own sentence, and ask one short confirmation question only when a bound is genuinely undecidable. " +
-               "During Acting Authority, record material decisions, effects, exceptions, risks, and uncertainty. " +
-               "When the Owner returns, prepare the durable handoff before returning command."
+             ? "\nStanding Orders are plain-language durable Owner instructions that grant, reserve, or limit " +
+               "authority. When the Owner grants one, summarize the bounds you understood in your response and " +
+               "record it from their words; quote the Owner's own sentence."
              : "") +
            (standingOrderContext ? `\nStanding Orders:\n${standingOrderContext}` : "") +
-           `\nActing Authority: ${actingAuthorityContext}` +
            nativeContext.skillsPrompt +
            nativeContext.contextFilesPrompt +
            (request.workerActions ? workerCapabilityPrompt(request.workerActions) : "") +
@@ -708,63 +668,29 @@ function commitmentTools(
   const actions = request.commitmentActions;
   return [
     {
-      name: "record_commitment",
-      label: "Record Commitment",
-      description:
-        "Visibly accept one outcome-oriented unit of work and declare how its response outcome is accepted.",
-      parameters: Type.Object({
-        outcome: Type.String({ minLength: 1 }),
-        criteria: Type.Array(commitmentCriterionSchema, { minItems: 1 }),
-        review: Type.Optional(Type.Object({
-          required: Type.Literal(true),
-          reasons: Type.Array(Type.Union([
-            Type.Literal("public-module"),
-            Type.Literal("authorization"),
-            Type.Literal("data"),
-            Type.Literal("deployment"),
-            Type.Literal("self-repair"),
-            Type.Literal("objective-check-gap"),
-          ]), { minItems: 1 }),
-        })),
-      }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const commitment = actions.record(params as CommitmentDraft);
-        observer.onMutation();
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Commitment ${commitment.id} is active and will be verified against the final response.`,
-            },
-          ],
-          details: { commitmentId: commitment.id, state: commitment.state },
-        };
-      },
-    },
-    {
       name: "run_target_project_operation",
       label: "Run Target Project Operation",
       description:
-        "Run and verify one declared semantic Target Project operation for an active Commitment.",
+        "Run one declared semantic Target Project operation for durable Verification evidence. " +
+        "When workItemId is omitted, CMD Riker attaches the run to a fresh Work Item.",
       parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
+        workItemId: Type.Optional(Type.String({ minLength: 1 })),
         operation: Type.Literal("test"),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, operation } = params as {
-          commitmentId: string;
+        const { workItemId, operation } = params as {
+          workItemId?: string;
           operation: "test";
         };
-        const result = await actions.executeOperation(commitmentId, operation);
+        const result = await actions.executeOperation(workItemId, operation);
         observer.onMutation();
         return {
           content: [
             {
               type: "text",
               text:
-                `Operation attempt ${result.operationAttemptId} ended ${result.status}; ` +
+                `Operation ended ${result.status}; ` +
                 `${result.affectedArtifacts.length} affected artifact(s); ` +
                 `${result.uncertainty ? result.uncertainty.reason : "no unresolved uncertainty"}.`,
             },
@@ -774,114 +700,37 @@ function commitmentTools(
       },
     },
     {
-      name: "record_material_commitment_attention",
-      label: "Record Material Commitment Attention",
-      description:
-        "Record an Owner-facing Commitment blocker only for a reserved decision, exhausted recovery, trusted-base loss, or mission-critical impairment, with the actual fact and recovery condition. When promoting an exhausted Worker recovery, include that Worker as the causal source.",
+      name: "resume_work_item",
+      label: "Resume Work Item",
+      description: "Continue a blocked Work Item the Owner asked to pick back up.",
+      parameters: Type.Object({ workItemId: Type.String({ minLength: 1 }) }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { workItemId } = params as { workItemId: string };
+        actions.resume(workItemId);
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: "The Work Item is active again." }],
+          details: { workItemId, state: "active" },
+        };
+      },
+    },
+    {
+      name: "cancel_work_item",
+      label: "Cancel Work Item",
+      description: "Cancel one Work Item on the Owner's explicit instruction.",
       parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
-        kind: Type.Union([
-          Type.Literal("owner-reserved-decision"),
-          Type.Literal("recovery-exhausted"),
-          Type.Literal("trusted-base-loss"),
-          Type.Literal("mission-critical-impairment"),
-        ]),
+        workItemId: Type.String({ minLength: 1 }),
         reason: Type.String({ minLength: 1 }),
-        nextAction: Type.String({ minLength: 1 }),
-        cause: Type.Optional(Type.Object({
-          kind: Type.Literal("worker-recovery-exhausted"),
-          workerSessionId: Type.String({ minLength: 1 }),
-        })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId, kind, reason, nextAction, cause } = params as {
-          commitmentId: string;
-          kind: "owner-reserved-decision" | "recovery-exhausted" | "trusted-base-loss" | "mission-critical-impairment";
-          reason: string;
-          nextAction: string;
-          cause?: { kind: "worker-recovery-exhausted"; workerSessionId: string };
-        };
-        actions.recordOwnerAttention(commitmentId, {
-          kind,
-          reason,
-          nextAction,
-          ...(cause ? { cause } : {}),
-        });
+        const { workItemId, reason } = params as { workItemId: string; reason: string };
+        actions.cancel(workItemId, reason);
         observer.onMutation();
         return {
-          content: [{ type: "text", text: `Material attention recorded for Commitment ${commitmentId}.` }],
-          details: { commitmentId, kind },
-        };
-      },
-    },
-    {
-      name: "resume_commitment",
-      label: "Resume Commitment",
-      description: "Bind a blocked or paused Commitment to this Owner turn so its outcome can continue.",
-      parameters: Type.Object({ commitmentId: Type.String({ minLength: 1 }) }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const { commitmentId } = params as { commitmentId: string };
-        actions.resume(commitmentId);
-        observer.onMutation();
-        return {
-          content: [{ type: "text", text: `Commitment ${commitmentId} resumed.` }],
-          details: { commitmentId, state: "active" },
-        };
-      },
-    },
-    {
-      name: "control_commitment",
-      label: "Control Commitment",
-      description: "Apply the Owner's explicit pause, cancellation, or supersession instruction.",
-      parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
-        action: Type.Union([
-          Type.Literal("pause"),
-          Type.Literal("cancel"),
-          Type.Literal("supersede"),
-        ]),
-        reason: Type.String({ minLength: 1 }),
-        replacementCommitmentId: Type.Optional(Type.String({ minLength: 1 })),
-      }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const { commitmentId, action, reason, replacementCommitmentId } = params as {
-          commitmentId: string;
-          action: "pause" | "cancel" | "supersede";
-          reason: string;
-          replacementCommitmentId?: string;
-        };
-        actions.control(commitmentId, action, reason, replacementCommitmentId);
-        observer.onMutation();
-        const disposition =
-          action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "superseded";
-        return {
-          content: [{ type: "text", text: `Commitment ${commitmentId} is ${disposition}.` }],
-          details: { commitmentId, action },
-        };
-      },
-    },
-    {
-      name: "accept_commitment",
-      label: "Accept Commitment",
-      description:
-        "Record the Owner's explicit verdict for one Commitment currently awaiting Owner Acceptance.",
-      parameters: Type.Object({ commitmentId: Type.String({ minLength: 1 }) }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const { commitmentId } = params as { commitmentId: string };
-        actions.accept(commitmentId);
-        observer.onMutation();
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Owner Acceptance recorded for Commitment ${commitmentId}.`,
-            },
-          ],
-          details: { commitmentId, state: "accepted" },
+          content: [{ type: "text", text: "The Work Item is cancelled." }],
+          details: { workItemId, state: "cancelled" },
         };
       },
     },
@@ -952,93 +801,6 @@ function authorityTools(
         };
       },
     },
-    {
-      name: "begin_acting_authority",
-      label: "Begin Acting Authority",
-      description:
-        "Begin an explicitly Owner-authorized absence period for bounded Commitments and active Standing Orders.",
-      parameters: Type.Object({
-        commitmentIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-        standingOrderIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-        ownerInstructionQuote: Type.String({ minLength: 2 }),
-      }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const acting = actions.beginActingAuthority(params as {
-          commitmentIds: string[];
-          standingOrderIds: string[];
-          ownerInstructionQuote: string;
-        });
-        observer.onMutation();
-        return {
-          content: [{ type: "text", text: `Acting Authority ${acting.id} began within its recorded bounds.` }],
-          details: acting,
-        };
-      },
-    },
-    {
-      name: "record_acting_authority_event",
-      label: "Record Acting Authority Event",
-      description:
-        "Record one material decision, effect, exception, risk, or uncertainty during active Acting Authority.",
-      parameters: Type.Object({
-        actingAuthorityId: Type.String({ minLength: 1 }),
-        kind: Type.Union([
-          Type.Literal("decision"),
-          Type.Literal("effect"),
-          Type.Literal("exception"),
-          Type.Literal("risk"),
-          Type.Literal("uncertainty"),
-        ]),
-        commitmentId: Type.String({ minLength: 1 }),
-        summary: Type.String({ minLength: 1 }),
-        evidence: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-        effect: Type.Optional(Type.Object({
-          effectClass: standingOrderEffectClassSchema,
-          target: Type.String({ minLength: 1 }),
-          reversible: Type.Boolean(),
-          externallyBinding: Type.Boolean(),
-          incrementalSpendUsd: Type.Number({ minimum: 0 }),
-          effectIntentId: Type.String({ minLength: 1 }),
-        })),
-        decision: Type.Optional(Type.Object({
-          decisionClass: Type.Union([
-            Type.Literal("product-decision"),
-            Type.Literal("prioritization"),
-          ]),
-          target: Type.String({ minLength: 1 }),
-        })),
-      }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const { actingAuthorityId, ...event } = params as Parameters<
-          typeof actions.recordActingAuthorityEvent
-        >[1] & { actingAuthorityId: string };
-        const recorded = actions.recordActingAuthorityEvent(actingAuthorityId, event);
-        observer.onMutation();
-        return {
-          content: [{ type: "text", text: `Acting Authority ${recorded.kind} ${recorded.id} recorded.` }],
-          details: recorded,
-        };
-      },
-    },
-    {
-      name: "prepare_acting_authority_handoff",
-      label: "Prepare Acting Authority Handoff",
-      description:
-        "Prepare the returning Owner's durable decisions, effects, exceptions, risks, and uncertainty handoff before command returns.",
-      parameters: Type.Object({ actingAuthorityId: Type.String({ minLength: 1 }) }),
-      executionMode: "sequential",
-      async execute(_toolCallId, params) {
-        const { actingAuthorityId } = params as { actingAuthorityId: string };
-        const handoff = actions.prepareActingAuthorityHandoff(actingAuthorityId);
-        observer.onMutation();
-        return {
-          content: [{ type: "text", text: `Acting Authority handoff: ${JSON.stringify(handoff)}` }],
-          details: handoff,
-        };
-      },
-    },
   ];
 }
 
@@ -1092,27 +854,30 @@ function workerTools(
 ): AgentTool[] {
   if (!request.workerActions) return [];
   const actions = request.workerActions;
-  const capabilities = workerCapabilities(actions);
-  const nativeName = nativeHarnessName(capabilities.nativeHarness);
-  const tools: AgentTool[] = [
-    {
-      name: `delegate_read_only_${capabilities.nativeHarness}`,
+  const tools: AgentTool[] = [];
+  for (const harness of actions.harnesses) {
+    const nativeName = nativeHarnessName(harness.nativeHarness);
+    tools.push({
+      name: `delegate_read_only_${harness.nativeHarness}`,
       label: `Delegate Read-only ${nativeName} Worker`,
       description:
-        `Start one bounded, read-only ${nativeName} Worker Session without waiting for its outcome.`,
+        `Start one bounded, read-only ${nativeName} Worker Session without waiting for its outcome. ` +
+        "Pass model only to override the configured Worker model for this task.",
       parameters: Type.Object({
         objective: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
+        model: Type.Optional(Type.String({ minLength: 1 })),
         commitmentId: Type.Optional(Type.String({ minLength: 1 })),
         recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
         recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const result = await actions.delegate(
+        const result = await harness.delegate(
           params as {
             objective: string;
             prompt: string;
+            model?: string;
             commitmentId?: string;
             recoveryOfWorkerSessionId?: string;
             recoveryReason?: string;
@@ -1131,45 +896,98 @@ function workerTools(
           details: result,
         };
       },
-    },
-  ];
-  if (capabilities.effectful && actions.delegateEffectful) {
+    });
+    const delegateEffectful = harness.delegateEffectful;
+    if (harness.effectful && delegateEffectful) {
+      tools.push({
+        name: `delegate_effectful_${harness.nativeHarness}`,
+        label: `Delegate Effectful ${nativeName} Worker`,
+        description:
+          `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. ` +
+          "When commitmentId is omitted, CMD Riker records the covering Work Item with its test Verification automatically. " +
+          "Pass model or timeoutMinutes only to override the defaults for this task.",
+        parameters: Type.Object({
+          objective: Type.String({ minLength: 1 }),
+          prompt: Type.String({ minLength: 1 }),
+          model: Type.Optional(Type.String({ minLength: 1 })),
+          commitmentId: Type.Optional(Type.String({ minLength: 1 })),
+          targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
+          timeoutMinutes: Type.Optional(Type.Integer({ minimum: 1, maximum: 180 })),
+          recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
+          recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
+        }),
+        executionMode: "sequential",
+        async execute(_toolCallId, params) {
+          const result = await delegateEffectful(
+            params as {
+              objective: string;
+              prompt: string;
+              model?: string;
+              commitmentId?: string;
+              targets: string[];
+              timeoutMinutes?: number;
+              recoveryOfWorkerSessionId?: string;
+              recoveryReason?: string;
+            },
+          );
+          observer.onMutation();
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Worker Session ${result.workerSessionId} started effectful ` +
+                  `execution attempt ${result.executionAttemptId} inside its Authorized Write Root.`,
+              },
+            ],
+            details: result,
+          };
+        },
+      });
+    }
+  }
+  if (actions.steer) {
     tools.push({
-      name: `delegate_effectful_${capabilities.nativeHarness}`,
-      label: `Delegate Effectful ${nativeName} Worker`,
+      name: "steer_worker",
+      label: "Steer Worker",
       description:
-        `Start one bounded ${nativeName} implementation assignment inside the technically enforced active Target Project checkout. When commitmentId is omitted, CMD Riker records the covering Commitment with its test Verification automatically.`,
+        "Send a mid-run Lead message into a live Worker Session: correct its course, deliver another Worker's finding, " +
+        "or announce a direct edit you made inside its checkout before it continues.",
       parameters: Type.Object({
-        objective: Type.String({ minLength: 1 }),
-        prompt: Type.String({ minLength: 1 }),
-        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
-        targets: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 64 }),
-        recoveryOfWorkerSessionId: Type.Optional(Type.String({ minLength: 1 })),
-        recoveryReason: Type.Optional(Type.String({ minLength: 1 })),
+        workerSessionId: Type.String({ minLength: 1 }),
+        message: Type.String({ minLength: 1 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const result = await actions.delegateEffectful!(
-          params as {
-            objective: string;
-            prompt: string;
-            commitmentId?: string;
-            targets: string[];
-            recoveryOfWorkerSessionId?: string;
-            recoveryReason?: string;
-          },
-        );
+        const { workerSessionId, message } = params as {
+          workerSessionId: string;
+          message: string;
+        };
+        await actions.steer!(workerSessionId, message);
         observer.onMutation();
         return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Worker Session ${result.workerSessionId} started effectful ` +
-                `execution attempt ${result.executionAttemptId} inside its Authorized Write Root.`,
-            },
-          ],
-          details: result,
+          content: [{ type: "text", text: "The steering message was delivered to the Worker." }],
+          details: { workerSessionId },
+        };
+      },
+    });
+  }
+  if (actions.workerOutput) {
+    tools.push({
+      name: "read_worker_output",
+      label: "Read Worker Output",
+      description: "Read the live output tail of one running Worker Session.",
+      parameters: Type.Object({ workerSessionId: Type.String({ minLength: 1 }) }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { workerSessionId } = params as { workerSessionId: string };
+        const output = actions.workerOutput!(workerSessionId);
+        return {
+          content: [{
+            type: "text",
+            text: output?.trim() ? output : "The Worker has produced no output yet.",
+          }],
+          details: { workerSessionId },
         };
       },
     });
@@ -1183,12 +1001,18 @@ function workerTools(
       parameters: Type.Object({
         implementationWorkerSessionId: Type.String({ minLength: 1 }),
         prompt: Type.String({ minLength: 1 }),
+        harness: Type.Optional(Type.Union([
+          Type.Literal("codex"),
+          Type.Literal("claude"),
+          Type.Literal("copilot"),
+        ])),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const result = await actions.delegateReview!(params as {
           implementationWorkerSessionId: string;
           prompt: string;
+          harness?: "codex" | "claude" | "copilot";
         });
         observer.onMutation();
         return {
@@ -1239,11 +1063,13 @@ function workerTools(
       },
     });
   }
-  if (capabilities.nativeQuestions && actions.answer) {
+  const anyNativeQuestions = actions.harnesses.some((harness) => harness.nativeQuestions);
+  const anyCancellation = actions.harnesses.some((harness) => harness.cancellation);
+  if (anyNativeQuestions && actions.answer) {
     tools.push({
       name: "answer_worker_question",
       label: "Answer Worker Question",
-      description: `Deliver the Owner's answer to one open native ${nativeName} question by durable identity.`,
+      description: "Deliver the decided answer to one open native Worker question by durable identity.",
       parameters: Type.Object({
         questionId: Type.String({ minLength: 1 }),
         answers: Type.Record(
@@ -1273,7 +1099,7 @@ function workerTools(
       },
     });
   }
-  if (capabilities.nativeQuestions && actions.reserveOwnerDecision) {
+  if (anyNativeQuestions && actions.reserveOwnerDecision) {
     tools.push({
       name: "reserve_worker_question_for_owner",
       label: "Reserve Worker Question for Owner",
@@ -1298,12 +1124,12 @@ function workerTools(
       },
     });
   }
-  if (capabilities.cancellation && actions.cancel) {
+  if (anyCancellation && actions.cancel) {
     tools.push({
       name: "cancel_worker_session",
       label: "Cancel Worker Session",
       description:
-        `Record cancellation intent, then interrupt one active ${nativeName} Worker Session. This does not roll back effects.`,
+        "Record cancellation intent, then interrupt one active Worker Session. This does not roll back effects.",
       parameters: Type.Object({
         workerSessionId: Type.String({ minLength: 1 }),
         reason: Type.String({ minLength: 1 }),
@@ -1333,35 +1159,34 @@ function workerTools(
   return tools;
 }
 
-function workerCapabilities(actions: NonNullable<PiTurnRequest["workerActions"]>) {
-  return actions.capabilities ?? {
-    nativeHarness: "codex" as const,
-    effectful: true,
-    nativeQuestions: true,
-    cancellation: true,
-  };
-}
-
 function nativeHarnessName(harness: "codex" | "claude" | "copilot"): string {
   return harness === "codex" ? "Codex" : harness === "claude" ? "Claude" : "Copilot";
 }
 
 function workerCapabilityPrompt(actions: NonNullable<PiTurnRequest["workerActions"]>): string {
-  const capabilities = workerCapabilities(actions);
-  const nativeName = nativeHarnessName(capabilities.nativeHarness);
+  const roster = actions.harnesses
+    .map(
+      (harness) =>
+        `${nativeHarnessName(harness.nativeHarness)} (${harness.effectful ? "implements and reviews" : "read-only research and review"})`,
+    )
+    .join(", ");
   return (
-    `\nA proven ${nativeName} Worker capability is available for bounded read-only work.` +
-    (capabilities.effectful
-      ? " Effectful work is confined to the active Target Project checkout; delegate with checkout-relative targets. When you omit commitmentId, CMD Riker records the covering Commitment and its test Verification automatically, and it resolves any applicable durable authority internally — never ask the Owner for IDs, effect classes, or authorization details. CMD Riker runs typed Verification after the Worker finishes."
-      : " Effectful assignment is unavailable because Authorized Write Root enforcement is not proven for this Native Harness.") +
-    (capabilities.nativeQuestions
-      ? " Native questions are available; reserve only authority or product-judgment questions for Owner attention."
-      : " Native questions are unavailable.") +
-    (capabilities.cancellation ? " Native cancellation is available." : " Native cancellation is unavailable.") +
+    `\nAvailable Worker harnesses: ${roster}. You choose the harness and, when useful, the model per ` +
+    "task — split one feature across parallel Workers freely; the Owner never sees the choice but can " +
+    "override it in plain language. Effectful work is confined to isolated checkouts with " +
+    "checkout-relative targets; when you omit commitmentId, CMD Riker records the covering Work Item " +
+    "and its test Verification automatically. CMD Riker runs typed Verification after a Worker finishes." +
+    (actions.steer
+      ? " You have live visibility (read_worker_output) and can steer any running Worker mid-run " +
+        "(steer_worker): correct a wrong path, deliver one Worker's finding to another, and always " +
+        "announce your own direct edits inside a Worker's checkout before it continues."
+      : "") +
     (actions.adjudicateReview
       ? " Adjudicate every reported Review finding as must-fix, documented exception, or follow-up with Lead rationale."
       : "") +
-    " Never claim resume, deletion, child control, rollback, or effect continuity when the recorded capability facts do not prove it."
+    " Answer routine Worker questions yourself within the mission; reserve only genuine product " +
+    "decisions for the Owner. Never claim resume, deletion, child control, rollback, or effect " +
+    "continuity when the recorded capability facts do not prove it."
   );
 }
 

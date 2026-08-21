@@ -986,19 +986,6 @@ test("orchestration blocks startup recovery after its bounded read-only attempts
     reason: "Automatic Worker recovery exhausted its bounded attempts.",
     nextAction: "The Owner must choose whether to diagnose, redelegate, or abandon the Assignment.",
   });
-  orchestration.recordCommitmentOwnerAttention(commitment.id, {
-    kind: "recovery-exhausted",
-    reason: "The linked Worker exhausted automatic recovery.",
-    nextAction: "The Owner must choose a changed recovery strategy.",
-    cause: {
-      kind: "worker-recovery-exhausted",
-      workerSessionId: started.workerSessionId,
-    },
-  });
-  assert.deepEqual(state.readCommitment(commitment.id)?.condition?.ownerAttentionCause, {
-    kind: "worker-recovery-exhausted",
-    workerSessionId: started.workerSessionId,
-  });
   const recovery = await supervisor.delegate({
     ...assignment,
     recoveryOfWorkerSessionId: started.workerSessionId,
@@ -1116,7 +1103,10 @@ test("the Codex 0.147.0 adapter enforces read-only policy and carries a native q
   await execution.answer(0, { module: ["State"] });
   await waitFor(() => terminalStatus !== undefined);
   assert.equal(terminalStatus, "completed");
-  assert.equal(output, "Read-only result.");
+  // The observer stream is the live tail; the outcome contract line is
+  // stripped later for the durable terminal record.
+  assert.match(output, /^Read-only result\./);
+  assert.match(output, /CMD_RIKER_OUTCOME:/);
   assert.deepEqual(reportedOutcome, {
     status: "completed",
     summary: "Read-only result.",

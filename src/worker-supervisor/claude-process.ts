@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 
 import type {
   NativeWorkerExecution,
@@ -70,9 +70,13 @@ export async function resolveClaudeRuntime(): Promise<ClaudeRuntime> {
   return { executable: resolve(executable), args: [], version };
 }
 
+const readOnlyTools = ["Read", "Glob", "Grep"];
+const effectfulTools = ["Read", "Glob", "Grep", "Edit", "Write", "MultiEdit"];
+const fileMutationTools = new Set(["Edit", "Write", "MultiEdit"]);
+
 class ClaudeStreamJsonHarness implements NativeWorkerHarness {
   readonly selection = { provider: "anthropic", nativeHarness: "claude" } as const;
-  readonly supportsEffectful = false;
+  readonly supportsEffectful = true;
   private readonly runtime: ClaudeRuntime;
 
   constructor(runtime: ClaudeRuntime) {
@@ -83,11 +87,11 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
     request: WorkerStartRequest,
     observer: WorkerExecutionObserver,
   ): Promise<NativeWorkerExecution> {
-    if (!request.readOnly) {
-      throw new Error(
-        "Claude effectful assignments are unavailable because Authorized Write Root enforcement is not proven.",
-      );
-    }
+    const allowedTools = request.readOnly ? readOnlyTools : effectfulTools;
+    // Effectful Claude isolation: the process runs inside the managed Execution
+    // Checkout as its cwd with acceptEdits confined to it, every file-mutation
+    // tool call is path-checked against the Authorized Write Root before it can
+    // proceed, and reconciliation later proves the exact path-bounded patch.
     const child = spawn(
       this.runtime.executable,
       [
@@ -104,16 +108,16 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
         "--effort",
         "high",
         "--permission-mode",
-        "manual",
+        request.readOnly ? "manual" : "acceptEdits",
         "--tools",
-        "Read,Glob,Grep",
+        allowedTools.join(","),
         "--allowedTools",
-        "Read,Glob,Grep",
+        allowedTools.join(","),
         "--safe-mode",
         "--no-session-persistence",
       ],
       {
-        cwd: request.targetProjectPath,
+        cwd: request.readOnly ? request.targetProjectPath : request.authorizedWriteRoot,
         env: safeChildEnvironment(),
         shell: false,
         windowsHide: true,
@@ -152,6 +156,7 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
     let terminalObserved = false;
     let terminating = false;
     let initializationObserved = false;
+    let streamedLiveOutput = false;
 
     const fail = (error: Error): void => {
       if (!initializationObserved) initialized.reject(error);
@@ -195,11 +200,23 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
           const block = asRecord(blockValue);
           if (block.type === "text" && typeof block.text === "string") {
             output = `${output}${block.text}`.slice(-64 * 1024);
-          } else if (
-            block.type === "tool_use" &&
-            !["Read", "Glob", "Grep"].includes(String(block.name))
-          ) {
-            fail(new Error(`Claude attempted unavailable tool ${String(block.name)}.`));
+            if (block.text) {
+              streamedLiveOutput = true;
+              observer.output(block.text);
+            }
+          } else if (block.type === "tool_use") {
+            const toolName = String(block.name);
+            if (!allowedTools.includes(toolName)) {
+              fail(new Error(`Claude attempted unavailable tool ${toolName}.`));
+            } else if (!request.readOnly && fileMutationTools.has(toolName)) {
+              const input = asRecord(block.input);
+              const path = String(input.file_path ?? input.notebook_path ?? "");
+              if (path && !isWithinRoot(request.authorizedWriteRoot, path)) {
+                fail(new Error(
+                  `Claude attempted a file mutation outside its Authorized Write Root: ${path}`,
+                ));
+              }
+            }
           }
         }
         return;
@@ -219,7 +236,7 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
         terminalObserved = true;
         if (typeof event.result === "string") output = event.result.slice(-64 * 1024);
         const reported = parseWorkerReportedOutcome(output);
-        if (reported.output) observer.output(reported.output);
+        if (!streamedLiveOutput && reported.output) observer.output(reported.output);
         const interrupted = event.terminal_reason === "aborted_streaming";
         void Promise.resolve(
           observer.completed(
@@ -264,26 +281,25 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
     });
 
     const nativeExecutionId = randomUUID();
-    child.stdin.write(
-      `${JSON.stringify({
-        type: "user",
-        uuid: nativeExecutionId,
-        session_id: "",
-        parent_tool_use_id: null,
-        message: {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: readOnlyPrompt(request),
-            },
-          ],
-        },
-      })}\n`,
-    );
+    const writeUserMessage = (text: string): void => {
+      child.stdin.write(
+        `${JSON.stringify({
+          type: "user",
+          uuid: randomUUID(),
+          session_id: "",
+          parent_tool_use_id: null,
+          message: {
+            role: "user",
+            content: [{ type: "text", text }],
+          },
+        })}\n`,
+      );
+    };
+    if (!request.readOnly) await observer.effectDispatchStarted?.();
+    writeUserMessage(assignmentPrompt(request));
     const init = await withTimeout(initialized.promise, 15_000, "Claude initialization");
     const capabilities = {
-      readOnly: true,
+      readOnly: request.readOnly,
       nativeQuestions: false,
       cancellation: init.cancellation,
       providerSessionResume: false,
@@ -302,9 +318,20 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
         harnessVersion: this.runtime.version,
         protocolSchemaSha256,
         capabilities,
+        ...(!request.readOnly
+          ? { writeIsolation: "claude-write-root-guard" as const }
+          : {}),
       },
       async answer() {
         throw new Error("Claude native questions are unavailable through the direct CLI transport.");
+      },
+      async send(text) {
+        if (terminalObserved) throw new Error("The Claude Worker already ended.");
+        writeUserMessage(
+          `Lead intervention: ${text}\n\n` +
+            "Continue the same assignment, incorporating this guidance. " +
+            "The original bounds and outcome contract still apply.",
+        );
       },
       async interrupt() {
         if (!capabilities.cancellation) throw new Error("Claude cancellation is unavailable.");
@@ -336,16 +363,38 @@ class ClaudeStreamJsonHarness implements NativeWorkerHarness {
   }
 }
 
-function readOnlyPrompt(request: WorkerStartRequest & { readOnly: true }): string {
-  return (
-    `Read-only assignment: ${request.objective}\n\n${request.prompt}\n\n` +
-    (request.priorAnswers?.length
-      ? `Retained Owner answers from the same Worker Session: ${JSON.stringify(request.priorAnswers)}\n\n`
-      : "") +
-    "Use only Read, Glob, and Grep. Do not modify files, configuration, credentials, processes, or external state. " +
+function assignmentPrompt(request: WorkerStartRequest): string {
+  const contract =
     "Report findings and evidence only. End with exactly one line beginning CMD_RIKER_OUTCOME: followed by JSON " +
-    "with status (completed or blocked), summary, affectedArtifacts, verificationResults, and optional unresolvedUncertainty."
+    "with status (completed or blocked), summary, affectedArtifacts, verificationResults, and optional unresolvedUncertainty.";
+  const answers = request.priorAnswers?.length
+    ? `Retained Owner answers from the same Worker Session: ${JSON.stringify(request.priorAnswers)}\n\n`
+    : "";
+  if (request.readOnly) {
+    return (
+      `Read-only assignment: ${request.objective}\n\n${request.prompt}\n\n` +
+      answers +
+      "Use only Read, Glob, and Grep. Do not modify files, configuration, credentials, processes, or external state. " +
+      contract
+    );
+  }
+  return (
+    `Effectful assignment: ${request.objective}\n\n${request.prompt}\n\n` +
+    `Authorized targets: ${JSON.stringify(request.targets)}\n` +
+    `Authorized Write Root: ${request.authorizedWriteRoot}\n` +
+    `Deadline: ${request.timeoutMs}ms. Recovery: ${request.recoveryConstraint}.\n\n` +
+    answers +
+    "Modify only assigned targets inside the Authorized Write Root using Read, Glob, Grep, Edit, Write, and " +
+    "MultiEdit. Do not run commands, access network services, credentials, or anything outside that root. " +
+    contract
   );
+}
+
+function isWithinRoot(root: string, candidate: string): boolean {
+  const resolvedRoot = resolve(root);
+  const resolvedCandidate = resolve(resolvedRoot, candidate);
+  const relativePath = relative(resolvedRoot, resolvedCandidate);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
 }
 
 function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {

@@ -53,6 +53,8 @@ function stubSupervisor(delegations: Array<{ model: string }>): WorkerSupervisor
       throw new Error("Review delegation is not part of this test.");
     },
     async answer() {},
+    async steer() {},
+    workerOutput: () => undefined,
     async cancel() {},
     async recover() {},
   };
@@ -106,8 +108,8 @@ test("a harness model override reaches delegation and a disabled harness stops i
   const delegations: Array<{ model: string }> = [];
   class DelegatingAdapter extends DeterministicTurnAdapter {
     override async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
-      if (request.workerActions?.delegateEffectful) {
-        await request.workerActions.delegateEffectful({
+      if (request.workerActions?.harnesses[0]?.delegateEffectful) {
+        await request.workerActions.harnesses[0]!.delegateEffectful!({
           objective: "Apply the change.",
           prompt: "Do it.",
           targets: ["src/app.ts"],
@@ -136,7 +138,7 @@ test("a harness model override reaches delegation and a disabled harness stops i
   });
   state.appendLeadAgentMessage(disableTurn, "Codex ist deaktiviert.");
   const response = await runtime().completeOwnerTurn("starte nochmal");
-  assert.match(response, /disabled this harness/i);
+  assert.match(response, /No enabled harness/i);
   assert.equal(delegations.length, 1);
   state.close();
 });

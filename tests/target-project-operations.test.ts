@@ -84,7 +84,8 @@ test("a declared typed Target Project operation is dispatched durably and verifi
               operationAttemptId: "conflicting-operation-attempt",
               kind: "target-project-operation",
               expectedEffect: "Conflicting test operation.",
-              authorizedWriteRootKey: checkout,
+              authorizedWriteRootKey:
+                process.platform === "win32" ? checkout.toLowerCase() : checkout,
               authorization: {
                 kind: "lead-agent-command-authority",
                 commitmentId: currentAttempt.commitmentId,

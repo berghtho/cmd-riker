@@ -33,10 +33,15 @@ export class LeadAgentRuntimeDiagnostic extends Error {
   }
 }
 
+export type WorkerSupervisors = Partial<
+  Record<"codex" | "claude" | "copilot", WorkerSupervisor>
+>;
+
 export function createLeadAgentRuntime(input: {
   state: AuthoritativeState;
   adapter: PiTurnAdapter;
   workerSupervisor?: WorkerSupervisor;
+  workerSupervisors?: WorkerSupervisors;
   targetProjectOperations?: TargetProjectOperations;
   forgeOperations?: ForgeOperations;
 }): LeadAgentRuntime {
@@ -61,10 +66,10 @@ export function commitmentNotice(commitment: {
   state: string;
   condition?: { kind: string };
 }): string {
-  const status = commitment.state === "awaiting-acceptance"
-    ? "awaiting Owner Acceptance"
+  const status = commitment.state === "accepted" || commitment.state === "awaiting-acceptance"
+    ? "delivered"
     : commitment.condition?.kind ?? commitment.state;
-  return `Commitment ${commitment.id} ${status}: ${commitment.outcome}`;
+  return `Work item ${status}: ${commitment.outcome}`;
 }
 
 async function completeOwnerTurn(input: {
@@ -72,6 +77,7 @@ async function completeOwnerTurn(input: {
   adapter: PiTurnAdapter;
   ownerInput: string;
   workerSupervisor?: WorkerSupervisor;
+  workerSupervisors?: WorkerSupervisors;
   targetProjectOperations: TargetProjectOperations;
   forgeOperations: ForgeOperations;
   onOwnerTurnRecorded?: (turnId: string) => void;
@@ -86,29 +92,30 @@ async function completeOwnerTurn(input: {
       .readCommitments()
       .map((commitment) => [commitment.id, commitmentFingerprint(commitment)]),
   );
-  // Durable Acting Authority paperwork is resolved here, never composed by the
-  // model or requested from the Owner.
-  const actingAuthorityGrant = (
-    commitmentId: string,
-    effect: { effectClass: "test" | "update"; target: string; externallyBinding: boolean },
-  ) => {
-    const actingAuthority = orchestration.actingAuthorityView();
-    if (
-      actingAuthority?.state !== "active" ||
-      !actingAuthority.commitmentIds.includes(commitmentId)
-    ) {
-      return undefined;
-    }
-    return orchestration.authorizeActingAuthorityEffect({
-      actingAuthorityId: actingAuthority.id,
-      commitmentId,
-      effectClass: effect.effectClass,
-      target: effect.target,
-      reversible: true,
-      externallyBinding: effect.externallyBinding,
-      incrementalSpendUsd: 0,
-    });
-  };
+  // Work Items are durable internal tracking; the model never fills forms for
+  // them. A missing Work Item is minted from the objective at hand.
+  const workItemFor = (
+    workItemId: string | undefined,
+    outcome: string,
+    criterion?:
+      | { kind: "target-project-operation"; operation: "test"; description: string }
+      | {
+          kind: "forge-operation";
+          operation: "github-issue-comment" | "azure-subscription-inspection";
+          description: string;
+        },
+  ): string =>
+    workItemId ??
+    orchestration.recordCommitment(turnId, {
+      outcome,
+      criteria: [
+        criterion ?? {
+          kind: "target-project-operation",
+          operation: "test",
+          description: "The declared Target Project test operation verifies the outcome.",
+        },
+      ],
+    }).id;
   const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
   for (const [index, modelSelection] of candidates.entries()) {
     const validation = await input.adapter.validateSelection(
@@ -123,20 +130,42 @@ async function completeOwnerTurn(input: {
       ...(index > 0 ? { selectionReason: "fallback-after-ineligible-candidate" as const } : {}),
     });
     try {
-      const workerCapabilities = input.workerSupervisor?.capabilities();
       const harnessSettings = conversation.workerHarnessSettings ?? {};
-      const activeHarness = workerCapabilities?.nativeHarness;
-      const activeSetting = activeHarness ? harnessSettings[activeHarness] : undefined;
-      const workerModel = activeHarness
-        ? activeSetting?.model ??
-          (conversation.workerModelPolicy?.selection.nativeHarness === activeHarness
-            ? conversation.workerModelPolicy.selection.model
-            : undefined)
-        : undefined;
-      const workerDisabled = activeSetting?.enabled === false;
-      const workerAvailable = Boolean(input.workerSupervisor && !workerDisabled && workerModel);
       const workerModelPolicyRevision =
         conversation.workerModelPolicy?.revision ?? "worker-harness-settings";
+      const supervisors = new Map<"codex" | "claude" | "copilot", WorkerSupervisor>();
+      const register = (supervisor: WorkerSupervisor | undefined): void => {
+        if (!supervisor) return;
+        const harness = supervisor.capabilities().nativeHarness;
+        if (!supervisors.has(harness)) supervisors.set(harness, supervisor);
+      };
+      register(input.workerSupervisor);
+      for (const supervisor of Object.values(input.workerSupervisors ?? {})) register(supervisor);
+      const modelFor = (harness: "codex" | "claude" | "copilot"): string | undefined =>
+        harnessSettings[harness]?.model ??
+        (conversation.workerModelPolicy?.selection.nativeHarness === harness
+          ? conversation.workerModelPolicy.selection.model
+          : undefined);
+      const availableHarnesses = [...supervisors.entries()].filter(
+        ([harness]) => harnessSettings[harness]?.enabled !== false && modelFor(harness),
+      );
+      const supervisorOfWorker = (workerSessionId: string): WorkerSupervisor => {
+        const worker = orchestration.workerSessionView(workerSessionId);
+        const attempt = worker
+          ? orchestration.workerExecutionAttemptView(worker.currentExecutionAttemptId)
+          : undefined;
+        const supervisor = attempt
+          ? supervisors.get(attempt.modelSelection.nativeHarness)
+          : undefined;
+        if (!supervisor) {
+          throw new Error("This Worker's Native Harness is not available in this session.");
+        }
+        return supervisor;
+      };
+      const workerAvailable = availableHarnesses.length > 0;
+      const firstSupervisor = supervisors.values().next().value as WorkerSupervisor | undefined;
+      const unavailableHarness = firstSupervisor?.capabilities().nativeHarness ??
+        conversation.workerModelPolicy?.selection.nativeHarness;
       const response = await input.adapter.completeTurn({
         conversation: conversation.messages,
         ownerInput: input.ownerInput,
@@ -144,19 +173,10 @@ async function completeOwnerTurn(input: {
         commitments: input.state.readCommitments(),
         nativeTools: { cwd: conversation.targetProject.path },
         standingOrders: orchestration.standingOrdersView(),
-        ...(orchestration.actingAuthorityView()
-          ? { actingAuthority: orchestration.actingAuthorityView()! }
-          : {}),
         authorityActions: {
           recordStandingOrder: (draft) => orchestration.recordStandingOrder(turnId, draft),
           revokeStandingOrder: (standingOrderId, reason) =>
             orchestration.revokeStandingOrder(standingOrderId, turnId, reason),
-          beginActingAuthority: (authorityInput) =>
-            orchestration.beginActingAuthority(turnId, authorityInput),
-          recordActingAuthorityEvent: (actingAuthorityId, eventInput) =>
-            orchestration.recordActingAuthorityEvent(actingAuthorityId, eventInput),
-          prepareActingAuthorityHandoff: (actingAuthorityId) =>
-            orchestration.prepareActingAuthorityHandoff(actingAuthorityId, turnId),
         },
         workers: orchestration.workerSessionsView(),
         workerQuestions: orchestration.workerQuestionsView(),
@@ -164,147 +184,138 @@ async function completeOwnerTurn(input: {
           configure: (configuration) =>
             orchestration.configureWorkerHarness(turnId, configuration),
         },
-        ...(!workerAvailable && (activeHarness || conversation.workerModelPolicy)
+        ...(!workerAvailable && (unavailableHarness || conversation.workerModelPolicy)
           ? {
               workerUnavailability: {
-                nativeHarness: activeHarness ??
+                nativeHarness: unavailableHarness ??
                   conversation.workerModelPolicy!.selection.nativeHarness,
-                detail: workerDisabled
-                  ? "The Owner disabled this harness; enable it again to delegate."
-                  : input.workerSupervisor && !workerModel
-                    ? "No Worker model is configured for the active harness; the Owner can set one conversationally."
-                    : input.state.readCapabilityNotice("codex-worker")?.state === "active"
-                      ? input.state.readCapabilityNotice("codex-worker")!.detail
-                      : "The Worker capability could not be proven at start.",
+                detail: supervisors.size > 0
+                  ? "No enabled harness has a configured Worker model; the Owner can set one conversationally."
+                  : input.state.readCapabilityNotice("codex-worker")?.state === "active"
+                    ? input.state.readCapabilityNotice("codex-worker")!.detail
+                    : "The Worker capability could not be proven at start.",
               },
             }
           : {}),
         ...(workerAvailable
           ? {
               workerActions: {
-                capabilities: {
-                  nativeHarness: workerCapabilities!.nativeHarness,
-                  effectful: workerCapabilities!.effectful,
-                  nativeQuestions: workerCapabilities!.nativeQuestions,
-                  cancellation: workerCapabilities!.cancellation,
-                },
-                delegate: (assignment: {
-                  objective: string;
-                  prompt: string;
-                  commitmentId?: string;
-                  recoveryOfWorkerSessionId?: string;
-                  recoveryReason?: string;
-                }) =>
-                  input.workerSupervisor!.delegate({
-                    ...assignment,
-                    targetProjectPath: conversation.targetProject.path,
-                    model: workerModel!,
-                    modelPolicyRevision: workerModelPolicyRevision,
-                  }),
+                harnesses: availableHarnesses.map(([harness, supervisor]) => {
+                  const capabilities = supervisor.capabilities();
+                  return {
+                    nativeHarness: harness,
+                    effectful: capabilities.effectful,
+                    nativeQuestions: capabilities.nativeQuestions,
+                    cancellation: capabilities.cancellation,
+                    delegate: (assignment: {
+                      objective: string;
+                      prompt: string;
+                      model?: string;
+                      commitmentId?: string;
+                      recoveryOfWorkerSessionId?: string;
+                      recoveryReason?: string;
+                    }) => {
+                      const { model, ...bounded } = assignment;
+                      return supervisor.delegate({
+                        ...bounded,
+                        targetProjectPath: conversation.targetProject.path,
+                        model: model ?? modelFor(harness)!,
+                        modelPolicyRevision: workerModelPolicyRevision,
+                      });
+                    },
+                    ...(capabilities.effectful
+                      ? {
+                          delegateEffectful: (assignment: {
+                            objective: string;
+                            prompt: string;
+                            model?: string;
+                            commitmentId?: string;
+                            targets: string[];
+                            timeoutMinutes?: number;
+                            recoveryOfWorkerSessionId?: string;
+                            recoveryReason?: string;
+                          }) => {
+                            const { model, timeoutMinutes, ...bounded } = assignment;
+                            const commitmentId = workItemFor(
+                              assignment.commitmentId,
+                              assignment.objective,
+                            );
+                            return supervisor.delegateEffectful({
+                              ...bounded,
+                              commitmentId,
+                              targetProjectPath: conversation.targetProject.path,
+                              model: model ?? modelFor(harness)!,
+                              modelPolicyRevision: workerModelPolicyRevision,
+                              timeoutMs: (timeoutMinutes ?? 20) * 60_000,
+                              verification: {
+                                operation: "test" as const,
+                                workingDirectory: conversation.targetProject.path,
+                                timeoutMs: 120_000,
+                              },
+                            });
+                          },
+                        }
+                      : {}),
+                  };
+                }),
                 delegateReview: (assignment: {
                   implementationWorkerSessionId: string;
                   prompt: string;
-                }) =>
-                  input.workerSupervisor!.delegateReview({
-                    ...assignment,
-                    model: workerModel!,
+                  harness?: "codex" | "claude" | "copilot";
+                }) => {
+                  const { harness, ...bounded } = assignment;
+                  const chosen = (harness && supervisors.get(harness)) ??
+                    availableHarnesses[0]?.[1];
+                  if (!chosen) throw new Error("No Worker harness is available for Review.");
+                  const chosenHarness = chosen.capabilities().nativeHarness;
+                  return chosen.delegateReview({
+                    ...bounded,
+                    model: modelFor(chosenHarness) ?? conversation.workerModelPolicy!.selection.model,
                     modelPolicyRevision: workerModelPolicyRevision,
-                  }),
+                  });
+                },
                 adjudicateReview: (adjudication) =>
                   orchestration.adjudicateReview(adjudication.commitmentId, adjudication.decisions),
                 reserveOwnerDecision: (questionId: string, reason: string) => {
                   orchestration.reserveWorkerQuestionForOwner(questionId, reason);
                 },
-                ...(workerCapabilities!.effectful
-                  ? {
-                      delegateEffectful: (assignment: {
-                        objective: string;
-                        prompt: string;
-                        commitmentId?: string;
-                        targets: string[];
-                        recoveryOfWorkerSessionId?: string;
-                        recoveryReason?: string;
-                      }) => {
-                        const commitmentId = assignment.commitmentId ??
-                          orchestration.recordCommitment(turnId, {
-                            outcome: assignment.objective,
-                            criteria: [{
-                              kind: "target-project-operation",
-                              operation: "test",
-                              description:
-                                "The declared Target Project test operation verifies the delegated change.",
-                            }],
-                          }).id;
-                        return input.workerSupervisor!.delegateEffectful({
-                          ...assignment,
-                          commitmentId,
-                          targetProjectPath: conversation.targetProject.path,
-                          model: workerModel!,
-                          modelPolicyRevision: workerModelPolicyRevision,
-                          timeoutMs: 20 * 60_000,
-                          verification: {
-                            operation: "test" as const,
-                            workingDirectory: conversation.targetProject.path,
-                            timeoutMs: 120_000,
-                          },
-                        });
-                      },
-                      answer: (questionId: string, answers: Record<string, string[]>) =>
-                        input.workerSupervisor!.answer(questionId, turnId, answers),
-                    }
-                  : {}),
-                ...(workerCapabilities!.cancellation
-                  ? {
-                      cancel: (workerSessionId: string, reason: string) =>
-                        input.workerSupervisor!.cancel(workerSessionId, turnId, reason),
-                    }
-                  : {}),
+                steer: async (workerSessionId: string, message: string) =>
+                  supervisorOfWorker(workerSessionId).steer(workerSessionId, message),
+                workerOutput: (workerSessionId: string) => {
+                  try {
+                    return supervisorOfWorker(workerSessionId).workerOutput(workerSessionId);
+                  } catch {
+                    return undefined;
+                  }
+                },
+                answer: (questionId: string, answers: Record<string, string[]>) => {
+                  const question = orchestration
+                    .workerQuestionsView()
+                    .find((candidate) => candidate.id === questionId);
+                  if (!question) throw new Error("Unknown Worker question.");
+                  return supervisorOfWorker(question.workerSessionId)
+                    .answer(questionId, turnId, answers);
+                },
+                cancel: (workerSessionId: string, reason: string) =>
+                  supervisorOfWorker(workerSessionId).cancel(workerSessionId, turnId, reason),
               },
             }
           : {}),
         commitmentActions: {
-          record: (draft) => orchestration.recordCommitment(turnId, draft),
-          recordOwnerAttention: (commitmentId, attentionInput) => {
-            orchestration.recordCommitmentOwnerAttention(commitmentId, attentionInput);
-          },
-          accept: (commitmentId) => orchestration.acceptCommitment(commitmentId, turnId),
-          resume: (commitmentId) => orchestration.resumeCommitment(commitmentId, turnId),
-          control: (commitmentId, action, reason, replacementCommitmentId) => {
-            if (action === "pause") orchestration.pauseCommitment(commitmentId, turnId, reason);
-            else if (action === "cancel") orchestration.cancelCommitment(commitmentId, turnId, reason);
-            else {
-              if (!replacementCommitmentId) {
-                throw new Error("Supersession requires a replacement Commitment.");
-              }
-              orchestration.supersedeCommitment(
-                commitmentId,
-                turnId,
-                reason,
-                replacementCommitmentId,
-              );
-            }
-          },
-          executeOperation: async (commitmentId, operation) => {
-            const authorization = actingAuthorityGrant(commitmentId, {
-              effectClass: "test",
-              target: operation,
-              externallyBinding: false,
-            });
+          resume: (workItemId) => orchestration.resumeCommitment(workItemId, turnId),
+          cancel: (workItemId, reason) =>
+            orchestration.cancelCommitment(workItemId, turnId, reason),
+          executeOperation: async (workItemId, operation) => {
+            const commitmentId = workItemFor(
+              workItemId,
+              "The declared Target Project test operation passes.",
+            );
             const result = await input.targetProjectOperations.execute({
               commitmentId,
               operation: { kind: operation, inputs: {} },
               checkout: conversation.targetProject.path,
               workingDirectory: conversation.targetProject.path,
               timeoutMs: 120_000,
-              ...(authorization
-                ? {
-                    actingAuthorityEffectAuthorization: {
-                      actingAuthorityId: authorization.actingAuthorityId,
-                      authorizationId: authorization.id,
-                      standingOrderId: authorization.standingOrderId,
-                    },
-                  }
-                : {}),
             });
             orchestration.observeTargetProjectOperationResult(commitmentId, result);
             return result;
@@ -315,13 +326,17 @@ async function completeOwnerTurn(input: {
             ? {
                 commentOnGitHubIssue: async (operationInput) => {
                   const authority = conversation.forgeAuthorities!.github!;
-                  const authorization = actingAuthorityGrant(operationInput.commitmentId, {
-                    effectClass: "update",
-                    target: `${authority.repository}#${operationInput.issueNumber}`,
-                    externallyBinding: true,
-                  });
+                  const commitmentId = workItemFor(
+                    operationInput.commitmentId,
+                    `A bounded comment is published on ${authority.repository}#${operationInput.issueNumber}.`,
+                    {
+                      kind: "forge-operation",
+                      operation: "github-issue-comment",
+                      description: "The typed GitHub adapter proves the exact published comment.",
+                    },
+                  );
                   const result = await input.forgeOperations.execute({
-                    commitmentId: operationInput.commitmentId,
+                    commitmentId,
                     operation: {
                       kind: "github-issue-comment",
                       repository: authority.repository,
@@ -330,25 +345,25 @@ async function completeOwnerTurn(input: {
                       expectedAccount: authority.account,
                     },
                     timeoutMs: 30_000,
-                    ...(authorization
-                      ? {
-                          actingAuthorityEffectAuthorization: {
-                            actingAuthorityId: authorization.actingAuthorityId,
-                            authorizationId: authorization.id,
-                            standingOrderId: authorization.standingOrderId,
-                          },
-                        }
-                      : {}),
                   });
-                  orchestration.observeForgeOperationResult(operationInput.commitmentId, result);
+                  orchestration.observeForgeOperationResult(commitmentId, result);
                   return result;
                 },
               }
             : {}),
           ...(conversation.forgeAuthorities?.azure
             ? {
-                inspectAzureSubscription: async (commitmentId) => {
+                inspectAzureSubscription: async (workItemId) => {
                   const authority = conversation.forgeAuthorities!.azure!;
+                  const commitmentId = workItemFor(
+                    workItemId,
+                    "The Azure subscription inspection completes.",
+                    {
+                      kind: "forge-operation",
+                      operation: "azure-subscription-inspection",
+                      description: "The typed Azure adapter proves the read-only inspection.",
+                    },
+                  );
                   const result = await input.forgeOperations.execute({
                     commitmentId,
                     operation: {
@@ -428,17 +443,6 @@ async function completeOwnerTurn(input: {
         ? `${durableResponse}\n\n${notices.join("\n")}`
         : durableResponse;
       orchestration.settleLeadTurnAttempt(attempt.id, "completed");
-      const pendingHandoff = orchestration.actingAuthorityView();
-      if (
-        pendingHandoff?.state === "handoff-pending" &&
-        pendingHandoff.handoff?.preparedForOwnerTurnId === turnId
-      ) {
-        orchestration.observeActingAuthorityHandoffDelivered(
-          pendingHandoff.id,
-          turnId,
-          durableResponse,
-        );
-      }
       return content;
     } catch (error) {
       if (!(error instanceof PiTurnFailure)) throw error;

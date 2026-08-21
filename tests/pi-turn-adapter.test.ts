@@ -146,13 +146,19 @@ test("production adapter advertises the bounded Codex Worker controls", async (t
     ownerInput: "Delegate a read-only architecture inspection.",
     modelSelection: modelSelection(localModel.baseUrl),
     workerActions: {
-      async delegate(input) {
-        delegated = input;
-        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
-      },
-      async delegateEffectful() {
-        return { workerSessionId: "worker-effectful-1", executionAttemptId: "attempt-effectful-1" };
-      },
+      harnesses: [{
+        nativeHarness: "codex",
+        effectful: true,
+        nativeQuestions: true,
+        cancellation: true,
+        async delegate(input) {
+          delegated = input;
+          return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+        },
+        async delegateEffectful() {
+          return { workerSessionId: "worker-effectful-1", executionAttemptId: "attempt-effectful-1" };
+        },
+      }],
       async answer() {},
       reserveOwnerDecision() {},
       async cancel() {},
@@ -195,15 +201,15 @@ test("production adapter exposes only proven Copilot Worker controls", async (t)
     ownerInput: "Delegate a read-only architecture inspection.",
     modelSelection: modelSelection(localModel.baseUrl),
     workerActions: {
-      capabilities: {
+      harnesses: [{
         nativeHarness: "copilot",
         effectful: false,
         nativeQuestions: false,
         cancellation: false,
-      },
-      async delegate() {
-        return { workerSessionId: "worker-copilot-1", executionAttemptId: "attempt-copilot-1" };
-      },
+        async delegate() {
+          return { workerSessionId: "worker-copilot-1", executionAttemptId: "attempt-copilot-1" };
+        },
+      }],
     },
   });
 
@@ -255,20 +261,17 @@ test("production adapter exposes explicit authority controls and independent Rev
         };
       },
       revokeStandingOrder() {},
-      beginActingAuthority() {
-        throw new Error("Not called.");
-      },
-      recordActingAuthorityEvent() {
-        throw new Error("Not called.");
-      },
-      prepareActingAuthorityHandoff() {
-        throw new Error("Not called.");
-      },
     },
     workerActions: {
-      async delegate() {
-        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
-      },
+      harnesses: [{
+        nativeHarness: "codex",
+        effectful: false,
+        nativeQuestions: false,
+        cancellation: false,
+        async delegate() {
+          return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+        },
+      }],
       async delegateReview() {
         return { workerSessionId: "reviewer-1", executionAttemptId: "review-attempt-1" };
       },
@@ -277,9 +280,7 @@ test("production adapter exposes explicit authority controls and independent Rev
 
   assert.equal(recordedTitle, "Integrate while absent");
   assert.match(firstRequest, /record_standing_order/);
-  assert.match(firstRequest, /begin_acting_authority/);
-  assert.match(firstRequest, /record_acting_authority_event/);
-  assert.match(firstRequest, /prepare_acting_authority_handoff/);
+  assert.doesNotMatch(firstRequest, /acting_authority/);
   assert.match(firstRequest, /delegate_independent_review/);
   assert.equal(result.content, "The bounded Standing Order is recorded.");
 });
@@ -310,13 +311,19 @@ test("production adapter delegates effectful work only through the bounded assig
     ownerInput: "Implement the accepted Target Project change.",
     modelSelection: modelSelection(localModel.baseUrl),
     workerActions: {
-      async delegate() {
-        return { workerSessionId: "worker-read-only", executionAttemptId: "attempt-read-only" };
-      },
-      async delegateEffectful(input) {
-        delegated = input;
-        return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
-      },
+      harnesses: [{
+        nativeHarness: "codex",
+        effectful: true,
+        nativeQuestions: true,
+        cancellation: true,
+        async delegate() {
+          return { workerSessionId: "worker-read-only", executionAttemptId: "attempt-read-only" };
+        },
+        async delegateEffectful(input) {
+          delegated = input;
+          return { workerSessionId: "worker-1", executionAttemptId: "attempt-1" };
+        },
+      }],
       async answer() {},
       async cancel() {},
     },
@@ -345,15 +352,6 @@ test("production adapter exposes typed Forge operations without provider command
             commitmentId: "commitment-1",
             issueNumber: 36,
             body: "Typed Forge proof.",
-            actingAuthorityEffect: {
-              actingAuthorityId: "acting-1",
-              commitmentId: "commitment-1",
-              effectClass: "update",
-              target: "berghtho/cmd-riker#36",
-              reversible: true,
-              externallyBinding: true,
-              incrementalSpendUsd: 0,
-            },
           },
         },
       };
@@ -372,7 +370,7 @@ test("production adapter exposes typed Forge operations without provider command
         return {
           operationAttemptId: "forge-attempt-1",
           effectIntentId: "forge-effect-1",
-          commitmentId: input.commitmentId,
+          commitmentId: input.commitmentId ?? "commitment-1",
           operation: "github-issue-comment",
           provider: "github",
           status: "succeeded",

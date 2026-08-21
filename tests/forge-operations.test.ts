@@ -105,38 +105,6 @@ test("Forge authority is checked against durable Owner configuration before prov
   assert.equal(inspected, false);
 });
 
-test("public GitHub mutation stops without an exact Standing Order grant", async (t) => {
-  const { state, commitment, githubAuthorization } = await configuredState(t, "public-authority");
-  let dispatched = false;
-  const github: GitHubCli = {
-    inspect: async () => githubCapability(),
-    createIssueComment: async () => {
-      dispatched = true;
-      return { id: "comment-42", url: "https://github.test/comment-42" };
-    },
-    readIssueComment: async () => assert.fail("read-back must not run"),
-  };
-  await assert.rejects(
-    createForgeOperations(state, { github }).execute({
-      commitmentId: commitment.id,
-      operation: {
-        kind: "github-issue-comment",
-        repository: "berghtho/cmd-riker",
-        issueNumber: 36,
-        body: "Not authorized by this grant.",
-        expectedAccount: "berghtho",
-      },
-      timeoutMs: 1_000,
-      actingAuthorityEffectAuthorization: {
-        ...githubAuthorization!,
-        authorizationId: "forged-authorization",
-      },
-    }),
-    /does not match its durable Acting Authority authorization/,
-  );
-  assert.equal(dispatched, false);
-});
-
 test("deadline expiry before GitHub dispatch is a known no-effect timeout", async (t) => {
   const { state, commitment, githubAuthorization } = await configuredState(t, "pre-dispatch-timeout");
   let dispatched = false;
@@ -520,47 +488,7 @@ async function configuredState(
       operation,
     }],
   });
-  if (operation === "azure-subscription-inspection") return { state, commitment };
-  const validUntil = new Date(Date.now() + 60_000).toISOString();
-  const standingOrderInstruction =
-    `Begin Acting Authority. Standing Order: update on berghtho/cmd-riker#36; ` +
-    `externally binding reversible effects; cost 0 USD until ${validUntil}.`;
-  const standingOrderTurnId = state.appendOwnerMessage(standingOrderInstruction);
-  const standingOrder = orchestration.recordStandingOrder(standingOrderTurnId, {
-    title: "Issue 36 public comments",
-    instruction: standingOrderInstruction,
-    commitmentIds: [commitment.id],
-    effectClasses: ["update"],
-    targets: ["berghtho/cmd-riker#36"],
-    allowIrreversibleEffects: false,
-    allowExternallyBindingEffects: true,
-    maximumIncrementalSpendUsd: 0,
-    validUntil,
-    ownerInstructionQuote: standingOrderInstruction,
-  });
-  const acting = orchestration.beginActingAuthority(standingOrderTurnId, {
-    commitmentIds: [commitment.id],
-    standingOrderIds: [standingOrder.id],
-    ownerInstructionQuote: standingOrderInstruction,
-  });
-  const authorization = orchestration.authorizeActingAuthorityEffect({
-    actingAuthorityId: acting.id,
-    commitmentId: commitment.id,
-    effectClass: "update",
-    target: "berghtho/cmd-riker#36",
-    reversible: true,
-    externallyBinding: true,
-    incrementalSpendUsd: 0,
-  });
-  return {
-    state,
-    commitment,
-    githubAuthorization: {
-      actingAuthorityId: authorization.actingAuthorityId,
-      authorizationId: authorization.id,
-      standingOrderId: authorization.standingOrderId,
-    },
-  };
+  return { state, commitment };
 }
 
 function githubCapability(): ForgeCapabilityProof {

@@ -129,6 +129,26 @@ class CodexAppServerHarness implements CodexWorkerHarness {
     let terminalObserved = false;
     let terminating = false;
     let isolationFailure: string | undefined;
+    let steeringResume: string | undefined;
+    let streamedLiveOutput = false;
+    const startTurn = async (text: string): Promise<string> => {
+      const turnResult = asRecord(
+        await transport.request("turn/start", {
+          threadId: providerSessionId,
+          input: [{ type: "text", text }],
+          cwd: request.targetProjectPath,
+          model: request.model,
+          effort: "high",
+          approvalPolicy: "never",
+          sandboxPolicy: request.readOnly
+            ? { type: "readOnly", networkAccess: false }
+            : workspaceWritePolicy(),
+        }),
+      );
+      const turn = asRecord(turnResult.turn);
+      if (typeof turn.id !== "string" || !turn.id) throw new Error("Codex returned no turn id.");
+      return turn.id;
+    };
     const answerDeliveries = new Map<
       string,
       { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }
@@ -169,7 +189,12 @@ class CodexAppServerHarness implements CodexWorkerHarness {
             : undefined;
       if (messageTurnId !== nativeExecutionId) return;
       if (message.method === "item/agentMessage/delta") {
-        outputText = `${outputText}${String(params.delta ?? "")}`.slice(-64 * 1024);
+        const delta = String(params.delta ?? "");
+        outputText = `${outputText}${delta}`.slice(-64 * 1024);
+        if (delta) {
+          streamedLiveOutput = true;
+          observer.output(delta);
+        }
         return;
       }
       if (message.method === "item/completed") {
@@ -198,11 +223,25 @@ class CodexAppServerHarness implements CodexWorkerHarness {
       }
       if (message.method === "turn/completed" && !terminalObserved) {
         const status = asRecord(params.turn).status;
+        if (status === "interrupted" && steeringResume) {
+          // A Lead steering intervention interrupted the turn; resume the same
+          // thread with the guidance instead of settling the Worker.
+          const text = steeringResume;
+          steeringResume = undefined;
+          void startTurn(text)
+            .then((turnId) => {
+              nativeExecutionId = turnId;
+            })
+            .catch((error: unknown) => {
+              if (!terminating) void observer.failed(asError(error));
+            });
+          return;
+        }
         if (status === "completed" || status === "failed" || status === "interrupted") {
           terminalObserved = true;
           setTimeout(() => {
             const reported = parseWorkerReportedOutcome(outputText);
-            if (reported.output) observer.output(reported.output);
+            if (!streamedLiveOutput && reported.output) observer.output(reported.output);
             void Promise.resolve(
               observer.completed(
                 status,
@@ -266,42 +305,24 @@ class CodexAppServerHarness implements CodexWorkerHarness {
         if (isolationFailure) throw new Error(isolationFailure);
         await observer.effectDispatchStarted?.();
       }
-      const turnResult = asRecord(
-        await transport.request("turn/start", {
-          threadId: providerSessionId,
-          input: [
-            {
-              type: "text",
-              text:
-                (request.readOnly
-                  ? `Read-only assignment: ${request.objective}\n\n${request.prompt}\n\n`
-                  : `Effectful assignment: ${request.objective}\n\n${request.prompt}\n\n` +
-                    `Authorized targets: ${JSON.stringify(request.targets)}\n` +
-                    `Authorized Write Root: ${request.authorizedWriteRoot}\n` +
-                    `Deadline: ${request.timeoutMs}ms. Recovery: ${request.recoveryConstraint}.\n\n`) +
-                (request.priorAnswers?.length
-                  ? `Retained Owner answers from the same Worker Session: ${JSON.stringify(request.priorAnswers)}\n\n`
-                  : "") +
-                (request.readOnly
-                  ? "Do not modify files, configuration, credentials, processes, or external state. "
-                  : "Modify only assigned targets inside the Authorized Write Root. Do not access network services, credentials, global configuration, or external state. ") +
-                "Report findings and evidence only. End with exactly one line beginning " +
-                "CMD_RIKER_OUTCOME: followed by JSON with status (completed or blocked), summary, " +
-                "affectedArtifacts, verificationResults, and optional unresolvedUncertainty.",
-            },
-          ],
-          cwd: request.targetProjectPath,
-          model: request.model,
-          effort: "high",
-          approvalPolicy: "never",
-          sandboxPolicy: request.readOnly
-            ? { type: "readOnly", networkAccess: false }
-            : workspaceWritePolicy(),
-        }),
+      const turnId = await startTurn(
+        (request.readOnly
+          ? `Read-only assignment: ${request.objective}\n\n${request.prompt}\n\n`
+          : `Effectful assignment: ${request.objective}\n\n${request.prompt}\n\n` +
+            `Authorized targets: ${JSON.stringify(request.targets)}\n` +
+            `Authorized Write Root: ${request.authorizedWriteRoot}\n` +
+            `Deadline: ${request.timeoutMs}ms. Recovery: ${request.recoveryConstraint}.\n\n`) +
+          (request.priorAnswers?.length
+            ? `Retained Owner answers from the same Worker Session: ${JSON.stringify(request.priorAnswers)}\n\n`
+            : "") +
+          (request.readOnly
+            ? "Do not modify files, configuration, credentials, processes, or external state. "
+            : "Modify only assigned targets inside the Authorized Write Root. Do not access network services, credentials, global configuration, or external state. ") +
+          "Report findings and evidence only. End with exactly one line beginning " +
+          "CMD_RIKER_OUTCOME: followed by JSON with status (completed or blocked), summary, " +
+          "affectedArtifacts, verificationResults, and optional unresolvedUncertainty.",
       );
-      const turn = asRecord(turnResult.turn);
-      if (typeof turn.id !== "string" || !turn.id) throw new Error("Codex returned no turn id.");
-      nativeExecutionId = turn.id;
+      nativeExecutionId = turnId;
       for (const message of queuedMessages.splice(0)) route(message);
     } catch (error) {
       terminating = true;
@@ -360,6 +381,23 @@ class CodexAppServerHarness implements CodexWorkerHarness {
           throw error;
         }
         await delivery.promise;
+      },
+      async send(text) {
+        if (terminalObserved) throw new Error("The Codex Worker turn already ended.");
+        steeringResume =
+          `Lead intervention: ${text}\n\n` +
+          "Continue the same assignment from where you stopped, incorporating this guidance. " +
+          "The original bounds, targets, and outcome contract still apply.";
+        try {
+          await transport.request(
+            "turn/interrupt",
+            { threadId: providerSessionId, turnId: nativeExecutionId },
+            10_000,
+          );
+        } catch (error) {
+          steeringResume = undefined;
+          throw asError(error);
+        }
       },
       async interrupt() {
         await transport.request(

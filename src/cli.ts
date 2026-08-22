@@ -20,6 +20,8 @@ import {
 } from "./conversation-runtime/index.ts";
 import {
   assertSupportedModelSelection,
+  leadThinkingLevels,
+  type LeadThinkingLevel,
   type ModelSelection,
 } from "./model-selection.ts";
 import {
@@ -779,7 +781,10 @@ function parseModelRequirements(value: unknown): LeadModelRequirements {
 }
 
 function parseModelSelection(value: unknown): ModelSelection {
-  if (!isRecordWithKeys(value, ["provider", "model", "api"])) {
+  if (
+    !isRecordWithKeys(value, ["provider", "model", "api"]) &&
+    !isRecordWithKeys(value, ["provider", "model", "api", "thinkingLevel"])
+  ) {
     if (!isRecordWithKeys(value, ["provider", "model", "api", "baseUrl"])) {
       throw invalidConfiguration();
     }
@@ -814,10 +819,20 @@ function parseModelSelection(value: unknown): ModelSelection {
   ) {
     throw invalidConfiguration();
   }
+  const thinkingLevel = value.thinkingLevel;
+  if (
+    thinkingLevel !== undefined &&
+    !leadThinkingLevels.includes(thinkingLevel as LeadThinkingLevel)
+  ) {
+    throw invalidConfiguration();
+  }
   return {
     provider: value.provider,
     model: value.model,
     api: value.api,
+    ...(thinkingLevel !== undefined
+      ? { thinkingLevel: thinkingLevel as LeadThinkingLevel }
+      : {}),
   };
 }
 

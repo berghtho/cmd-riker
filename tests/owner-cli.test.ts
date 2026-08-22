@@ -368,6 +368,44 @@ test("Owner CLI accepts an existing Pi OpenAI Codex login configuration", async 
   state.close();
 });
 
+test("Owner CLI records an explicit Lead thinking level and rejects unknown levels", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-thinking-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const configurationWith = (thinkingLevel: string): string =>
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        api: "openai-codex-responses",
+        thinkingLevel,
+      },
+      modelPolicyRevision: "owner-policy-1",
+    });
+  await writeFile(join(stateDirectory, "config.json"), configurationWith("high"));
+
+  const accepted = await runCli(stateDirectory, "");
+
+  assert.equal(accepted.code, 0, accepted.stderr);
+  const state = openAuthoritativeState(stateDirectory);
+  assert.deepEqual(state.readOwnerConversation()?.modelSelection, {
+    provider: "openai-codex",
+    model: "gpt-5.6-sol",
+    api: "openai-codex-responses",
+    thinkingLevel: "high",
+  });
+  state.close();
+
+  const invalidDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-thinking-invalid-test-"));
+  t.after(() => rm(invalidDirectory, { recursive: true, force: true }));
+  await writeFile(join(invalidDirectory, "config.json"), configurationWith("boundless"));
+
+  const rejected = await runCli(invalidDirectory, "");
+
+  assert.equal(rejected.code, 2);
+  assert.match(rejected.stderr, /CMD_RIKER_CONFIG_INVALID/);
+});
+
 test("Owner CLI accepts Claude and Copilot Worker Model Policies", async (t) => {
   const selections = [
     { provider: "anthropic", model: "claude-sonnet-5", nativeHarness: "claude" },

@@ -435,10 +435,11 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
         model: execution.model,
         messages: request.conversation.map(toPiMessage),
         tools,
-        // The Lead carries Command Authority; give reasoning models full thinking
-        // budget. Loopback completions models advertise no reasoning support.
+        // The Lead carries Command Authority; without an Owner-chosen level,
+        // reasoning models get the full thinking budget. Loopback completions
+        // models advertise no reasoning support.
         ...(request.modelSelection.api === "openai-codex-responses"
-          ? { thinkingLevel: "xhigh" as const }
+          ? { thinkingLevel: request.modelSelection.thinkingLevel ?? ("xhigh" as const) }
           : {}),
       };
       const agent = new Agent(

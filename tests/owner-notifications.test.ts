@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,9 +8,9 @@ import test from "node:test";
 import {
   createWindowsToastNotifier,
   ownerToastAppUserModelId,
-  ownerToastShortcutName,
+  ownerToastDisplayName,
+  ownerToastRegistryKey,
   ownerToastShortcutPath,
-  removeOwnerToastRegistration,
 } from "../src/owner-notifications/index.ts";
 
 type RecordedCommand = { executable: string; args: readonly string[] };
@@ -18,7 +19,6 @@ function recordingNotifier(appDataDirectory: string) {
   const commands: RecordedCommand[] = [];
   const notifier = createWindowsToastNotifier({
     snoretoastPath: "C:\\bundle\\tools\\snoretoast\\snoretoast-x64.exe",
-    shortcutTarget: "C:\\install\\launcher\\riker.cmd",
     appDataDirectory,
     runCommand: async (executable, args) => {
       commands.push({ executable, args });
@@ -33,7 +33,7 @@ async function appDataFixture(t: test.TestContext): Promise<string> {
   return appData;
 }
 
-test("registration installs the Start Menu shortcut carrying the toast identity", async (t) => {
+test("registration writes the per-user registry identity, never a Start Menu shortcut", async (t) => {
   const appData = await appDataFixture(t);
   const { notifier, commands } = recordingNotifier(appData);
 
@@ -41,30 +41,38 @@ test("registration installs the Start Menu shortcut carrying the toast identity"
 
   assert.deepEqual(commands, [
     {
-      executable: "C:\\bundle\\tools\\snoretoast\\snoretoast-x64.exe",
+      executable: "reg.exe",
       args: [
-        "-install",
-        ownerToastShortcutName,
-        "C:\\install\\launcher\\riker.cmd",
-        ownerToastAppUserModelId,
+        "add",
+        ownerToastRegistryKey,
+        "/v",
+        "DisplayName",
+        "/t",
+        "REG_SZ",
+        "/d",
+        ownerToastDisplayName,
+        "/f",
       ],
     },
   ]);
+  const shortcut = ownerToastShortcutPath(appData);
+  assert(shortcut !== undefined);
+  assert.equal(existsSync(shortcut), false);
 });
 
-test("registration is skipped once the shortcut exists", async (t) => {
+test("registration removes the legacy Start Menu shortcut", async (t) => {
   const appData = await appDataFixture(t);
   const shortcut = ownerToastShortcutPath(appData);
   assert(shortcut !== undefined);
   await mkdir(join(appData, "Microsoft", "Windows", "Start Menu", "Programs"), {
     recursive: true,
   });
-  await writeFile(shortcut, "existing shortcut");
-  const { notifier, commands } = recordingNotifier(appData);
+  await writeFile(shortcut, "legacy shortcut");
+  const { notifier } = recordingNotifier(appData);
 
   await notifier.ensureRegistered();
 
-  assert.deepEqual(commands, []);
+  assert.equal(existsSync(shortcut), false);
 });
 
 test("a notice becomes one branded toast under the registered identity", async (t) => {
@@ -107,28 +115,10 @@ test("a failing toast command never reaches the caller", async (t) => {
   const appData = await appDataFixture(t);
   const notifier = createWindowsToastNotifier({
     snoretoastPath: "C:\\bundle\\tools\\snoretoast\\snoretoast-x64.exe",
-    shortcutTarget: "C:\\install\\launcher\\riker.cmd",
     appDataDirectory: appData,
     runCommand: () => Promise.reject(new Error("spawn failed")),
   });
 
   notifier.notify({ title: "CMD Riker", message: "notice" });
   await new Promise((resolvePromise) => setImmediate(resolvePromise));
-});
-
-test("removing the registration deletes the shortcut and tolerates its absence", async (t) => {
-  const appData = await appDataFixture(t);
-  const shortcut = ownerToastShortcutPath(appData);
-  assert(shortcut !== undefined);
-  await mkdir(join(appData, "Microsoft", "Windows", "Start Menu", "Programs"), {
-    recursive: true,
-  });
-  await writeFile(shortcut, "existing shortcut");
-
-  await removeOwnerToastRegistration(appData);
-  await removeOwnerToastRegistration(appData);
-
-  const { notifier, commands } = recordingNotifier(appData);
-  await notifier.ensureRegistered();
-  assert.equal(commands.length, 1);
 });

@@ -234,6 +234,15 @@ test("rollback restores the previous pair and state with a fresh generation", as
   assert.equal((await context.installation.inspect()).previous?.code.revision, "rev-2");
 });
 
+test("nextRevision counts a numeric tail and seeds one when missing", async () => {
+  const { nextRevision } = await import("../src/local-installation/index.ts");
+  assert.equal(nextRevision("local.25"), "local.26");
+  assert.equal(nextRevision("riker-0.1.0-local.9"), "riker-0.1.0-local.10");
+  assert.equal(nextRevision("release-99"), "release-100");
+  assert.equal(nextRevision("nightly"), "nightly.2");
+  assert.equal(nextRevision("nightly.2"), "nightly.3");
+});
+
 test("rollback without a previous version is refused", async (t) => {
   const context = await installed(t);
   await assert.rejects(context.installation.rollback(), /No previous version/);

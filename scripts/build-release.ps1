@@ -1,6 +1,7 @@
 param([Parameter(Mandatory = $true)][string]$Revision)
 $ErrorActionPreference = "Stop"
-Set-Location C:\repos\cmd-riker
+$repository = Resolve-Path (Join-Path $PSScriptRoot "..")
+Set-Location $repository
 npm run build
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $commit = (git rev-parse HEAD).Trim()
@@ -10,7 +11,7 @@ npm run build:local-release -- `
   --lead-dist dist/lead-agent `
   --lead-node-modules node_modules `
   --tools vendor `
-  --source-path C:\repos\cmd-riker `
+  --source-path "$repository" `
   --source-commit $commit `
   --output "release/$Revision"
 exit $LASTEXITCODE

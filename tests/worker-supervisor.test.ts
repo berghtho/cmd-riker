@@ -554,6 +554,77 @@ test("effectful Worker continuity loss becomes unknown and is never replayed", a
   state.close();
 });
 
+test("restart recovery over a settled-unknown effectful Worker neither throws nor replays", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-effectful-worker-boot-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  let state = openAuthoritativeState(stateDirectory);
+  state.initialize(ownerConfiguration());
+  const orchestration = createOrchestrationCore(state);
+  const turnId = state.appendOwnerMessage("Implement the bounded change.");
+  const commitment = orchestration.recordCommitment(turnId, {
+    outcome: "The bounded change passes tests.",
+    criteria: [
+      {
+        kind: "target-project-operation",
+        description: "Tests pass.",
+        operation: "test",
+      },
+    ],
+  });
+  const harness = new FakeCodexHarness();
+  const supervisor = createWorkerSupervisor(
+    state,
+    harness,
+    {
+      async execute() {
+        assert.fail("An uncertain Worker effect must not launch Verification.");
+      },
+    },
+    effectfulCheckoutInspector("C:\\target-project"),
+  );
+  const started = await supervisor.delegateEffectful({
+    objective: "Implement the bounded change.",
+    prompt: "Change src/index.ts.",
+    targetProjectPath: "C:\\target-project",
+    model: "gpt-5.6-sol",
+    modelPolicyRevision: "worker-policy-1",
+    commitmentId: commitment.id,
+    targets: ["src/index.ts"],
+    timeoutMs: 120_000,
+    verification: {
+      operation: "test",
+      workingDirectory: "C:\\target-project",
+      timeoutMs: 30_000,
+    },
+  });
+  await waitFor(
+    () => state.readWorkerExecutionAttempt(started.executionAttemptId)?.status === "running",
+  );
+  await harness.starts[0]!.execution.emitFailure(new Error("app-server connection lost"));
+  const effectIntentId = state.readWorkerExecutionAttempt(started.executionAttemptId)!.effectIntentId!;
+  assert.equal(state.readEffectIntent(effectIntentId)?.status, "unknown");
+  state.close();
+
+  state = openAuthoritativeState(stateDirectory);
+  const restartedSupervisor = createWorkerSupervisor(
+    state,
+    harness,
+    {
+      async execute() {
+        assert.fail("A settled-unknown Worker effect must not launch Verification.");
+      },
+    },
+    effectfulCheckoutInspector("C:\\target-project"),
+  );
+
+  await restartedSupervisor.recover();
+
+  assert.equal(harness.starts.length, 1);
+  assert.equal(state.readEffectIntent(effectIntentId)?.status, "unknown");
+  assert.equal(state.readWorkerSession(started.workerSessionId)?.state, "reconciling");
+  state.close();
+});
+
 test("passing narration cannot accept an effectful assignment with no observed checkout change", async (t) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-effectful-worker-noop-test-"));
   t.after(() => rm(stateDirectory, { recursive: true, force: true }));

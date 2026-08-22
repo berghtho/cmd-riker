@@ -2588,6 +2588,15 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       }
       if (!worker.assignment.readOnly) {
         if (!processGone) return { kind: "blocked" };
+        const openEffect = previousAttempt.effectIntentId
+          ? state.readEffectIntent(previousAttempt.effectIntentId)
+          : undefined;
+        // An effect settled before this recovery already carries its durable
+        // terminal fact; observing a second terminal would demand an open
+        // effect that no longer exists.
+        if (openEffect && openEffect.status !== "pending" && openEffect.status !== "dispatching") {
+          return { kind: openEffect.status === "unknown" ? "blocked" : "settled" };
+        }
         this.observeWorkerTerminal({
           workerSessionId: worker.id,
           executionAttemptId: previousAttempt.id,

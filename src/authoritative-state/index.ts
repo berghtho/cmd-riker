@@ -980,7 +980,7 @@ export function openAuthoritativeState(
       effectIntent,
       ...(predecessors ? { predecessors } : {}),
       ...(rejectConflict ? { beforeWrite: () => {
-        if (attempt.target.kind !== "github-issue") {
+        if (attempt.target.kind === "azure-subscription") {
           throw new Error("Only a typed GitHub target can dispatch a Forge mutation.");
         }
         assertNoConflictingOpenEffect(

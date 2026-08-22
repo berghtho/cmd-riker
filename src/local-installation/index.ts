@@ -420,6 +420,13 @@ export function createLocalInstallation(options: LocalInstallationOptions): Loca
   };
 }
 
+// "local.25" -> "local.26"; a revision without a numeric tail gets a numeric
+// tail appended so the next call counts on from there.
+export function nextRevision(current: string): string {
+  const match = /^(.*?)(\d+)$/.exec(current);
+  return match ? `${match[1]}${Number(match[2]) + 1}` : `${current}.2`;
+}
+
 export async function connectWithRetry(
   address: string,
   timeoutMs: number,

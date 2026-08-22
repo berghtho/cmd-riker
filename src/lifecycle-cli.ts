@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -9,6 +10,7 @@ import { openAuthoritativeState } from "./authoritative-state/index.ts";
 import {
   createLocalInstallation,
   localInstallationPaths,
+  nextRevision,
   readGeneration,
   readLifecycle,
   type LocalInstallation,
@@ -34,9 +36,16 @@ try {
   else if (command === "inspect") {
     process.stdout.write(`${JSON.stringify(await installation.inspect(), null, 2)}\n`);
   } else if (command === "upgrade") {
+    const supplied = argumentValue("--lead-bundle");
+    const built = supplied === undefined
+      ? await buildFromSourceRepository(installation)
+      : undefined;
+    const leadAgentCandidateDirectory = supplied ?? built!.bundleDirectory;
+    const stateRevision = argumentValue("--state-revision") ??
+      (built ? `before-${built.revision}` : `before-upgrade-${Date.now()}`);
     const result = await installation.upgrade({
-      leadAgentCandidateDirectory: requiredArgument("--lead-bundle"),
-      stateRevision: requiredArgument("--state-revision"),
+      leadAgentCandidateDirectory,
+      stateRevision,
       stateProvenance: "Owner-supplied local upgrade",
     });
     await (await installation.start()).detach();
@@ -61,6 +70,64 @@ function errorChain(error: unknown): string {
   }
   if (current !== undefined && current !== null) messages.push(String(current));
   return messages.join(" Caused by: ");
+}
+
+// A bare `riker upgrade` builds the next revision from the source repository
+// the installed bundle recorded, so the update notice's instruction is one
+// literal command.
+async function buildFromSourceRepository(
+  installation: LocalInstallation,
+): Promise<{ bundleDirectory: string; revision: string }> {
+  const inspection = await installation.inspect();
+  const active = inspection.active;
+  if (!active) throw new Error("No installed version to upgrade from; supply --lead-bundle.");
+  let record: { repositoryPath?: string };
+  try {
+    record = JSON.parse(
+      await readFile(join(active.code.path, "source.json"), "utf8"),
+    ) as { repositoryPath?: string };
+  } catch {
+    throw new Error(
+      "The installed bundle records no source repository; supply --lead-bundle explicitly.",
+    );
+  }
+  const repositoryPath = record.repositoryPath;
+  if (!repositoryPath || !existsSync(repositoryPath)) {
+    throw new Error(
+      "The recorded source repository is unavailable; supply --lead-bundle explicitly.",
+    );
+  }
+  const buildScript = join(repositoryPath, "scripts", "build-release.ps1");
+  if (!existsSync(buildScript)) {
+    throw new Error(`The source repository is missing ${buildScript}; supply --lead-bundle.`);
+  }
+  let revision = nextRevision(active.code.revision);
+  while (existsSync(join(repositoryPath, "release", revision))) {
+    revision = nextRevision(revision);
+  }
+  process.stdout.write(`Building ${revision} from ${repositoryPath} …\n`);
+  await runBuild(buildScript, revision);
+  const bundleDirectory = join(repositoryPath, "release", revision, "lead-agent");
+  if (!existsSync(join(bundleDirectory, "manifest.json"))) {
+    throw new Error(`The build did not produce ${bundleDirectory}.`);
+  }
+  return { bundleDirectory, revision };
+}
+
+function runBuild(buildScript: string, revision: string): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", buildScript, "-Revision", revision],
+      { stdio: ["ignore", "inherit", "inherit"], windowsHide: true },
+    );
+    child.once("error", reject);
+    child.once("exit", (code) =>
+      code === 0
+        ? resolvePromise()
+        : reject(new Error(`The release build exited with code ${code ?? "none"}.`)),
+    );
+  });
 }
 
 async function install(installation: LocalInstallation, installRoot: string): Promise<void> {

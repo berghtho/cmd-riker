@@ -169,10 +169,7 @@ async function host(installRoot: string): Promise<void> {
       // A bundle without the vendored SnoreToast simply runs without toasts.
       const toastExecutable = join(release.path, "tools", "snoretoast", "snoretoast-x64.exe");
       const toasts = existsSync(toastExecutable)
-        ? createWindowsToastNotifier({
-            snoretoastPath: toastExecutable,
-            shortcutTarget: join(paths.launcher, "riker.cmd"),
-          })
+        ? createWindowsToastNotifier({ snoretoastPath: toastExecutable })
         : undefined;
       if (toasts) await toasts.ensureRegistered().catch(() => {});
       const workerNoticePrefix = "CMD_RIKER_WORKER_NOTICE: ";

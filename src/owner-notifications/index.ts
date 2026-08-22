@@ -1,14 +1,16 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 
 export const ownerToastAppUserModelId = "CMDRiker.Lead";
-export const ownerToastShortcutName = "CMD Riker";
+export const ownerToastDisplayName = "CMD Riker";
+export const ownerToastRegistryKey =
+  `HKCU\\Software\\Classes\\AppUserModelId\\${ownerToastAppUserModelId}`;
 
-// Windows resolves a toast's display name and icon from a Start Menu shortcut
-// carrying the AppUserModelID; without one the toast is labeled with the raw
-// sending executable, which is exactly what the Owner must never see.
+// Windows resolves a toast's display name from the sender's AppUserModelID.
+// That identity is registered per-user in the registry - never as a Start Menu
+// shortcut: a .lnk pointing into AppData is exactly the pattern antivirus
+// heuristics flag as a loader.
 export function ownerToastShortcutPath(
   appDataDirectory: string | undefined = process.env.APPDATA,
 ): string | undefined {
@@ -19,14 +21,16 @@ export function ownerToastShortcutPath(
     "Windows",
     "Start Menu",
     "Programs",
-    `${ownerToastShortcutName}.lnk`,
+    `${ownerToastDisplayName}.lnk`,
   );
 }
 
 export async function removeOwnerToastRegistration(appDataDirectory?: string): Promise<void> {
   const shortcut = ownerToastShortcutPath(appDataDirectory);
-  if (!shortcut) return;
-  await rm(shortcut, { force: true });
+  if (shortcut) await rm(shortcut, { force: true });
+  await runRegistryCommand(["delete", ownerToastRegistryKey, "/f"]).catch(() => {
+    // A missing key is the desired end state.
+  });
 }
 
 export type WindowsToastNotifier = {
@@ -36,8 +40,6 @@ export type WindowsToastNotifier = {
 
 export type WindowsToastNotifierOptions = {
   snoretoastPath: string;
-  /** Launched when the Owner opens the Start Menu shortcut that carries the toast identity. */
-  shortcutTarget: string;
   appDataDirectory?: string;
   // Toast delivery is observable side effect only; tests inject a recorder.
   runCommand?: (executable: string, args: readonly string[]) => Promise<void>;
@@ -51,14 +53,21 @@ export function createWindowsToastNotifier(
   const runCommand = options.runCommand ?? runToastCommand;
   return {
     async ensureRegistered() {
-      const shortcut = ownerToastShortcutPath(options.appDataDirectory);
-      if (shortcut !== undefined && existsSync(shortcut)) return;
-      await runCommand(options.snoretoastPath, [
-        "-install",
-        ownerToastShortcutName,
-        options.shortcutTarget,
-        ownerToastAppUserModelId,
+      await runCommand("reg.exe", [
+        "add",
+        ownerToastRegistryKey,
+        "/v",
+        "DisplayName",
+        "/t",
+        "REG_SZ",
+        "/d",
+        ownerToastDisplayName,
+        "/f",
       ]);
+      // Earlier versions registered the identity through a Start Menu shortcut;
+      // migrate it away so antivirus heuristics stop tripping over the .lnk.
+      const legacyShortcut = ownerToastShortcutPath(options.appDataDirectory);
+      if (legacyShortcut) await rm(legacyShortcut, { force: true });
     },
     notify(input) {
       const message =
@@ -80,9 +89,19 @@ export function createWindowsToastNotifier(
   };
 }
 
+function runRegistryCommand(args: readonly string[]): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    execFile("reg.exe", [...args], { windowsHide: true }, (error) => {
+      if (error) reject(error);
+      else resolvePromise();
+    });
+  });
+}
+
 // SnoreToast exits non-zero for dismissed or timed-out toasts; that is a
 // delivered notification, not a failure, so only spawning itself can fail.
 function runToastCommand(executable: string, args: readonly string[]): Promise<void> {
+  if (executable.toLowerCase() === "reg.exe") return runRegistryCommand(args);
   return new Promise((resolvePromise) => {
     let child: ReturnType<typeof spawn>;
     try {

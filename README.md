@@ -72,8 +72,10 @@ The installation is deliberately per-user and contained under `%LOCALAPPDATA%\CM
   dependencies.
 - `state\` contains the authoritative SQLite state.
 - `recovery\` contains the lifecycle journal, snapshots, and failed-state evidence.
-- One Start Menu shortcut, `CMD Riker`, carries the toast identity so Owner Notices appear as
-  "CMD Riker" instead of a raw executable. `uninstall` removes it.
+- One per-user registry value (`HKCU\Software\Classes\AppUserModelId\CMDRiker.Lead`) carries the
+  toast identity so Owner Notices appear as "CMD Riker" instead of a raw executable. `uninstall`
+  removes it. No Start Menu shortcut is created - a `.lnk` pointing into AppData is the pattern
+  antivirus heuristics flag.
 
 Nothing registers with Windows Task Scheduler and nothing starts at boot or logon. `riker start`
 spawns one detached host process from the active bundle; the host owns the singleton pipe, runs the

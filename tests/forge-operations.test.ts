@@ -23,7 +23,7 @@ test("GitHub mutation records intent before dispatch and settles only after exac
   let inspectTimeout = 0;
   let createTimeout = 0;
   let readTimeout = 0;
-  const github: GitHubCli = {
+  const github = githubCli({
     inspect: async (input) => {
       inspectTimeout = input.timeoutMs;
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -48,7 +48,7 @@ test("GitHub mutation records intent before dispatch and settles only after exac
         observedAt: "2026-08-19T20:00:00.000Z",
       };
     },
-  };
+  });
 
   const result = await createForgeOperations(state, { github }).execute({
     commitmentId: commitment.id,
@@ -75,17 +75,165 @@ test("GitHub mutation records intent before dispatch and settles only after exac
   assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
 });
 
+test("GitHub issue close settles only after the closed state reads back attributed", async (t) => {
+  const { state, commitment, githubAuthorization } = await configuredState(
+    t,
+    "github-close",
+    "github-issue-close",
+  );
+  let closed: unknown;
+  const github = githubCli({
+    closeIssue: async (input) => {
+      closed = { stateReason: input.stateReason, issueNumber: input.issueNumber };
+      return { url: "https://github.test/issues/36" };
+    },
+    readIssueState: async () => ({
+      state: "closed",
+      stateReason: "completed",
+      closedBy: "berghtho",
+      url: "https://github.test/issues/36",
+      observedAt: "2026-08-19T20:00:00.000Z",
+    }),
+  });
+
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-close",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      stateReason: "completed",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
+  });
+
+  assert.deepEqual(closed, { stateReason: "completed", issueNumber: 36 });
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.evidence[0]?.source, "provider-readback");
+  assert.match(result.evidence[0]?.summary ?? "", /closed \(completed\)/);
+  assert.equal(state.readEffectIntent(result.effectIntentId ?? "")?.status, "succeeded");
+  createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
+  assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
+});
+
+test("GitHub issue close read-back without the intended closer stays unknown", async (t) => {
+  const { state, commitment, githubAuthorization } = await configuredState(
+    t,
+    "github-close-unknown",
+    "github-issue-close",
+  );
+  const github = githubCli({
+    closeIssue: async () => ({ url: "https://github.test/issues/36" }),
+    readIssueState: async () => ({
+      state: "closed",
+      stateReason: "completed",
+      closedBy: "someone-else",
+      url: "https://github.test/issues/36",
+      observedAt: "2026-08-19T20:00:00.000Z",
+    }),
+  });
+
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-close",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      stateReason: "completed",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
+  });
+
+  assert.equal(result.status, "unknown");
+  assert.equal(state.readEffectIntent(result.effectIntentId ?? "")?.status, "unknown");
+  createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
+  assert.equal(state.readCommitment(commitment.id)?.condition?.kind, "reconciling");
+});
+
+test("GitHub label removal settles only after the label is absent in read-back", async (t) => {
+  const { state, commitment, githubAuthorization } = await configuredState(
+    t,
+    "github-label",
+    "github-issue-label-remove",
+  );
+  let removed: unknown;
+  const github = githubCli({
+    removeIssueLabel: async (input) => {
+      removed = { label: input.label, issueNumber: input.issueNumber };
+    },
+    readIssueLabels: async () => ({
+      labels: ["wayfinder:task"],
+      url: "https://github.test/issues/36",
+      observedAt: "2026-08-19T20:00:00.000Z",
+    }),
+  });
+
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-label-remove",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      label: "status: verify",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
+  });
+
+  assert.deepEqual(removed, { label: "status: verify", issueNumber: 36 });
+  assert.equal(result.status, "succeeded");
+  assert.match(result.evidence[0]?.summary ?? "", /no longer carries label/);
+  createOrchestrationCore(state).observeForgeOperationResult(commitment.id, result);
+  assert.equal(state.readCommitment(commitment.id)?.state, "accepted");
+});
+
+test("GitHub label removal whose read-back still lists the label stays unknown", async (t) => {
+  const { state, commitment, githubAuthorization } = await configuredState(
+    t,
+    "github-label-unknown",
+    "github-issue-label-remove",
+  );
+  const github = githubCli({
+    removeIssueLabel: async () => {},
+    readIssueLabels: async () => ({
+      labels: ["status: verify"],
+      url: "https://github.test/issues/36",
+      observedAt: "2026-08-19T20:00:00.000Z",
+    }),
+  });
+
+  const result = await createForgeOperations(state, { github }).execute({
+    commitmentId: commitment.id,
+    operation: {
+      kind: "github-issue-label-remove",
+      repository: "berghtho/cmd-riker",
+      issueNumber: 36,
+      label: "status: verify",
+      expectedAccount: "berghtho",
+    },
+    timeoutMs: 1_000,
+    actingAuthorityEffectAuthorization: githubAuthorization!,
+  });
+
+  assert.equal(result.status, "unknown");
+  assert.match(result.uncertainty?.reason ?? "", /still lists the intended label/);
+  assert.equal(state.readEffectIntent(result.effectIntentId ?? "")?.status, "unknown");
+});
+
 test("Forge authority is checked against durable Owner configuration before provider use", async (t) => {
   const { state, commitment, githubAuthorization } = await configuredState(t, "authority");
   let inspected = false;
-  const github: GitHubCli = {
+  const github = githubCli({
     inspect: async () => {
       inspected = true;
       return githubCapability();
     },
-    createIssueComment: async () => assert.fail("mutation must not dispatch"),
-    readIssueComment: async () => assert.fail("read-back must not run"),
-  };
+  });
 
   await assert.rejects(
     createForgeOperations(state, { github }).execute({
@@ -108,7 +256,7 @@ test("Forge authority is checked against durable Owner configuration before prov
 test("deadline expiry before GitHub dispatch is a known no-effect timeout", async (t) => {
   const { state, commitment, githubAuthorization } = await configuredState(t, "pre-dispatch-timeout");
   let dispatched = false;
-  const github: GitHubCli = {
+  const github = githubCli({
     inspect: async () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       return githubCapability();
@@ -117,8 +265,7 @@ test("deadline expiry before GitHub dispatch is a known no-effect timeout", asyn
       dispatched = true;
       return { id: "comment-42", url: "https://github.test/comment-42" };
     },
-    readIssueComment: async () => assert.fail("read-back must not run"),
-  };
+  });
   const result = await createForgeOperations(state, { github }).execute({
     commitmentId: commitment.id,
     operation: {
@@ -180,13 +327,11 @@ test("native CLI environment excludes ambient secret-bearing variables", () => {
 
 test("missing GitHub authentication records one durable Owner action and deduplicates repeats", async (t) => {
   const { state, commitment, githubAuthorization } = await configuredState(t, "github-auth");
-  const github: GitHubCli = {
+  const github = githubCli({
     inspect: async () => {
       throw new ForgeAdapterError("authentication", "GitHub CLI authentication is unavailable.");
     },
-    createIssueComment: async () => assert.fail("mutation must not dispatch"),
-    readIssueComment: async () => assert.fail("read-back must not run"),
-  };
+  });
   const operations = createForgeOperations(state, { github });
   const request = {
     commitmentId: commitment.id,
@@ -352,8 +497,7 @@ test("Owner actions remain scoped when the configured Azure target changes", asy
 
 test("mismatched GitHub read-back leaves the dispatched effect unknown", async (t) => {
   const { state, commitment, githubAuthorization } = await configuredState(t, "github-unknown");
-  const github: GitHubCli = {
-    inspect: async () => githubCapability(),
+  const github = githubCli({
     createIssueComment: async () => ({ id: "comment-42", url: "https://github.test/comment-42" }),
     readIssueComment: async () => ({
       id: "comment-42",
@@ -362,7 +506,7 @@ test("mismatched GitHub read-back leaves the dispatched effect unknown", async (
       author: "berghtho",
       observedAt: "2026-08-19T20:00:00.000Z",
     }),
-  };
+  });
 
   const result = await createForgeOperations(state, { github }).execute({
     commitmentId: commitment.id,
@@ -445,7 +589,11 @@ test("restart marks a dispatched GitHub mutation unknown without replay", async 
 async function configuredState(
   t: test.TestContext,
   suffix: string,
-  operation: "github-issue-comment" | "azure-subscription-inspection" = "github-issue-comment",
+  operation:
+    | "github-issue-comment"
+    | "github-issue-close"
+    | "github-issue-label-remove"
+    | "azure-subscription-inspection" = "github-issue-comment",
 ): Promise<{
   state: AuthoritativeState;
   commitment: Commitment;
@@ -489,6 +637,19 @@ async function configuredState(
     }],
   });
   return { state, commitment };
+}
+
+function githubCli(overrides: Partial<GitHubCli>): GitHubCli {
+  return {
+    inspect: async () => githubCapability(),
+    createIssueComment: async () => assert.fail("createIssueComment must not run"),
+    readIssueComment: async () => assert.fail("readIssueComment must not run"),
+    closeIssue: async () => assert.fail("closeIssue must not run"),
+    readIssueState: async () => assert.fail("readIssueState must not run"),
+    removeIssueLabel: async () => assert.fail("removeIssueLabel must not run"),
+    readIssueLabels: async () => assert.fail("readIssueLabels must not run"),
+    ...overrides,
+  };
 }
 
 function githubCapability(): ForgeCapabilityProof {

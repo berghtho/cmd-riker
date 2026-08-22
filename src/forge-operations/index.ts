@@ -9,6 +9,8 @@ import type {
 
 export type ForgeProvider = "github" | "azure";
 
+export type GitHubIssueCloseReason = "completed" | "not-planned";
+
 export type ForgeOperationRequest =
   | {
       commitmentId: string;
@@ -29,12 +31,49 @@ export type ForgeOperationRequest =
   | {
       commitmentId: string;
       operation: {
+        kind: "github-issue-close";
+        repository: string;
+        issueNumber: number;
+        stateReason: GitHubIssueCloseReason;
+        expectedAccount: string;
+      };
+      timeoutMs: number;
+      actingAuthorityEffectAuthorization?: {
+        actingAuthorityId: string;
+        authorizationId: string;
+        standingOrderId: string;
+      };
+    }
+  | {
+      commitmentId: string;
+      operation: {
+        kind: "github-issue-label-remove";
+        repository: string;
+        issueNumber: number;
+        label: string;
+        expectedAccount: string;
+      };
+      timeoutMs: number;
+      actingAuthorityEffectAuthorization?: {
+        actingAuthorityId: string;
+        authorizationId: string;
+        standingOrderId: string;
+      };
+    }
+  | {
+      commitmentId: string;
+      operation: {
         kind: "azure-subscription-inspection";
         subscriptionId: string;
         expectedAccount: string;
       };
       timeoutMs: number;
     };
+
+export type GitHubMutationRequest = Exclude<
+  ForgeOperationRequest,
+  { operation: { kind: "azure-subscription-inspection" } }
+>;
 
 export type ForgeOperationStatus =
   | "succeeded"
@@ -50,6 +89,19 @@ export type ForgeOperationTarget =
       repository: string;
       issueNumber: number;
       bodySha256: string;
+    }
+  | {
+      kind: "github-issue-state";
+      repository: string;
+      issueNumber: number;
+      state: "closed";
+      stateReason: GitHubIssueCloseReason;
+    }
+  | {
+      kind: "github-issue-label";
+      repository: string;
+      issueNumber: number;
+      label: string;
     }
   | {
       kind: "azure-subscription";
@@ -122,6 +174,7 @@ export interface GitHubCli {
     repository: string;
     issueNumber: number;
     expectedAccount: string;
+    capability: string;
     timeoutMs: number;
   }): Promise<ForgeCapabilityProof>;
   createIssueComment(input: {
@@ -135,6 +188,34 @@ export interface GitHubCli {
     commentId: string;
     timeoutMs: number;
   }): Promise<{ id: string; url: string; body: string; author: string; observedAt: string }>;
+  closeIssue(input: {
+    repository: string;
+    issueNumber: number;
+    stateReason: GitHubIssueCloseReason;
+    timeoutMs: number;
+  }): Promise<{ url: string }>;
+  readIssueState(input: {
+    repository: string;
+    issueNumber: number;
+    timeoutMs: number;
+  }): Promise<{
+    state: string;
+    stateReason: string;
+    closedBy: string;
+    url: string;
+    observedAt: string;
+  }>;
+  removeIssueLabel(input: {
+    repository: string;
+    issueNumber: number;
+    label: string;
+    timeoutMs: number;
+  }): Promise<void>;
+  readIssueLabels(input: {
+    repository: string;
+    issueNumber: number;
+    timeoutMs: number;
+  }): Promise<{ labels: string[]; url: string; observedAt: string }>;
 }
 
 export interface AzureCli {
@@ -197,18 +278,14 @@ export function createForgeOperations(
       ) {
         throw new Error("The active Commitment must declare the exact Forge operation as its objective criterion.");
       }
-      if (request.operation.kind === "github-issue-comment") {
-        return executeGitHubMutation(
+      if (request.operation.kind === "azure-subscription-inspection") {
+        return executeAzureInspection(
           state,
-          github,
-          request as Extract<ForgeOperationRequest, { operation: { kind: "github-issue-comment" } }>,
+          azure,
+          request as Extract<ForgeOperationRequest, { operation: { kind: "azure-subscription-inspection" } }>,
         );
       }
-      return executeAzureInspection(
-        state,
-        azure,
-        request as Extract<ForgeOperationRequest, { operation: { kind: "azure-subscription-inspection" } }>,
-      );
+      return executeGitHubMutation(state, github, request as GitHubMutationRequest);
     },
   };
 }
@@ -237,6 +314,7 @@ export class NativeGitHubCli implements GitHubCli {
     repository: string;
     issueNumber: number;
     expectedAccount: string;
+    capability: string;
     timeoutMs: number;
   }): Promise<ForgeCapabilityProof> {
     const deadline = Date.now() + input.timeoutMs;
@@ -278,7 +356,7 @@ export class NativeGitHubCli implements GitHubCli {
     }
     const permission = typeof parsed.viewerPermission === "string" ? parsed.viewerPermission : "";
     if (!new Set(["ADMIN", "MAINTAIN", "WRITE"]).has(permission)) {
-      throw new ForgeAdapterError("capability", "The authenticated GitHub account cannot write issue comments in the target repository.");
+      throw new ForgeAdapterError("capability", "The authenticated GitHub account cannot write to issues in the target repository.");
     }
     const issue = await runCli(
       this.executable,
@@ -296,7 +374,7 @@ export class NativeGitHubCli implements GitHubCli {
       authentication: "verified",
       account,
       target: `${parsed.nameWithOwner}#${input.issueNumber}`,
-      capability: `issue-comment:${permission}`,
+      capability: `${input.capability}:${permission}`,
       observedAt: new Date().toISOString(),
     };
   }
@@ -362,6 +440,126 @@ export class NativeGitHubCli implements GitHubCli {
       throw new ForgeAdapterError("capability", "GitHub read-back response was incomplete.");
     }
     return parsed as { id: string; url: string; body: string; author: string; observedAt: string };
+  }
+
+  async closeIssue(input: {
+    repository: string;
+    issueNumber: number;
+    stateReason: GitHubIssueCloseReason;
+    timeoutMs: number;
+  }): Promise<{ url: string }> {
+    const result = await runCli(
+      this.executable,
+      [
+        "api",
+        `repos/${input.repository}/issues/${input.issueNumber}`,
+        "--method",
+        "PATCH",
+        "--raw-field",
+        "state=closed",
+        "--raw-field",
+        `state_reason=${input.stateReason.replace("-", "_")}`,
+        "--jq",
+        "{url: .html_url}",
+      ],
+      input.timeoutMs,
+      "github",
+    );
+    if (result.exitCode !== 0) {
+      throw new ForgeAdapterError("capability", "GitHub issue close dispatch did not return a successful response.");
+    }
+    const parsed = parseJson(result.stdout, "GitHub mutation response") as { url?: unknown };
+    if (typeof parsed.url !== "string") {
+      throw new ForgeAdapterError("capability", "GitHub mutation response omitted its remote identity.");
+    }
+    return { url: parsed.url };
+  }
+
+  async readIssueState(input: {
+    repository: string;
+    issueNumber: number;
+    timeoutMs: number;
+  }): Promise<{ state: string; stateReason: string; closedBy: string; url: string; observedAt: string }> {
+    const result = await runCli(
+      this.executable,
+      [
+        "api",
+        `repos/${input.repository}/issues/${input.issueNumber}`,
+        "--jq",
+        '{state: .state, stateReason: (.state_reason // ""), closedBy: (.closed_by.login // ""), url: .html_url, observedAt: .updated_at}',
+      ],
+      input.timeoutMs,
+      "github",
+    );
+    if (result.exitCode !== 0) {
+      throw new ForgeAdapterError("capability", "GitHub issue state read-back was unavailable.");
+    }
+    const parsed = parseJson(result.stdout, "GitHub read-back response") as Record<string, unknown>;
+    if (
+      typeof parsed.state !== "string" ||
+      typeof parsed.stateReason !== "string" ||
+      typeof parsed.closedBy !== "string" ||
+      typeof parsed.url !== "string" ||
+      typeof parsed.observedAt !== "string"
+    ) {
+      throw new ForgeAdapterError("capability", "GitHub read-back response was incomplete.");
+    }
+    return parsed as { state: string; stateReason: string; closedBy: string; url: string; observedAt: string };
+  }
+
+  async removeIssueLabel(input: {
+    repository: string;
+    issueNumber: number;
+    label: string;
+    timeoutMs: number;
+  }): Promise<void> {
+    const result = await runCli(
+      this.executable,
+      [
+        "api",
+        `repos/${input.repository}/issues/${input.issueNumber}/labels/${encodeURIComponent(input.label)}`,
+        "--method",
+        "DELETE",
+        "--jq",
+        "length",
+      ],
+      input.timeoutMs,
+      "github",
+    );
+    if (result.exitCode !== 0) {
+      throw new ForgeAdapterError("capability", "GitHub label removal dispatch did not return a successful response.");
+    }
+  }
+
+  async readIssueLabels(input: {
+    repository: string;
+    issueNumber: number;
+    timeoutMs: number;
+  }): Promise<{ labels: string[]; url: string; observedAt: string }> {
+    const result = await runCli(
+      this.executable,
+      [
+        "api",
+        `repos/${input.repository}/issues/${input.issueNumber}`,
+        "--jq",
+        "{labels: [.labels[].name], url: .html_url, observedAt: .updated_at}",
+      ],
+      input.timeoutMs,
+      "github",
+    );
+    if (result.exitCode !== 0) {
+      throw new ForgeAdapterError("capability", "GitHub issue label read-back was unavailable.");
+    }
+    const parsed = parseJson(result.stdout, "GitHub read-back response") as Record<string, unknown>;
+    if (
+      !Array.isArray(parsed.labels) ||
+      parsed.labels.some((label) => typeof label !== "string") ||
+      typeof parsed.url !== "string" ||
+      typeof parsed.observedAt !== "string"
+    ) {
+      throw new ForgeAdapterError("capability", "GitHub read-back response was incomplete.");
+    }
+    return parsed as { labels: string[]; url: string; observedAt: string };
   }
 }
 
@@ -460,28 +658,184 @@ export class NativeAzureCli implements AzureCli {
   }
 }
 
+/** One GitHub mutation's operation-specific steps: how to dispatch it and how
+ * to settle it from an authoritative remote read-back. `readBack` returns the
+ * attributed evidence, or undefined when the remote fact does not match the
+ * intended effect. */
+type GitHubMutationSteps = {
+  capability: string;
+  target: ForgeOperationTarget;
+  expectedEffect: string;
+  retryRule: string;
+  mismatchReason: string;
+  dispatch(timeoutMs: number): Promise<void>;
+  readBack(timeoutMs: number): Promise<ExternalEffectEvidence | undefined>;
+};
+
+function githubCommentSteps(
+  github: GitHubCli,
+  operation: Extract<GitHubMutationRequest, { operation: { kind: "github-issue-comment" } }>["operation"],
+): GitHubMutationSteps {
+  const bodySha256 = sha256(operation.body);
+  let created: { id: string; url: string } | undefined;
+  return {
+    capability: "issue-comment",
+    target: {
+      kind: "github-issue",
+      repository: operation.repository,
+      issueNumber: operation.issueNumber,
+      bodySha256,
+    },
+    expectedEffect: `Create one attributed GitHub issue comment with body SHA-256 ${bodySha256}.`,
+    retryRule: "Read back the exact remote comment identity before any retry.",
+    mismatchReason: "GitHub read-back did not match the intended account, remote identity, and content digest.",
+    async dispatch(timeoutMs) {
+      created = await github.createIssueComment({
+        repository: operation.repository,
+        issueNumber: operation.issueNumber,
+        body: operation.body,
+        timeoutMs,
+      });
+    },
+    async readBack(timeoutMs) {
+      const readback = await github.readIssueComment({
+        repository: operation.repository,
+        commentId: created!.id,
+        timeoutMs,
+      });
+      const verified =
+        readback.id === created!.id &&
+        readback.url === created!.url &&
+        sha256(readback.body) === bodySha256 &&
+        readback.author.toLowerCase() === operation.expectedAccount.toLowerCase();
+      if (!verified) return undefined;
+      return {
+        source: "provider-readback",
+        reference: readback.url,
+        summary: `GitHub comment ${readback.id} matched the intended account and content digest.`,
+        observedAt: readback.observedAt,
+      };
+    },
+  };
+}
+
+function githubCloseSteps(
+  github: GitHubCli,
+  operation: Extract<GitHubMutationRequest, { operation: { kind: "github-issue-close" } }>["operation"],
+): GitHubMutationSteps {
+  return {
+    capability: "issue-close",
+    target: {
+      kind: "github-issue-state",
+      repository: operation.repository,
+      issueNumber: operation.issueNumber,
+      state: "closed",
+      stateReason: operation.stateReason,
+    },
+    expectedEffect: `Close GitHub issue ${operation.repository}#${operation.issueNumber} as ${operation.stateReason}.`,
+    retryRule: "Read back the remote issue state before any retry.",
+    mismatchReason: "GitHub read-back did not show the issue closed by the intended account with the intended reason.",
+    async dispatch(timeoutMs) {
+      await github.closeIssue({
+        repository: operation.repository,
+        issueNumber: operation.issueNumber,
+        stateReason: operation.stateReason,
+        timeoutMs,
+      });
+    },
+    async readBack(timeoutMs) {
+      const readback = await github.readIssueState({
+        repository: operation.repository,
+        issueNumber: operation.issueNumber,
+        timeoutMs,
+      });
+      const verified =
+        readback.state === "closed" &&
+        readback.stateReason === operation.stateReason.replace("-", "_") &&
+        readback.closedBy.toLowerCase() === operation.expectedAccount.toLowerCase();
+      if (!verified) return undefined;
+      return {
+        source: "provider-readback",
+        reference: readback.url,
+        summary: `GitHub issue ${operation.repository}#${operation.issueNumber} is closed (${operation.stateReason}) by the intended account.`,
+        observedAt: readback.observedAt,
+      };
+    },
+  };
+}
+
+function githubLabelRemoveSteps(
+  github: GitHubCli,
+  operation: Extract<GitHubMutationRequest, { operation: { kind: "github-issue-label-remove" } }>["operation"],
+): GitHubMutationSteps {
+  return {
+    capability: "issue-label-remove",
+    target: {
+      kind: "github-issue-label",
+      repository: operation.repository,
+      issueNumber: operation.issueNumber,
+      label: operation.label,
+    },
+    expectedEffect: `Remove label "${operation.label}" from GitHub issue ${operation.repository}#${operation.issueNumber}.`,
+    retryRule: "Read back the remote issue labels before any retry.",
+    mismatchReason: "GitHub read-back still lists the intended label on the issue.",
+    async dispatch(timeoutMs) {
+      await github.removeIssueLabel({
+        repository: operation.repository,
+        issueNumber: operation.issueNumber,
+        label: operation.label,
+        timeoutMs,
+      });
+    },
+    async readBack(timeoutMs) {
+      const readback = await github.readIssueLabels({
+        repository: operation.repository,
+        issueNumber: operation.issueNumber,
+        timeoutMs,
+      });
+      const absent = readback.labels.every(
+        (label) => label.toLowerCase() !== operation.label.toLowerCase(),
+      );
+      if (!absent) return undefined;
+      return {
+        source: "provider-readback",
+        reference: readback.url,
+        summary: `GitHub issue ${operation.repository}#${operation.issueNumber} no longer carries label "${operation.label}".`,
+        observedAt: readback.observedAt,
+      };
+    },
+  };
+}
+
+function githubMutationSteps(github: GitHubCli, request: GitHubMutationRequest): GitHubMutationSteps {
+  switch (request.operation.kind) {
+    case "github-issue-comment":
+      return githubCommentSteps(github, request.operation);
+    case "github-issue-close":
+      return githubCloseSteps(github, request.operation);
+    case "github-issue-label-remove":
+      return githubLabelRemoveSteps(github, request.operation);
+  }
+}
+
 async function executeGitHubMutation(
   state: ForgeOperationState,
   github: GitHubCli,
-  request: Extract<ForgeOperationRequest, { operation: { kind: "github-issue-comment" } }>,
+  request: GitHubMutationRequest,
 ): Promise<ForgeOperationResult> {
   const deadline = Date.now() + request.timeoutMs;
   const operationAttemptId = randomUUID();
   const effectIntentId = randomUUID();
   const startedAt = new Date().toISOString();
-  const bodySha256 = sha256(request.operation.body);
-  const target: ForgeOperationTarget = {
-    kind: "github-issue",
-    repository: request.operation.repository,
-    issueNumber: request.operation.issueNumber,
-    bodySha256,
-  };
+  const steps = githubMutationSteps(github, request);
+  const target = steps.target;
   let capability: ForgeCapabilityProof;
   try {
     capability = await github.inspect({
       repository: request.operation.repository,
       issueNumber: request.operation.issueNumber,
       expectedAccount: request.operation.expectedAccount,
+      capability: steps.capability,
       timeoutMs: remainingTimeout(deadline),
     });
   } catch (error) {
@@ -518,7 +872,7 @@ async function executeGitHubMutation(
     forgeOperationAttemptId: operationAttemptId,
     provider: "github",
     effectScopeKey: `github:${request.operation.repository.toLowerCase()}:issue:${request.operation.issueNumber}`,
-    expectedEffect: `Create one attributed GitHub issue comment with body SHA-256 ${bodySha256}.`,
+    expectedEffect: steps.expectedEffect,
     authorization: {
       kind: "lead-agent-command-authority",
       commitmentId: request.commitmentId,
@@ -531,7 +885,7 @@ async function executeGitHubMutation(
         ? { actingAuthority: request.actingAuthorityEffectAuthorization }
         : {}),
     },
-    retryRule: "Read back the exact remote comment identity before any retry.",
+    retryRule: steps.retryRule,
     status: "pending",
   };
   let dispatchTimeout: number;
@@ -553,14 +907,8 @@ async function executeGitHubMutation(
   };
   state.claimForgeMutation(runningAttempt, dispatchingEffect);
 
-  let created: Awaited<ReturnType<GitHubCli["createIssueComment"]>>;
   try {
-    created = await github.createIssueComment({
-      repository: request.operation.repository,
-      issueNumber: request.operation.issueNumber,
-      body: request.operation.body,
-      timeoutMs: dispatchTimeout,
-    });
+    await steps.dispatch(dispatchTimeout);
   } catch {
     return settleUnknownGitHubMutation(
       state,
@@ -571,13 +919,9 @@ async function executeGitHubMutation(
     );
   }
 
-  let readback: Awaited<ReturnType<GitHubCli["readIssueComment"]>>;
+  let evidence: ExternalEffectEvidence | undefined;
   try {
-    readback = await github.readIssueComment({
-      repository: request.operation.repository,
-      commentId: created.id,
-      timeoutMs: remainingTimeout(deadline),
-    });
+    evidence = await steps.readBack(remainingTimeout(deadline));
   } catch {
     return settleUnknownGitHubMutation(
       state,
@@ -587,18 +931,13 @@ async function executeGitHubMutation(
       "GitHub mutation completed without an authoritative read-back.",
     );
   }
-  const verified =
-    readback.id === created.id &&
-    readback.url === created.url &&
-    sha256(readback.body) === bodySha256 &&
-    readback.author.toLowerCase() === request.operation.expectedAccount.toLowerCase();
-  if (!verified) {
+  if (!evidence) {
     return settleUnknownGitHubMutation(
       state,
       runningAttempt,
       dispatchingEffect,
       capability,
-      "GitHub read-back did not match the intended account, remote identity, and content digest.",
+      steps.mismatchReason,
     );
   }
   const result: ForgeOperationResult = {
@@ -609,13 +948,8 @@ async function executeGitHubMutation(
     provider: "github",
     status: "succeeded",
     capability,
-    evidence: [{
-      source: "provider-readback",
-      reference: readback.url,
-      summary: `GitHub comment ${readback.id} matched the intended account and content digest.`,
-      observedAt: readback.observedAt,
-    }],
-    diagnostics: [{ source: "gh-cli", message: "GitHub issue comment was verified by remote read-back." }],
+    evidence: [evidence],
+    diagnostics: [{ source: "gh-cli", message: "The GitHub mutation was verified by remote read-back." }],
     uncertainty: null,
     startedAt,
     completedAt: new Date().toISOString(),
@@ -892,15 +1226,37 @@ function assertRequest(request: ForgeOperationRequest): void {
   if (!request.operation.expectedAccount.trim()) {
     throw new Error("Forge operations require the intended account identity.");
   }
-  if (request.operation.kind === "github-issue-comment") {
+  if (request.operation.kind !== "azure-subscription-inspection") {
     if (
       !/^[^/\s]+\/[^/\s]+$/.test(request.operation.repository) ||
       !Number.isInteger(request.operation.issueNumber) ||
-      request.operation.issueNumber < 1 ||
+      request.operation.issueNumber < 1
+    ) {
+      throw new Error("GitHub mutations require a repository and issue number.");
+    }
+  }
+  if (request.operation.kind === "github-issue-comment") {
+    if (
       !request.operation.body.trim() ||
       Buffer.byteLength(request.operation.body, "utf8") > 64 * 1024
     ) {
-      throw new Error("GitHub issue comments require a repository, issue number, and bounded body.");
+      throw new Error("GitHub issue comments require a bounded non-empty body.");
+    }
+    return;
+  }
+  if (request.operation.kind === "github-issue-close") {
+    if (request.operation.stateReason !== "completed" && request.operation.stateReason !== "not-planned") {
+      throw new Error("GitHub issue close requires the state reason completed or not-planned.");
+    }
+    return;
+  }
+  if (request.operation.kind === "github-issue-label-remove") {
+    if (
+      !request.operation.label.trim() ||
+      request.operation.label !== request.operation.label.trim() ||
+      Buffer.byteLength(request.operation.label, "utf8") > 100
+    ) {
+      throw new Error("GitHub label removal requires one bounded trimmed label name.");
     }
     return;
   }
@@ -914,7 +1270,7 @@ function assertConfiguredAuthority(
   request: ForgeOperationRequest,
 ): void {
   if (!configuration) throw new Error("Forge operations require the persisted Owner configuration.");
-  if (request.operation.kind === "github-issue-comment") {
+  if (request.operation.kind !== "azure-subscription-inspection") {
     const authority = configuration.forgeAuthorities?.github;
     if (!authority) throw new Error("GitHub Forge authority is not configured by the Owner.");
     if (
@@ -936,9 +1292,9 @@ function assertConfiguredAuthority(
 }
 
 function targetLabel(target: ForgeOperationTarget): string {
-  return target.kind === "github-issue"
-    ? `${target.repository}#${target.issueNumber}`
-    : `subscription:${target.subscriptionId}`;
+  return target.kind === "azure-subscription"
+    ? `subscription:${target.subscriptionId}`
+    : `${target.repository}#${target.issueNumber}`;
 }
 
 function sha256(value: string): string {

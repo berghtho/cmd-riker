@@ -386,6 +386,12 @@ test("production adapter exposes typed Forge operations without provider command
           completedAt: "2026-08-19T20:00:01.000Z",
         };
       },
+      async closeGitHubIssue() {
+        throw new Error("not expected");
+      },
+      async removeGitHubIssueLabel() {
+        throw new Error("not expected");
+      },
       async inspectAzureSubscription() {
         throw new Error("not expected");
       },
@@ -398,6 +404,8 @@ test("production adapter exposes typed Forge operations without provider command
     body: "Typed Forge proof.",
   });
   assert.match(firstRequest, /comment_on_github_issue/);
+  assert.match(firstRequest, /close_github_issue/);
+  assert.match(firstRequest, /remove_github_issue_label/);
   assert.match(firstRequest, /inspect_azure_subscription/);
   assert.doesNotMatch(firstRequest, /gh api|az account/);
   assert.equal(result.content, "The typed GitHub operation is recorded.");

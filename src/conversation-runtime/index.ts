@@ -61,6 +61,16 @@ export type PiTurnRequest = {
     commentOnGitHubIssue?(
       input: { commitmentId?: string; issueNumber: number; body: string },
     ): Promise<ForgeOperationResult>;
+    closeGitHubIssue?(
+      input: {
+        commitmentId?: string;
+        issueNumber: number;
+        stateReason?: "completed" | "not-planned";
+      },
+    ): Promise<ForgeOperationResult>;
+    removeGitHubIssueLabel?(
+      input: { commitmentId?: string; issueNumber: number; label: string },
+    ): Promise<ForgeOperationResult>;
     inspectAzureSubscription?(commitmentId?: string): Promise<ForgeOperationResult>;
   };
   standingOrders?: readonly StandingOrder[];
@@ -400,7 +410,8 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
               "checkout, announce the change to that Worker before it continues, so it never reacts to " +
               "unexplained changes."
             : "") +
-           (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.inspectAzureSubscription
+           (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.closeGitHubIssue ||
+             request.forgeActions?.removeGitHubIssueLabel || request.forgeActions?.inspectAzureSubscription
              ? " Use the typed GitHub and Azure tools only for their declared semantic operations; never construct gh or az commands. " +
                "Treat an unavailable result as one Owner action and do not retry blindly."
              : "") +
@@ -614,6 +625,63 @@ function forgeTools(
         };
       },
     });
+  if (actions.closeGitHubIssue) tools.push({
+      name: "close_github_issue",
+      label: "Close GitHub Issue",
+      description:
+        "Close one GitHub issue through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back of the closed state. Close an issue only after its durable resolution comment exists.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        issueNumber: Type.Integer({ minimum: 1 }),
+        stateReason: Type.Optional(Type.Union([
+          Type.Literal("completed"),
+          Type.Literal("not-planned"),
+        ])),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, issueNumber, stateReason } = params as {
+          commitmentId: string;
+          issueNumber: number;
+          stateReason?: "completed" | "not-planned";
+        };
+        const result = await actions.closeGitHubIssue!({
+          commitmentId,
+          issueNumber,
+          ...(stateReason ? { stateReason } : {}),
+        });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: forgeResultText(result) }],
+          details: result,
+        };
+      },
+    });
+  if (actions.removeGitHubIssueLabel) tools.push({
+      name: "remove_github_issue_label",
+      label: "Remove GitHub Issue Label",
+      description:
+        "Remove one label from one GitHub issue through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back of the issue's labels.",
+      parameters: Type.Object({
+        commitmentId: Type.String({ minLength: 1 }),
+        issueNumber: Type.Integer({ minimum: 1 }),
+        label: Type.String({ minLength: 1, maxLength: 100 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { commitmentId, issueNumber, label } = params as {
+          commitmentId: string;
+          issueNumber: number;
+          label: string;
+        };
+        const result = await actions.removeGitHubIssueLabel!({ commitmentId, issueNumber, label });
+        observer.onMutation();
+        return {
+          content: [{ type: "text", text: forgeResultText(result) }],
+          details: result,
+        };
+      },
+    });
   if (actions.inspectAzureSubscription) tools.push({
       name: "inspect_azure_subscription",
       label: "Inspect Azure Subscription",
@@ -664,6 +732,8 @@ const commitmentCriterionSchema = Type.Union([
     description: Type.String({ minLength: 1 }),
     operation: Type.Union([
       Type.Literal("github-issue-comment"),
+      Type.Literal("github-issue-close"),
+      Type.Literal("github-issue-label-remove"),
       Type.Literal("azure-subscription-inspection"),
     ]),
   }),

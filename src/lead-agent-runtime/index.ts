@@ -101,7 +101,11 @@ async function completeOwnerTurn(input: {
       | { kind: "target-project-operation"; operation: "test"; description: string }
       | {
           kind: "forge-operation";
-          operation: "github-issue-comment" | "azure-subscription-inspection";
+          operation:
+            | "github-issue-comment"
+            | "github-issue-close"
+            | "github-issue-label-remove"
+            | "azure-subscription-inspection";
           description: string;
         },
   ): string =>
@@ -342,6 +346,57 @@ async function completeOwnerTurn(input: {
                       repository: authority.repository,
                       issueNumber: operationInput.issueNumber,
                       body: operationInput.body,
+                      expectedAccount: authority.account,
+                    },
+                    timeoutMs: 30_000,
+                  });
+                  orchestration.observeForgeOperationResult(commitmentId, result);
+                  return result;
+                },
+                closeGitHubIssue: async (operationInput) => {
+                  const authority = conversation.forgeAuthorities!.github!;
+                  const stateReason = operationInput.stateReason ?? "completed";
+                  const commitmentId = workItemFor(
+                    operationInput.commitmentId,
+                    `Issue ${authority.repository}#${operationInput.issueNumber} is closed (${stateReason}).`,
+                    {
+                      kind: "forge-operation",
+                      operation: "github-issue-close",
+                      description: "The typed GitHub adapter proves the closed issue by read-back.",
+                    },
+                  );
+                  const result = await input.forgeOperations.execute({
+                    commitmentId,
+                    operation: {
+                      kind: "github-issue-close",
+                      repository: authority.repository,
+                      issueNumber: operationInput.issueNumber,
+                      stateReason,
+                      expectedAccount: authority.account,
+                    },
+                    timeoutMs: 30_000,
+                  });
+                  orchestration.observeForgeOperationResult(commitmentId, result);
+                  return result;
+                },
+                removeGitHubIssueLabel: async (operationInput) => {
+                  const authority = conversation.forgeAuthorities!.github!;
+                  const commitmentId = workItemFor(
+                    operationInput.commitmentId,
+                    `Label "${operationInput.label}" is removed from ${authority.repository}#${operationInput.issueNumber}.`,
+                    {
+                      kind: "forge-operation",
+                      operation: "github-issue-label-remove",
+                      description: "The typed GitHub adapter proves the absent label by read-back.",
+                    },
+                  );
+                  const result = await input.forgeOperations.execute({
+                    commitmentId,
+                    operation: {
+                      kind: "github-issue-label-remove",
+                      repository: authority.repository,
+                      issueNumber: operationInput.issueNumber,
+                      label: operationInput.label,
                       expectedAccount: authority.account,
                     },
                     timeoutMs: 30_000,

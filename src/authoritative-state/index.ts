@@ -3294,8 +3294,11 @@ function sameSelection(left: ModelSelection, right: ModelSelection | undefined):
   ) {
     return false;
   }
+  if (left.api === "openai-completions") {
+    return right.api === "openai-completions" && left.baseUrl === right.baseUrl;
+  }
   return (
-    left.api !== "openai-completions" ||
-    (right.api === "openai-completions" && left.baseUrl === right.baseUrl)
+    right.api === "openai-codex-responses" &&
+    (left.thinkingLevel ?? "xhigh") === (right.thinkingLevel ?? "xhigh")
   );
 }

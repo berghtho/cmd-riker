@@ -1,3 +1,13 @@
+export type LeadThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export const leadThinkingLevels: readonly LeadThinkingLevel[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
+
 export type ModelSelection =
   | {
       provider: string;
@@ -9,6 +19,8 @@ export type ModelSelection =
       provider: "openai-codex";
       model: string;
       api: "openai-codex-responses";
+      /** Reasoning budget for the Lead turn; omitted means the full "xhigh" budget. */
+      thinkingLevel?: LeadThinkingLevel;
     };
 
 export function assertSupportedModelSelection(selection: ModelSelection): void {

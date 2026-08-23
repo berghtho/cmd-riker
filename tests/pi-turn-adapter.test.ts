@@ -411,6 +411,55 @@ test("production adapter exposes typed Forge operations without provider command
   assert.equal(result.content, "The typed GitHub operation is recorded.");
 });
 
+test("a Forge tool call without commitmentId reaches the minting action", async (t) => {
+  let executed: unknown;
+  const localModel = await startLocalModel((call) => {
+    if (call === 1) {
+      return {
+        toolCall: {
+          id: "github-close-call-1",
+          name: "close_github_issue",
+          arguments: { issueNumber: 891 },
+        },
+      };
+    }
+    return "The issue is closed.";
+  });
+  t.after(() => localModel.close());
+
+  const result = await new PiAgentTurnAdapter().completeTurn({
+    conversation: [],
+    ownerInput: "Close the verified issue.",
+    modelSelection: modelSelection(localModel.baseUrl),
+    forgeActions: {
+      async closeGitHubIssue(input) {
+        executed = input;
+        return {
+          operationAttemptId: "forge-attempt-2",
+          effectIntentId: "forge-effect-2",
+          commitmentId: "minted-work-item",
+          operation: "github-issue-close",
+          provider: "github",
+          status: "succeeded",
+          evidence: [{
+            source: "provider-readback",
+            reference: "https://github.test/issues/891",
+            summary: "The issue is closed by the intended account.",
+            observedAt: "2026-08-23T00:00:00.000Z",
+          }],
+          diagnostics: [],
+          uncertainty: null,
+          startedAt: "2026-08-23T00:00:00.000Z",
+          completedAt: "2026-08-23T00:00:01.000Z",
+        };
+      },
+    },
+  });
+
+  assert.deepEqual(executed, { issueNumber: 891 });
+  assert.equal(result.content, "The issue is closed.");
+});
+
 test("production adapter exposes only configured Forge provider tools", async (t) => {
   let request = "";
   const localModel = await startLocalModel((_call, requestBody) => {

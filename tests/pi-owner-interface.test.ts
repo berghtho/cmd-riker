@@ -126,6 +126,52 @@ test("the Session View panel groups Workers under their Work Item with running t
   assert.ok(workerLine === itemLine + 2, "the Worker renders under its Work Item and status line");
 });
 
+test("the Session View panel stays human-sized: needs-you first, running bold, done collapsed", () => {
+  const now = Date.parse("2026-08-21T12:00:00.000Z");
+  const snapshot: SessionViewSnapshot = {
+    leadAvailability: "available",
+    activeWorkerCount: 1,
+    workers: [
+      {
+        number: 1,
+        workerSessionId: "worker-1",
+        label: "Implement CSV export",
+        status: "running",
+        cancellable: true,
+        workItemId: "item-running",
+      },
+    ],
+    items: [
+      { number: 1, workItemId: "item-done-1", outcome: "Old delivery one", status: "done", needsOwner: false },
+      { number: 2, workItemId: "item-done-2", outcome: "Old delivery two", status: "done", needsOwner: false },
+      {
+        number: 3,
+        workItemId: "item-running",
+        outcome: "CSV export ships",
+        status: "in progress (Worker running)",
+        needsOwner: false,
+      },
+      {
+        number: 4,
+        workItemId: "item-needs-owner",
+        outcome: "Broken import needs a decision",
+        status: "needs you",
+        needsOwner: true,
+      },
+      { number: 5, workItemId: "item-idle", outcome: "Idle refactoring", status: "blocked", needsOwner: false },
+    ],
+    notices: [],
+  };
+
+  const lines = renderSessionPanel(plainTheme, snapshot, now);
+  const rendered = lines.join("\n");
+  const position = (needle: string) => lines.findIndex((line) => line.includes(needle));
+  assert.ok(position("Broken import") < position("CSV export ships"), "needs-you sorts first");
+  assert.ok(position("CSV export ships") < position("Idle refactoring"), "running sorts before idle");
+  assert.doesNotMatch(rendered, /Old delivery/);
+  assert.match(rendered, /2 erledigt · Details mit \/items/);
+});
+
 test("panel ages read plainly at every magnitude", () => {
   const now = Date.parse("2026-08-21T12:00:00.000Z");
   assert.equal(formatAge("2026-08-21T11:59:40.000Z", now), "unter 1 min");

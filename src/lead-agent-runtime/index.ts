@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import type { AuthoritativeState } from "../authoritative-state/index.ts";
 import {
   PiTurnFailure,
@@ -309,6 +312,15 @@ async function completeOwnerTurn(input: {
           resume: (workItemId) => orchestration.resumeCommitment(workItemId, turnId),
           cancel: (workItemId, reason) =>
             orchestration.cancelCommitment(workItemId, turnId, reason),
+          recordOwnerVerdict: async (workItemId, ownerVerdictQuote) => {
+            const targetProjectHeadCommit = await readTargetProjectHead(
+              conversation.targetProject.path,
+            );
+            return orchestration.recordOwnerVerdict(workItemId, turnId, {
+              ownerVerdictQuote,
+              ...(targetProjectHeadCommit ? { targetProjectHeadCommit } : {}),
+            });
+          },
           executeOperation: async (workItemId, operation) => {
             const commitmentId = workItemFor(
               workItemId,
@@ -519,6 +531,24 @@ async function completeOwnerTurn(input: {
     "CMD_RIKER_MODEL_UNAVAILABLE",
     "The configured Model did not complete the turn.",
   );
+}
+
+const execFileAsync = promisify(execFile);
+
+// An Owner verdict is worth recording even when the Target Project head cannot
+// be read; the pin is dropped rather than the acceptance.
+async function readTargetProjectHead(targetProjectPath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", targetProjectPath, "rev-parse", "HEAD"],
+      { timeout: 10_000, windowsHide: true },
+    );
+    const head = stdout.trim();
+    return /^[0-9a-f]{40,64}$/i.test(head) ? head : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function commitmentFingerprint(commitment: {

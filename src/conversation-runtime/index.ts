@@ -52,6 +52,10 @@ export type PiTurnRequest = {
   commitmentActions?: {
     resume(commitmentId: string): void;
     cancel(commitmentId: string, reason: string): void;
+    recordOwnerVerdict(
+      commitmentId: string,
+      ownerVerdictQuote: string,
+    ): Promise<Commitment>;
     executeOperation(
       commitmentId: string | undefined,
       operation: "test",
@@ -343,6 +347,13 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
             (commitment.condition
               ? ` (${commitment.condition.kind}: ${commitment.condition.reason}; next: ${commitment.condition.nextAction})`
               : "") +
+            (commitment.acceptance?.authority === "owner"
+              ? ` (Owner-verified: ${JSON.stringify(commitment.acceptance.ownerVerdictQuote)}` +
+                (commitment.acceptance.targetProjectHeadCommit
+                  ? `; pinned to Target Project commit ${commitment.acceptance.targetProjectHeadCommit}`
+                  : "") +
+                ")"
+              : "") +
             ` - ${commitment.outcome}`,
         )
         .join("\n");
@@ -388,7 +399,10 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           "and durable state. Never ask the Owner for internal IDs, forms, or restatements of what they already " +
           "said; if exactly one genuine product decision is missing, propose a concrete default and ask one " +
           "short question. Use resume_work_item for blocked work the Owner asks to continue and " +
-          "cancel_work_item only on their explicit instruction." +
+          "cancel_work_item only on their explicit instruction. When the Owner explicitly states that a " +
+          "delivered outcome is verified, record that verdict with record_owner_verdict, quoting their " +
+          "sentence; a recorded Owner verdict is durable acceptance — never re-verify that outcome while " +
+          "its pinned Target Project commit is still the head." +
           " When the Owner asks how things stand, answer in their language and in plain terms: name each " +
           "work item by what it is, say what is happening right now, and say what (if anything) you need from " +
           "them. Keep UUIDs and state-machine vocabulary out of everything the Owner sees." +
@@ -776,6 +790,40 @@ function commitmentTools(
             },
           ],
           details: result,
+        };
+      },
+    },
+    {
+      name: "record_owner_verdict",
+      label: "Record Owner Verdict",
+      description:
+        "Record the Owner's explicit conversational verdict that one delivered Work Item outcome is verified. " +
+        "Quote the Owner's own sentence; never infer a verdict from silence or vague approval. " +
+        "CMD Riker pins the verdict to the current Target Project commit, so later turns rely on it " +
+        "instead of re-verifying while that commit is still the head.",
+      parameters: Type.Object({
+        workItemId: Type.String({ minLength: 1 }),
+        ownerVerdictQuote: Type.String({ minLength: 2 }),
+      }),
+      executionMode: "sequential",
+      async execute(_toolCallId, params) {
+        const { workItemId, ownerVerdictQuote } = params as {
+          workItemId: string;
+          ownerVerdictQuote: string;
+        };
+        const commitment = await actions.recordOwnerVerdict(workItemId, ownerVerdictQuote);
+        observer.onMutation();
+        const pin = commitment.acceptance?.authority === "owner"
+          ? commitment.acceptance.targetProjectHeadCommit
+          : undefined;
+        return {
+          content: [{
+            type: "text",
+            text:
+              "The Owner verdict is recorded as durable acceptance" +
+              (pin ? `, pinned to Target Project commit ${pin}.` : "."),
+          }],
+          details: { workItemId, state: commitment.state, targetProjectHeadCommit: pin },
         };
       },
     },

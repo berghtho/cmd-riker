@@ -58,6 +58,12 @@ when risk warrants it, not a lifecycle stage; delivery needs no Owner acceptance
 Order reserves it.
 _Avoid_: Acceptance, Review stage, Prose audit
 
+**Owner Verdict**:
+The Owner's explicit conversational statement that a delivered outcome is verified, recorded as
+durable acceptance and pinned to the Target Project commit it judged. While that commit remains the
+head, the verdict stands and the Lead Agent does not re-verify the outcome.
+_Avoid_: Sign-off, Approval, Acceptance stage
+
 **Native Harness**:
 The installed Codex, Claude, Copilot, Pi, or other environment that owns a Worker Session's native
 agent loop and capabilities.

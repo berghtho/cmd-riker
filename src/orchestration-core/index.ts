@@ -170,6 +170,10 @@ export type Commitment = {
         basis: "owner-verdict";
         ownerTurnId: string;
         acceptedAt: string;
+        ownerVerdictQuote: string;
+        /** The Target Project head commit the Owner's verdict judged. While it
+         * remains the head, the verdict stands and no re-verification is due. */
+        targetProjectHeadCommit?: string;
       };
   outcomeAccount?: {
     content: string;
@@ -661,6 +665,11 @@ export interface OrchestrationCore {
   }): void;
   resumeCommitment(commitmentId: string, ownerTurnId: string): void;
   cancelCommitment(commitmentId: string, ownerTurnId: string, reason: string): void;
+  recordOwnerVerdict(
+    commitmentId: string,
+    ownerTurnId: string,
+    verdict: { ownerVerdictQuote: string; targetProjectHeadCommit?: string },
+  ): Commitment;
   observeLeadResponse(ownerTurnId: string, leadAgentResponse: string): void;
   observeTargetProjectOperationResult(
     commitmentId: string,
@@ -1318,6 +1327,37 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           disposition: { kind: "cancelled", reason, ownerTurnId },
         },
       ]);
+    },
+
+    recordOwnerVerdict(commitmentId, ownerTurnId, verdict) {
+      const commitment = requireControlledCommitment(state, commitmentId, ownerTurnId);
+      assertNonterminalCommitment(commitment);
+      if (!verdict.ownerVerdictQuote.trim()) {
+        throw new Error("An Owner verdict requires the Owner's own words.");
+      }
+      if (
+        verdict.targetProjectHeadCommit !== undefined &&
+        !/^[0-9a-f]{40,64}$/i.test(verdict.targetProjectHeadCommit)
+      ) {
+        throw new Error("An Owner verdict pin requires a full Target Project commit SHA.");
+      }
+      const { condition: _condition, ...unblocked } = commitment;
+      const accepted: Commitment = {
+        ...unblocked,
+        state: "accepted",
+        acceptance: {
+          authority: "owner",
+          basis: "owner-verdict",
+          ownerTurnId,
+          acceptedAt: new Date().toISOString(),
+          ownerVerdictQuote: verdict.ownerVerdictQuote,
+          ...(verdict.targetProjectHeadCommit
+            ? { targetProjectHeadCommit: verdict.targetProjectHeadCommit }
+            : {}),
+        },
+      };
+      state.appendCommitmentSnapshots([accepted]);
+      return accepted;
     },
 
     observeLeadResponse(ownerTurnId, leadAgentResponse) {

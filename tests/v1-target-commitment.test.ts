@@ -233,8 +233,9 @@ test("installed Lead runtime completes one real Target Project Commitment throug
     workerSupervisor: restartedSupervisor,
     targetProjectOperations: restartedOperations,
   }).completeOwnerTurn("Report the accepted outcome after restart.");
-  assert.match(delivered, new RegExp(`Commitment ${commitmentId} accepted by Lead Agent`));
-  assert.match(delivered, /Verification attempt [0-9a-f-]{36} passed/);
+  assert.match(delivered, /Delivered: /);
+  assert.match(delivered, /Verified via the declared Target Project operation\./);
+  assert.doesNotMatch(delivered, new RegExp(commitmentId));
   assert.match(delivered, /Residual uncertainty: none\./);
   state.close();
 

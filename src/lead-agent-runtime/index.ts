@@ -67,12 +67,21 @@ export function commitmentNotice(commitment: {
   id: string;
   outcome: string;
   state: string;
-  condition?: { kind: string };
+  condition?: { kind: string; nextAction?: string; ownerAttention?: string };
 }): string {
+  if (commitment.condition?.ownerAttention) {
+    return (
+      `Work item needs you: ${commitment.outcome}` +
+      (commitment.condition.nextAction ? ` Next: ${commitment.condition.nextAction}` : "")
+    );
+  }
   const status = commitment.state === "accepted" || commitment.state === "awaiting-acceptance"
     ? "delivered"
     : commitment.condition?.kind ?? commitment.state;
-  return `Work item ${status}: ${commitment.outcome}`;
+  return (
+    `Work item ${status}: ${commitment.outcome}` +
+    (commitment.condition?.nextAction ? ` Next: ${commitment.condition.nextAction}` : "")
+  );
 }
 
 async function completeOwnerTurn(input: {

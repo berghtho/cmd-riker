@@ -3039,12 +3039,13 @@ function withOutcomeAccount(commitment: Commitment): Commitment {
   const residualUncertainty = residualFindings.length
     ? residualFindings.map((finding) => finding.summary).join("; ")
     : "none";
+  // The Owner hears plain language; internal identifiers stay out of accounts.
   return {
     ...commitment,
     outcomeAccount: {
       content:
-        `Commitment ${commitment.id} accepted by Lead Agent: ${commitment.outcome} ` +
-        `Verification attempt ${operationEvidence.operationAttemptId} passed via ${source}. ` +
+        `Delivered: ${commitment.outcome} ` +
+        `Verified via ${source}. ` +
         `Residual uncertainty: ${residualUncertainty}.`,
     },
   };

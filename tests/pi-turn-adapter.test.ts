@@ -338,7 +338,7 @@ test("production adapter delegates effectful work only through the bounded assig
   assert.equal(result.content, "The bounded implementation Worker Session is running.");
 });
 
-test("production adapter exposes typed Forge operations without provider commands", async (t) => {
+test("production adapter prefers typed Forge operations and expressly permits manual provider commands", async (t) => {
   let executed: unknown;
   let firstRequest = "";
   const localModel = await startLocalModel((call, requestBody) => {
@@ -408,6 +408,11 @@ test("production adapter exposes typed Forge operations without provider command
   assert.match(firstRequest, /remove_github_issue_label/);
   assert.match(firstRequest, /inspect_azure_subscription/);
   assert.doesNotMatch(firstRequest, /gh api|az account/);
+  assert.match(firstRequest, /Prefer the typed GitHub and Azure tools/);
+  assert.match(firstRequest, /never a cage/);
+  assert.match(firstRequest, /reach the outcome directly with gh or az/);
+  assert.doesNotMatch(firstRequest, /never construct/);
+  assert.doesNotMatch(firstRequest, /do not retry blindly/);
   assert.equal(result.content, "The typed GitHub operation is recorded.");
 });
 

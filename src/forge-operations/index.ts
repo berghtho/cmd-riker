@@ -250,8 +250,28 @@ export interface ForgeOperationState {
   appendForgeOwnerActionNotice(notice: ForgeOwnerActionNotice): void;
 }
 
+export type ForgeEffectReadBack = {
+  applied: boolean;
+  evidence: {
+    source: "provider-readback";
+    reference: string;
+    summary: string;
+    observedAt: string;
+  };
+};
+
 export interface ForgeOperations {
   execute(request: ForgeOperationRequest): Promise<ForgeOperationResult>;
+  /** Re-observes the durable target of one dispatched Forge mutation so an
+   * uncertain effect can settle on provider evidence instead of blocking.
+   * Only deterministically re-observable targets qualify: issue labels and
+   * issue state. A comment's identity dies with the lost dispatch, and Azure
+   * inspections have no mutation to prove. */
+  readBackEffect(input: {
+    target: ForgeOperationTarget;
+    expectedAccount: string;
+    timeoutMs: number;
+  }): Promise<ForgeEffectReadBack>;
 }
 
 export function createForgeOperations(
@@ -286,6 +306,54 @@ export function createForgeOperations(
         );
       }
       return executeGitHubMutation(state, github, request as GitHubMutationRequest);
+    },
+
+    async readBackEffect(input) {
+      const target = input.target;
+      if (target.kind === "github-issue-label") {
+        const readback = await github.readIssueLabels({
+          repository: target.repository,
+          issueNumber: target.issueNumber,
+          timeoutMs: input.timeoutMs,
+        });
+        const applied = readback.labels.every(
+          (label) => label.toLowerCase() !== target.label.toLowerCase(),
+        );
+        return {
+          applied,
+          evidence: {
+            source: "provider-readback",
+            reference: readback.url,
+            summary: applied
+              ? `GitHub issue ${target.repository}#${target.issueNumber} no longer carries label "${target.label}".`
+              : `GitHub issue ${target.repository}#${target.issueNumber} still carries label "${target.label}".`,
+            observedAt: readback.observedAt,
+          },
+        };
+      }
+      if (target.kind === "github-issue-state") {
+        const readback = await github.readIssueState({
+          repository: target.repository,
+          issueNumber: target.issueNumber,
+          timeoutMs: input.timeoutMs,
+        });
+        const applied =
+          readback.state === "closed" &&
+          readback.stateReason === target.stateReason.replace("-", "_") &&
+          readback.closedBy.toLowerCase() === input.expectedAccount.toLowerCase();
+        return {
+          applied,
+          evidence: {
+            source: "provider-readback",
+            reference: readback.url,
+            summary: applied
+              ? `GitHub issue ${target.repository}#${target.issueNumber} is closed (${target.stateReason}) by the intended account.`
+              : `GitHub issue ${target.repository}#${target.issueNumber} is not closed (${target.stateReason}) by the intended account.`,
+            observedAt: readback.observedAt,
+          },
+        };
+      }
+      throw new Error("This Forge effect has no deterministically re-observable target.");
     },
   };
 }

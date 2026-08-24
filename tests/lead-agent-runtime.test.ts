@@ -86,9 +86,11 @@ test("Lead runtime delivers one durable account for an asynchronously accepted C
   });
   const delivered = await runtime.completeOwnerTurn("What completed while I was away?");
 
-  assert.match(delivered, new RegExp(`Commitment ${commitment.id} accepted by Lead Agent`));
-  assert.match(delivered, new RegExp(`Verification attempt ${operation.operationAttemptId}`));
+  assert.match(delivered, /Delivered: The bounded Target Project change passes its declared tests\./);
+  assert.match(delivered, /Verified via the declared Target Project operation\./);
   assert.match(delivered, /Residual uncertainty: none\./);
+  assert.doesNotMatch(delivered, new RegExp(commitment.id));
+  assert.doesNotMatch(delivered, new RegExp(operation.operationAttemptId));
   assert.equal(state.leadAgentResponse(state.latestOwnerTurnId()!), delivered);
   state.close();
 

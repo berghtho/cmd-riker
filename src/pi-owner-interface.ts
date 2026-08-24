@@ -436,14 +436,20 @@ export function renderSessionPanel(
       (age ? theme.fg("dim", ` · seit ${age}`) : "")
     );
   };
-  for (const item of snapshot.items) {
-    const marker = item.needsOwner
-      ? theme.fg("error", "● ")
-      : item.status.startsWith("done")
-        ? theme.fg("success", "● ")
-        : theme.fg("accent", "● ");
+  // The panel stays human-sized: finished work collapses to one line, and
+  // what needs the Owner or is actually moving sorts to the top.
+  const doneItems = snapshot.items.filter((item) => item.status.startsWith("done"));
+  const rank = (item: SessionViewSnapshot["items"][number]): number =>
+    item.needsOwner ? 0 : workersByItem.has(item.workItemId) ? 1 : 2;
+  const activeItems = snapshot.items
+    .filter((item) => !item.status.startsWith("done"))
+    .sort((left, right) => rank(left) - rank(right) || left.number - right.number);
+  for (const item of activeItems) {
+    const running = workersByItem.has(item.workItemId);
+    const marker = item.needsOwner ? theme.fg("error", "● ") : theme.fg("accent", "● ");
     const age = item.since ? formatAge(item.since, now) : "";
-    lines.push(marker + truncate(item.outcome, wide));
+    const outcome = truncate(item.outcome, wide);
+    lines.push(marker + (running ? theme.bold(outcome) : outcome));
     lines.push(
       "  " + theme.fg("dim", `${item.status}${age ? ` · seit ${age}` : ""}`),
     );
@@ -455,6 +461,12 @@ export function renderSessionPanel(
     }
   }
   for (const worker of unattachedWorkers) lines.push(workerLine(worker));
+  if (doneItems.length > 0) {
+    lines.push(
+      theme.fg("success", "✓ ") +
+        theme.fg("dim", `${doneItems.length} erledigt · Details mit /items`),
+    );
+  }
   for (const notice of snapshot.notices) {
     lines.push(theme.fg("error", "! ") + truncate(notice, wide));
   }

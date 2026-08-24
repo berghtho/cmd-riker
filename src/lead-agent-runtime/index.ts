@@ -13,6 +13,7 @@ import {
 import {
   createOrchestrationCore,
   defaultLeadModelRequirements,
+  type OrchestrationCore,
 } from "../orchestration-core/index.ts";
 import {
   createTargetProjectOperations,
@@ -99,6 +100,7 @@ async function completeOwnerTurn(input: {
   const orchestration = createOrchestrationCore(input.state);
   const turnId = input.state.appendOwnerMessage(input.ownerInput);
   input.onOwnerTurnRecorded?.(turnId);
+  await reconcileUncertainForgeEffects(input.state, orchestration, input.forgeOperations);
   const commitmentsBefore = new Map(
     input.state
       .readCommitments()
@@ -543,6 +545,36 @@ async function completeOwnerTurn(input: {
 }
 
 const execFileAsync = promisify(execFile);
+
+// An idempotent Forge mutation whose confirmation was lost must not trap its
+// Commitment: the provider is re-observed and the effect settles on that
+// evidence. A failed re-observation leaves the effect uncertain — honesty
+// over guessing.
+async function reconcileUncertainForgeEffects(
+  state: AuthoritativeState,
+  orchestration: OrchestrationCore,
+  forgeOperations: ForgeOperations,
+): Promise<void> {
+  for (const effect of state.readEffectIntents()) {
+    if (effect.kind !== "forge-operation" || effect.status !== "unknown") continue;
+    const attempt = state.readForgeOperationAttempt(effect.forgeOperationAttemptId);
+    if (!attempt) continue;
+    try {
+      const readBack = await forgeOperations.readBackEffect({
+        target: attempt.target,
+        expectedAccount: attempt.expectedAccount,
+        timeoutMs: 30_000,
+      });
+      orchestration.reconcileForgeEffect({
+        effectIntentId: effect.id,
+        applied: readBack.applied,
+        evidence: readBack.evidence,
+      });
+    } catch {
+      // The effect stays uncertain until a read-back succeeds.
+    }
+  }
+}
 
 // An Owner verdict is worth recording even when the Target Project head cannot
 // be read; the pin is dropped rather than the acceptance.

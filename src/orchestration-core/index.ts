@@ -663,6 +663,11 @@ export interface OrchestrationCore {
     disposition: EffectReconciliation["disposition"];
     evidence: EffectReconciliation["evidence"];
   }): void;
+  reconcileForgeEffect(input: {
+    effectIntentId: string;
+    applied: boolean;
+    evidence: EffectReconciliation["evidence"];
+  }): void;
   resumeCommitment(commitmentId: string, ownerTurnId: string): void;
   cancelCommitment(commitmentId: string, ownerTurnId: string, reason: string): void;
   recordOwnerVerdict(
@@ -1250,6 +1255,61 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           reconciledBy: "lead-agent",
         },
       });
+    },
+
+    reconcileForgeEffect(input) {
+      const effect = state.readEffectIntent(input.effectIntentId);
+      if (effect?.kind !== "forge-operation" || effect.status !== "unknown") {
+        throw new Error("Only an uncertain Forge effect can settle on provider read-back evidence.");
+      }
+      const disposition = input.applied ? "confirmed-applied" : "confirmed-not-applied";
+      assertEffectEvidenceSupportsDisposition(disposition, input.evidence);
+      state.reconcileEffectIntent({
+        ...effect,
+        status: "reconciled",
+        reconciliation: {
+          disposition,
+          evidence: input.evidence,
+          reconciledAt: new Date().toISOString(),
+          reconciledBy: "lead-agent",
+        },
+      });
+      const commitment = state.readCommitment(effect.commitmentId);
+      if (!commitment || ["accepted", "cancelled", "superseded"].includes(commitment.state)) {
+        return;
+      }
+      const { condition: _condition, ...unconditioned } = commitment;
+      if (!input.applied) {
+        // The mutation provably never landed; the Commitment is retryable again.
+        state.appendCommitmentSnapshots([{ ...unconditioned, state: "active" }]);
+        return;
+      }
+      const forgeCriteria = commitment.criteria.filter(
+        (criterion) => criterion.kind === "forge-operation",
+      );
+      const verification = {
+        passed: true,
+        verifiedAt: new Date().toISOString(),
+        evidence: forgeCriteria.map((criterion) => ({
+          id: randomUUID(),
+          criterionId: criterion.id,
+          description: `Provider read-back settled the uncertain Forge effect as applied: ${input.evidence.summary}`,
+          source: "forge-operation-result" as const,
+          operationAttemptId: effect.forgeOperationAttemptId,
+        })),
+      };
+      state.appendCommitmentSnapshots([
+        withOutcomeAccount({
+          ...unconditioned,
+          state: "accepted",
+          verification,
+          acceptance: {
+            authority: "lead-agent",
+            basis: "objective-criteria",
+            acceptedAt: new Date().toISOString(),
+          },
+        }),
+      ]);
     },
 
     resumeCommitment(commitmentId, ownerTurnId) {

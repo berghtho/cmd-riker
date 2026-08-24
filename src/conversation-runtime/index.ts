@@ -617,21 +617,22 @@ function forgeTools(
       name: "comment_on_github_issue",
       label: "Comment on GitHub Issue",
       description:
-        "Create one bounded GitHub issue comment through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back.",
+        "Create one bounded GitHub issue comment through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back. " +
+        "When commitmentId is omitted, CMD Riker records the covering Work Item automatically.",
       parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
+        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
         issueNumber: Type.Integer({ minimum: 1 }),
         body: Type.String({ minLength: 1, maxLength: 65_536 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const { commitmentId, issueNumber, body } = params as {
-          commitmentId: string;
+          commitmentId?: string;
           issueNumber: number;
           body: string;
         };
         const result = await actions.commentOnGitHubIssue!(
-          { commitmentId, issueNumber, body },
+          { ...(commitmentId ? { commitmentId } : {}), issueNumber, body },
         );
         observer.onMutation();
         return {
@@ -644,9 +645,10 @@ function forgeTools(
       name: "close_github_issue",
       label: "Close GitHub Issue",
       description:
-        "Close one GitHub issue through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back of the closed state. Close an issue only after its durable resolution comment exists.",
+        "Close one GitHub issue through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back of the closed state. Close an issue only after its durable resolution comment exists. " +
+        "When commitmentId is omitted, CMD Riker records the covering Work Item automatically.",
       parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
+        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
         issueNumber: Type.Integer({ minimum: 1 }),
         stateReason: Type.Optional(Type.Union([
           Type.Literal("completed"),
@@ -656,12 +658,12 @@ function forgeTools(
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const { commitmentId, issueNumber, stateReason } = params as {
-          commitmentId: string;
+          commitmentId?: string;
           issueNumber: number;
           stateReason?: "completed" | "not-planned";
         };
         const result = await actions.closeGitHubIssue!({
-          commitmentId,
+          ...(commitmentId ? { commitmentId } : {}),
           issueNumber,
           ...(stateReason ? { stateReason } : {}),
         });
@@ -676,20 +678,25 @@ function forgeTools(
       name: "remove_github_issue_label",
       label: "Remove GitHub Issue Label",
       description:
-        "Remove one label from one GitHub issue through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back of the issue's labels.",
+        "Remove one label from one GitHub issue through the typed adapter, after proving executable, authentication, intended account, repository, and write capability. The durable result is settled only by remote read-back of the issue's labels. " +
+        "When commitmentId is omitted, CMD Riker records the covering Work Item automatically.",
       parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
+        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
         issueNumber: Type.Integer({ minimum: 1 }),
         label: Type.String({ minLength: 1, maxLength: 100 }),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
         const { commitmentId, issueNumber, label } = params as {
-          commitmentId: string;
+          commitmentId?: string;
           issueNumber: number;
           label: string;
         };
-        const result = await actions.removeGitHubIssueLabel!({ commitmentId, issueNumber, label });
+        const result = await actions.removeGitHubIssueLabel!({
+          ...(commitmentId ? { commitmentId } : {}),
+          issueNumber,
+          label,
+        });
         observer.onMutation();
         return {
           content: [{ type: "text", text: forgeResultText(result) }],
@@ -701,13 +708,14 @@ function forgeTools(
       name: "inspect_azure_subscription",
       label: "Inspect Azure Subscription",
       description:
-        "Inspect one Azure subscription through the typed non-interactive adapter after proving executable, intended account, target, and read capability. No secret value is accepted or returned.",
+        "Inspect one Azure subscription through the typed non-interactive adapter after proving executable, intended account, target, and read capability. No secret value is accepted or returned. " +
+        "When commitmentId is omitted, CMD Riker records the covering Work Item automatically.",
       parameters: Type.Object({
-        commitmentId: Type.String({ minLength: 1 }),
+        commitmentId: Type.Optional(Type.String({ minLength: 1 })),
       }),
       executionMode: "sequential",
       async execute(_toolCallId, params) {
-        const { commitmentId } = params as { commitmentId: string };
+        const { commitmentId } = params as { commitmentId?: string };
         const result = await actions.inspectAzureSubscription!(commitmentId);
         observer.onMutation();
         return {

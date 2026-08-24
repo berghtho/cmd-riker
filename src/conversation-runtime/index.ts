@@ -438,11 +438,13 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
            (request.forgeActions?.commentOnGitHubIssue || request.forgeActions?.closeGitHubIssue ||
              request.forgeActions?.removeGitHubIssueLabel || request.forgeActions?.inspectAzureSubscription
              ? " Prefer the typed GitHub and Azure tools for their declared semantic operations — they " +
-               "leave durable, restart-safe evidence. Constructing gh or az commands with your native " +
-               "tools is expressly permitted when no typed operation covers the need or a typed " +
-               "operation is stuck; such a manual effect bypasses the durable effect ledger, so name it " +
-               "plainly in your reply with what you observed. " +
-               "Treat an unavailable result as one Owner action and do not retry blindly."
+               "leave durable, restart-safe evidence. They are never a cage: when a typed operation " +
+               "fails, is stuck, or covers nothing, verify the real provider state with your native " +
+               "tools and reach the outcome directly with gh or az under your own Command Authority. " +
+               "A duplicated idempotent effect is acceptable; an unverified claim is not — read back " +
+               "what you changed and name any manual effect plainly in your reply, since it bypasses " +
+               "the durable effect ledger. Reserve Owner actions for what genuinely only the Owner can " +
+               "do, such as provider logins."
              : "") +
            (commitmentContext ? `\nCurrent Work Items:\n${commitmentContext}` : "") +
            (request.authorityActions

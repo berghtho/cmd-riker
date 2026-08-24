@@ -409,8 +409,10 @@ test("production adapter prefers typed Forge operations and expressly permits ma
   assert.match(firstRequest, /inspect_azure_subscription/);
   assert.doesNotMatch(firstRequest, /gh api|az account/);
   assert.match(firstRequest, /Prefer the typed GitHub and Azure tools/);
-  assert.match(firstRequest, /expressly permitted/);
+  assert.match(firstRequest, /never a cage/);
+  assert.match(firstRequest, /reach the outcome directly with gh or az/);
   assert.doesNotMatch(firstRequest, /never construct/);
+  assert.doesNotMatch(firstRequest, /do not retry blindly/);
   assert.equal(result.content, "The typed GitHub operation is recorded.");
 });
 

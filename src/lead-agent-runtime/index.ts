@@ -507,6 +507,7 @@ async function completeOwnerTurn(input: {
           ...(index > 0
             ? { selectionReason: "fallback-after-ineligible-candidate" as const }
             : {}),
+          ...(response.metrics ? { turnMetrics: response.metrics } : {}),
         },
       );
       orchestration.observeLeadResponse(turnId, durableResponse);

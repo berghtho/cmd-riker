@@ -8,6 +8,19 @@ export const leadThinkingLevels: readonly LeadThinkingLevel[] = [
   "xhigh",
 ];
 
+/**
+ * What one completed Lead turn actually ran on: the attributed Model, the
+ * effective reasoning budget, and the context the turn occupied. Context
+ * numbers are measured from the provider's usage report, never estimated.
+ */
+export type LeadTurnMetrics = {
+  provider: string;
+  model: string;
+  thinkingLevel?: LeadThinkingLevel;
+  contextTokens: number;
+  contextWindow: number | null;
+};
+
 export type ModelSelection =
   | {
       provider: string;

@@ -39,6 +39,7 @@ import {
 } from "../orchestration-core/index.ts";
 import {
   assertSupportedModelSelection,
+  type LeadTurnMetrics,
   type ModelSelection,
 } from "../model-selection.ts";
 import type { TargetProjectOperationResult } from "../target-project-operations/index.ts";
@@ -152,7 +153,9 @@ export interface PiTurnAdapter {
     modelSelection: ModelSelection,
     requirements?: LeadModelRequirements,
   ): Promise<ModelCandidateValidation>;
-  completeTurn(request: PiTurnRequest): Promise<{ content: string }>;
+  completeTurn(
+    request: PiTurnRequest,
+  ): Promise<{ content: string; metrics?: LeadTurnMetrics }>;
 }
 
 export class PiTurnFailure extends Error {
@@ -314,7 +317,9 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
     };
   }
 
-  async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
+  async completeTurn(
+    request: PiTurnRequest,
+  ): Promise<{ content: string; metrics?: LeadTurnMetrics }> {
     let commitmentMutationApplied = false;
     try {
       assertSupportedModelSelection(request.modelSelection);
@@ -544,7 +549,19 @@ export class PiAgentTurnAdapter implements PiTurnAdapter {
           commitmentMutationApplied,
         );
       }
-      return { content };
+      // Context occupancy is measured from the provider's own usage report:
+      // prompt tokens (fresh + cache-served) plus the produced output.
+      const usage = response.usage;
+      const metrics: LeadTurnMetrics = {
+        provider: request.modelSelection.provider,
+        model: request.modelSelection.model,
+        ...(request.modelSelection.api === "openai-codex-responses"
+          ? { thinkingLevel: request.modelSelection.thinkingLevel ?? ("xhigh" as const) }
+          : {}),
+        contextTokens: usage.input + usage.cacheRead + usage.output,
+        contextWindow: execution.model.contextWindow ?? null,
+      };
+      return { content, metrics };
     } catch (error) {
       if (error instanceof PiTurnFailure) throw error;
       throw new PiTurnFailure(

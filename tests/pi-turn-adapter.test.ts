@@ -41,7 +41,12 @@ async function exerciseContract(
     ownerInput: "What did I say?",
     modelSelection: selection,
   });
-  assert.deepEqual(result, { content: expected });
+  assert.equal(result.content, expected);
+  if (result.metrics) {
+    assert.equal(result.metrics.provider, selection.provider);
+    assert.equal(result.metrics.model, selection.model);
+    assert.ok(result.metrics.contextTokens >= 0);
+  }
 }
 
 test("deterministic adapter satisfies the Pi turn contract", async () => {

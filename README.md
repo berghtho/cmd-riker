@@ -150,6 +150,9 @@ An uninitialized installation or development state directory requires a secret-f
 ```json
 {
   "targetProject": { "path": "C:\\path\\to\\target-project" },
+  "projects": [
+    { "name": "second-project", "path": "C:\\path\\to\\second-project" }
+  ],
   "forgeAuthorities": {
     "github": { "account": "owner-login", "repository": "owner/repository" },
     "azure": {

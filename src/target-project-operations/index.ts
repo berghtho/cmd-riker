@@ -200,7 +200,9 @@ export interface CheckoutInspector {
 }
 
 interface TargetProjectOperationState {
-  readOwnerConversation(): { targetProject: { path: string } } | undefined;
+  readOwnerConversation():
+    | { targetProject: { path: string }; projects?: Array<{ name: string; path: string }> }
+    | undefined;
   readCommitment(commitmentId: string): Commitment | undefined;
   startTargetProjectOperation(
     attempt: TargetProjectOperationAttempt,
@@ -550,9 +552,13 @@ async function discoverOperation(
   artifacts: string[];
   discovery: Extract<TargetProjectOperationDiscovery, { status: "verified" }>;
 }> {
-  const configured = state.readOwnerConversation()?.targetProject.path;
-  if (!configured || !samePath(configured, request.checkout)) {
-    throw new Error("The operation checkout is not the active Target Project.");
+  const ownerConfiguration = state.readOwnerConversation();
+  const configured = [
+    ...(ownerConfiguration ? [ownerConfiguration.targetProject.path] : []),
+    ...(ownerConfiguration?.projects ?? []).map((project) => project.path),
+  ].find((path) => samePath(path, request.checkout));
+  if (!configured) {
+    throw new Error("The operation checkout is not a configured project.");
   }
   const commitment = state.readCommitment(request.commitmentId);
   if (!commitment || commitment.state !== "active" || commitment.condition) {

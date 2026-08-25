@@ -85,8 +85,15 @@ Providers, and Native Harnesses the Lead Agent may choose for itself and for Del
 _Avoid_: Model configuration, Router configuration
 
 **Target Project**:
-The project whose work the Lead Agent coordinates. Exactly one is active in the first product.
+The default configured project whose work the Lead Agent coordinates. Further named projects may
+be configured beside it; each Owner Session works in exactly one configured project.
 _Avoid_: Workspace, Client repository
+
+**Owner Session**:
+One durable Owner conversation thread with the Lead Agent, named automatically from its first
+prompt and bound to one configured project. Worker Sessions keep running regardless of which Owner
+Session is in front.
+_Avoid_: Chat tab, Thread, Window
 
 **Execution Checkout**:
 An isolated project checkout used as the sole write location for one effectful Worker Session while

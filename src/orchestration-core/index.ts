@@ -23,7 +23,10 @@ export type WorkerHarnessSetting = {
 };
 
 export type OwnerConfiguration = {
+  /** The default project; `projects` may add further local source repositories. */
   targetProject: { path: string };
+  /** Additional named projects beside the default Target Project. */
+  projects?: Array<{ name: string; path: string }>;
   forgeAuthorities?: {
     github?: { account: string; repository: string };
     azure?: { account: string; subscriptionId: string };
@@ -1615,9 +1618,16 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (!input.modelSelection.model.trim() || !input.modelPolicyRevision.trim()) {
         throw new Error("A Worker assignment requires a Model Policy.");
       }
-      const configuredPath = state.readOwnerConversation()?.targetProject.path;
-      if (!configuredPath || !samePath(configuredPath, input.targetProjectPath)) {
-        throw new Error("An effectful Worker requires the active Target Project checkout.");
+      // Any configured project is a legitimate effectful target; the matched
+      // path anchors every later checkout and verification bound of this
+      // delegation.
+      const ownerConfiguration = state.readOwnerConversation();
+      const configuredPath = [
+        ...(ownerConfiguration ? [ownerConfiguration.targetProject.path] : []),
+        ...(ownerConfiguration?.projects ?? []).map((project) => project.path),
+      ].find((path) => samePath(path, input.targetProjectPath));
+      if (!configuredPath) {
+        throw new Error("An effectful Worker requires a configured project checkout.");
       }
       const commitment = state.readCommitment(input.commitmentId);
       if (!commitment || commitment.state !== "active" || commitment.condition) {

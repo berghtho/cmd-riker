@@ -7,7 +7,7 @@ implementation to native Worker Sessions, monitors their work, and repairs its o
 system when necessary.
 
 The Owner-facing product is a TypeScript/Node modular monolith using
-SQLite WAL state and pinned Pi `0.84.2` libraries behind CMD-Riker-owned seams.
+SQLite WAL state and pinned Pi `0.84.3` libraries behind CMD-Riker-owned seams.
 
 ## Development
 

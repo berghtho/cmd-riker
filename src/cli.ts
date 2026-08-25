@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -52,9 +53,11 @@ import {
 } from "./lead-agent-runtime/index.ts";
 import { runPiOwnerInterface } from "./pi-owner-interface.ts";
 import {
+  parseOwnerSessionControl,
   parseSessionViewControl,
   parseStandingOrderControl,
   projectSessionView,
+  renderOwnerSessions,
   renderSessionItems,
   renderSessionView,
   renderSessionWorkers,
@@ -244,12 +247,16 @@ async function main(): Promise<void> {
     };
     const workerSupervisors = await availableWorkerSupervisors(state, conversation, ownerNotices);
     for (const supervisor of Object.values(workerSupervisors)) await supervisor.recover();
+    // A restarted interface resumes the session the Owner spoke to last.
+    const sessionContext: OwnerSessionContext = {
+      activeSessionId: state.latestActiveOwnerSessionId(),
+    };
     // A Worker notice implies changed session state; hosted clients keep their
     // structured Session View current from the same transcript stream.
     const deliverNotice = ownerNotices.deliver;
     ownerNotices.deliver = (content) => {
       deliverNotice(content);
-      emitSessionData(state, workerSupervisors);
+      emitSessionData(state, workerSupervisors, sessionContext);
     };
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
@@ -259,6 +266,7 @@ async function main(): Promise<void> {
         conversation.targetProject.path,
         workerSupervisors,
         ownerNotices,
+        sessionContext,
       );
     } else {
       await runScriptableConversation(
@@ -266,6 +274,7 @@ async function main(): Promise<void> {
         adapter,
         conversation.targetProject.path,
         workerSupervisors,
+        sessionContext,
       );
     }
   } finally {
@@ -278,10 +287,11 @@ async function runScriptableConversation(
   adapter: PiTurnAdapter,
   targetProjectPath: string,
   workerSupervisors: WorkerSupervisors,
+  sessionContext: OwnerSessionContext,
 ): Promise<void> {
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
-  process.stdout.write(`${currentSessionView(state, workerSupervisors)}\n`);
-  emitSessionData(state, workerSupervisors);
+  process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
+  emitSessionData(state, workerSupervisors, sessionContext);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInput of lines) {
     if (!ownerInput.trim()) continue;
@@ -298,19 +308,24 @@ async function runScriptableConversation(
             process.stdout.write(`CMD_RIKER_OWNER_RECORDED:${turnId}\n`);
           }
         : undefined,
+      sessionContext,
     );
     if (hosted && !ownerTurnRecorded) {
       process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
     }
     process.stdout.write(`${output.source}: ${output.content}\n`);
-    process.stdout.write(`${currentSessionView(state, workerSupervisors)}\n`);
-    emitSessionData(state, workerSupervisors);
+    process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
+    emitSessionData(state, workerSupervisors, sessionContext);
   }
 }
 
-function emitSessionData(state: AuthoritativeState, workerSupervisors: WorkerSupervisors): void {
+function emitSessionData(
+  state: AuthoritativeState,
+  workerSupervisors: WorkerSupervisors,
+  sessionContext?: OwnerSessionContext,
+): void {
   process.stdout.write(
-    `CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionViewSnapshot(state, workerSupervisors))}\n`,
+    `CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionViewSnapshot(state, workerSupervisors, "available", sessionContext))}\n`,
   );
 }
 
@@ -320,8 +335,9 @@ function runInteractiveConversation(
   targetProjectPath: string,
   workerSupervisors: WorkerSupervisors,
   ownerNotices: OwnerNoticeSink,
+  sessionContext: OwnerSessionContext,
 ): Promise<void> {
-  const conversation = state.readOwnerConversation();
+  const conversation = state.readOwnerConversation(sessionContext.activeSessionId);
   const transcript = (conversation?.messages ?? []).map((message) => ({
     source: message.role,
     content: message.content,
@@ -335,9 +351,9 @@ function runInteractiveConversation(
     targetProjectPath,
     transcript,
     completeOwnerInput: (ownerInput) =>
-      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisors),
-    readSessionView: () => currentSessionView(state, workerSupervisors),
-    readSessionData: () => sessionViewSnapshot(state, workerSupervisors),
+      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisors, undefined, sessionContext),
+    readSessionView: () => currentSessionView(state, workerSupervisors, sessionContext),
+    readSessionData: () => sessionViewSnapshot(state, workerSupervisors, "available", sessionContext),
     subscribeNotices: (listener) => {
       const previous = ownerNotices.deliver;
       ownerNotices.deliver = listener;
@@ -353,12 +369,16 @@ type OwnerInteractionOutput = {
   content: string;
 };
 
+/** Which Owner Session the Lead is currently serving; switching mutates it in place. */
+type OwnerSessionContext = { activeSessionId: string };
+
 async function completeOwnerInteraction(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   ownerInput: string,
   workerSupervisors: WorkerSupervisors = {},
   onOwnerTurnRecorded?: (turnId: string) => void,
+  sessionContext?: OwnerSessionContext,
 ): Promise<OwnerInteractionOutput> {
   if (!/^\/session\s+/i.test(ownerInput)) {
     return {
@@ -368,10 +388,35 @@ async function completeOwnerInteraction(
         adapter,
         workerSupervisors,
       })
-        .completeOwnerTurn(ownerInput, onOwnerTurnRecorded),
+        .completeOwnerTurn(ownerInput, onOwnerTurnRecorded, sessionContext?.activeSessionId),
     };
   }
-  const snapshot = sessionViewSnapshot(state, workerSupervisors);
+  const snapshot = sessionViewSnapshot(state, workerSupervisors, "available", sessionContext);
+  const sessionAction = parseOwnerSessionControl(snapshot.sessions ?? [], ownerInput);
+  if (sessionAction?.kind === "list-sessions") {
+    return {
+      source: "Session View",
+      content: renderOwnerSessions(snapshot.sessions ?? []),
+    };
+  }
+  if (sessionAction?.kind === "new-session" && sessionContext) {
+    const sessionId = randomUUID();
+    state.appendOwnerSessionSnapshots([
+      { id: sessionId, name: "", createdAt: new Date().toISOString(), state: "active" },
+    ]);
+    sessionContext.activeSessionId = sessionId;
+    return {
+      source: "Session View",
+      content: "New session started. Its first prompt names it.",
+    };
+  }
+  if (sessionAction?.kind === "use-session" && sessionContext) {
+    sessionContext.activeSessionId = sessionAction.sessionId;
+    return {
+      source: "Session View",
+      content: `Switched to session "${sessionAction.name || "(unnamed)"}". New turns continue there.`,
+    };
+  }
   if (/^\/session\s+items\s*$/i.test(ownerInput)) {
     return {
       source: "Session View",
@@ -437,19 +482,24 @@ async function completeOwnerInteraction(
 function currentSessionView(
   state: AuthoritativeState,
   workerSupervisors: WorkerSupervisors = {},
+  sessionContext?: OwnerSessionContext,
   leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
 ): string {
-  return renderSessionView(sessionViewSnapshot(state, workerSupervisors, leadAvailability));
+  return renderSessionView(
+    sessionViewSnapshot(state, workerSupervisors, leadAvailability, sessionContext),
+  );
 }
 
 function sessionViewSnapshot(
   state: AuthoritativeState,
   workerSupervisors: WorkerSupervisors = {},
   leadAvailability: SessionViewSnapshot["leadAvailability"] = "available",
+  sessionContext?: OwnerSessionContext,
 ): SessionViewSnapshot {
   return projectSessionView(state, {
     leadAvailability,
     cancellationAvailable: Object.keys(workerSupervisors).length > 0,
+    ...(sessionContext ? { activeSessionId: sessionContext.activeSessionId } : {}),
   });
 }
 

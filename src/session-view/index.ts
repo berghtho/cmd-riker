@@ -9,6 +9,7 @@ import type {
 import type { EffectIntent } from "../target-project-operations/index.ts";
 import type { ForgeOwnerActionNotice } from "../forge-operations/index.ts";
 import type { LeadTurnMetrics } from "../model-selection.ts";
+import type { OwnerSessionView } from "../authoritative-state/index.ts";
 
 export type SessionViewWorker = {
   number: number;
@@ -41,6 +42,17 @@ export type SessionViewSnapshot = {
   lead?: LeadTurnMetrics;
   /** Every recorded Standing Order, current ones first; expiry is derived, never stored. */
   standingOrders?: StandingOrderViewEntry[];
+  /** Owner Sessions, most recently active first; `current` marks the one the Lead is serving. */
+  sessions?: OwnerSessionViewEntry[];
+};
+
+export type OwnerSessionViewEntry = {
+  number: number;
+  sessionId: string;
+  name: string;
+  current: boolean;
+  lastActiveAt: string;
+  state: "active" | "archived";
 };
 
 export type StandingOrderViewEntry = {
@@ -71,6 +83,7 @@ export interface SessionViewState {
   commitmentRecordedAt?(commitmentId: string): string | undefined;
   readLatestLeadTurnMetrics?(): LeadTurnMetrics | undefined;
   readStandingOrders?(): StandingOrder[];
+  readOwnerSessions?(): OwnerSessionView[];
 }
 
 export function projectSessionView(
@@ -78,6 +91,7 @@ export function projectSessionView(
   options: {
     leadAvailability?: SessionViewSnapshot["leadAvailability"];
     cancellationAvailable?: boolean;
+    activeSessionId?: string;
   } = {},
 ): SessionViewSnapshot {
   const cancellationAvailable = options.cancellationAvailable ?? true;
@@ -142,6 +156,14 @@ export function projectSessionView(
   }
 
   const lead = state.readLatestLeadTurnMetrics?.();
+  const sessions = state.readOwnerSessions?.().map((session, index) => ({
+    number: index + 1,
+    sessionId: session.id,
+    name: session.name,
+    current: session.id === options.activeSessionId,
+    lastActiveAt: session.lastActiveAt,
+    state: session.state,
+  }));
   const standingOrders = state.readStandingOrders
     ? projectStandingOrders(state.readStandingOrders())
     : undefined;
@@ -159,7 +181,40 @@ export function projectSessionView(
     notices,
     ...(lead ? { lead } : {}),
     ...(standingOrders ? { standingOrders } : {}),
+    ...(sessions ? { sessions } : {}),
   };
+}
+
+export function renderOwnerSessions(entries: OwnerSessionViewEntry[]): string {
+  if (entries.length === 0) return "No sessions yet. Start one with /session new.";
+  return entries
+    .map(
+      (entry) =>
+        `${entry.number}. ${entry.current ? "* " : ""}${entry.name || "(unnamed)"}` +
+        (entry.state === "archived" ? " | archived" : "") +
+        (entry.current ? "" : ` | /session use ${entry.number}`),
+    )
+    .join("\n");
+}
+
+export function parseOwnerSessionControl(
+  entries: OwnerSessionViewEntry[],
+  input: string,
+):
+  | { kind: "list-sessions" }
+  | { kind: "new-session" }
+  | { kind: "use-session"; sessionId: string; name: string }
+  | undefined {
+  if (/^\/session\s+list\s*$/i.test(input)) return { kind: "list-sessions" };
+  if (/^\/session\s+new\s*$/i.test(input)) return { kind: "new-session" };
+  const use = /^\/session\s+use\s+(\d+)\s*$/i.exec(input);
+  if (!use) return undefined;
+  const entry = entries.find(
+    (candidate) => candidate.number === Number(use[1]) && candidate.state === "active",
+  );
+  return entry
+    ? { kind: "use-session", sessionId: entry.sessionId, name: entry.name }
+    : undefined;
 }
 
 export function projectStandingOrders(

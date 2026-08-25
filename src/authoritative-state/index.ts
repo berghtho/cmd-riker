@@ -112,6 +112,36 @@ export type OwnerConversation = OwnerConfiguration & {
   messages: ConversationMessage[];
 };
 
+/**
+ * One durable Owner conversation thread. Messages recorded before sessions
+ * existed belong to the primary session. `lastActiveAt` is derived from the
+ * session's messages, never stored, so routine turns do not grow the journal.
+ */
+export type OwnerSession = {
+  id: string;
+  /** Empty until the first prompt names the session. */
+  name: string;
+  createdAt: string;
+  state: "active" | "archived";
+};
+
+export type OwnerSessionView = OwnerSession & { lastActiveAt: string };
+
+export const primaryOwnerSessionId = "primary";
+
+/**
+ * A session is named by its first prompt, the way Claude Code, Codex, and
+ * Copilot title theirs: the prompt itself, compacted and cut at a word
+ * boundary — no manual naming step.
+ */
+export function deriveSessionName(ownerInput: string): string {
+  const compact = ownerInput.replace(/\s+/g, " ").trim();
+  if (compact.length <= 48) return compact;
+  const cut = compact.slice(0, 48);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${cut.slice(0, lastSpace > 24 ? lastSpace : 48).trimEnd()}…`;
+}
+
 export type AuthoritativeStateRecovery = {
   version: 1;
   phase: "damaged-state" | "post-backup-reconciliation";
@@ -180,11 +210,16 @@ export interface AuthoritativeState {
   replaceOwnerConfiguration(configuration: OwnerConfiguration): void;
   knownModelPolicyRevisions(): string[];
   commitmentRecordedAt(commitmentId: string): string | undefined;
-  readOwnerConversation(): OwnerConversation | undefined;
+  readOwnerConversation(sessionId?: string): OwnerConversation | undefined;
   ownerMessage(ownerTurnId: string): string | undefined;
   latestOwnerTurnId(): string | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
-  appendOwnerMessage(content: string): string;
+  appendOwnerMessage(content: string, sessionId?: string): string;
+  /** Every Owner Session, most recently active first; the primary session is synthesized for pre-session journals. */
+  readOwnerSessions(): OwnerSessionView[];
+  appendOwnerSessionSnapshots(snapshots: OwnerSession[]): void;
+  /** The session the Owner spoke to last — the one a restarted interface resumes. */
+  latestActiveOwnerSessionId(): string;
   recordOwnerInteractionDisposition(
     ownerTurnId: string,
     kind: "session-view-control",
@@ -316,6 +351,7 @@ type FactDraft =
       value: {
         content: string;
         turnId: string;
+        sessionId?: string;
         modelSelection: ModelSelection;
         modelPolicyRevision: string;
       };
@@ -325,12 +361,15 @@ type FactDraft =
       value: {
         content: string;
         turnId: string;
+        sessionId?: string;
         modelSelection: ModelSelection;
         modelPolicyRevision: string;
         selectionReason?: "fallback-after-ineligible-candidate";
+        turnMetrics?: LeadTurnMetrics;
       };
     }
   | { kind: "commitment.snapshot"; value: Commitment }
+  | { kind: "owner-session.snapshot"; value: OwnerSession }
   | { kind: "lead-turn-attempt.snapshot"; value: LeadTurnAttempt }
   | { kind: "worker-session.snapshot"; value: WorkerSession }
   | { kind: "worker-execution-attempt.snapshot"; value: WorkerExecutionAttempt }
@@ -357,6 +396,7 @@ type TransitionKind =
   | "owner.forge-authorities-reconfigured"
   | "owner-conversation.owner-message-recorded"
   | "owner-conversation.lead-agent-message-recorded"
+  | `owner-session.${OwnerSession["state"]}`
   | `commitment.${Commitment["state"]}`
   | `lead-turn-attempt.${LeadTurnAttempt["status"]}`
   | `worker-session.${WorkerSession["state"]}`
@@ -622,7 +662,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-
+      | "owner-session.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
@@ -651,7 +691,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-
+      | "owner-session.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
@@ -676,7 +716,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-
+      | "owner-session.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
@@ -687,7 +727,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-
+      | "owner-session"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
@@ -698,7 +738,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-
+      | "owner-session"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
@@ -762,7 +802,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt.snapshot"
       | "worker-question.snapshot"
       | "standing-order.snapshot"
-
+      | "owner-session.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
@@ -771,7 +811,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-
+      | "owner-session"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
@@ -780,7 +820,7 @@ export function openAuthoritativeState(
       | "worker-execution-attempt"
       | "worker-question"
       | "standing-order"
-
+      | "owner-session"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
@@ -1109,9 +1149,11 @@ export function openAuthoritativeState(
       ))];
     },
 
-    readOwnerConversation() {
+    readOwnerConversation(sessionId = primaryOwnerSessionId) {
       const configuration = readConfigurationRow()?.value;
       if (!configuration) return undefined;
+      // Messages recorded before sessions existed carry no sessionId and
+      // belong to the primary session.
       const rows = database
         .prepare(`
           SELECT ROW_NUMBER() OVER (ORDER BY sequence) AS sequence, id, kind, value_json
@@ -1120,9 +1162,10 @@ export function openAuthoritativeState(
              'owner-conversation.owner-message',
              'owner-conversation.lead-agent-message'
            )
+           AND COALESCE(json_extract(value_json, '$.sessionId'), 'primary') = ?
            ORDER BY sequence
         `)
-        .all() as JournalRow[];
+        .all(sessionId) as JournalRow[];
       const messages: ConversationMessage[] = rows.map((row) => {
         const value = JSON.parse(row.value_json) as {
           content: string;
@@ -1187,9 +1230,27 @@ export function openAuthoritativeState(
       };
     },
 
-    appendOwnerMessage(content) {
+    appendOwnerMessage(content, sessionId = primaryOwnerSessionId) {
       const configuration = readConfigurationRow()?.value;
       if (!configuration) throw new Error("Authoritative state is not configured.");
+      const session = readCurrentSnapshot<OwnerSession>(
+        "owner-session.snapshot",
+        `owner-session:${sessionId}`,
+      )?.value;
+      if (!session) {
+        appendSnapshots("owner-session.snapshot", "owner-session", "owner-session", [
+          {
+            id: sessionId,
+            name: deriveSessionName(content),
+            createdAt: new Date().toISOString(),
+            state: "active" as const,
+          },
+        ]);
+      } else if (!session.name) {
+        appendSnapshots("owner-session.snapshot", "owner-session", "owner-session", [
+          { ...session, name: deriveSessionName(content) },
+        ]);
+      }
       const turnId = randomUUID();
       appendFact(
         {
@@ -1197,6 +1258,7 @@ export function openAuthoritativeState(
           value: {
             content,
             turnId,
+            sessionId,
             modelSelection: configuration.modelSelection,
             modelPolicyRevision: configuration.modelPolicyRevision,
           },
@@ -1204,6 +1266,67 @@ export function openAuthoritativeState(
         "owner-conversation.owner-message-recorded",
       );
       return turnId;
+    },
+
+    readOwnerSessions() {
+      const sessions = readCurrentSnapshots<OwnerSession>("owner-session.snapshot");
+      const activity = new Map(
+        (database
+          .prepare(`
+            SELECT COALESCE(json_extract(value_json, '$.sessionId'), 'primary') AS session_id,
+                   MAX(recorded_at) AS last_recorded_at
+              FROM facts
+             WHERE kind IN (
+               'owner-conversation.owner-message',
+               'owner-conversation.lead-agent-message'
+             )
+             GROUP BY session_id
+          `)
+          .all() as Array<{ session_id: string; last_recorded_at: string }>)
+          .map((row) => [row.session_id, row.last_recorded_at]),
+      );
+      // A journal from before sessions existed still is one conversation: it
+      // appears as the primary session without rewriting any fact.
+      if (
+        !sessions.some((session) => session.id === primaryOwnerSessionId) &&
+        activity.has(primaryOwnerSessionId)
+      ) {
+        const firstOwnerMessage = database
+          .prepare(`
+            SELECT value_json
+              FROM facts
+             WHERE kind = 'owner-conversation.owner-message'
+               AND COALESCE(json_extract(value_json, '$.sessionId'), 'primary') = 'primary'
+             ORDER BY sequence
+             LIMIT 1
+          `)
+          .get() as { value_json: string } | undefined;
+        sessions.push({
+          id: primaryOwnerSessionId,
+          name: firstOwnerMessage
+            ? deriveSessionName((JSON.parse(firstOwnerMessage.value_json) as { content: string }).content)
+            : "",
+          createdAt: activity.get(primaryOwnerSessionId)!,
+          state: "active",
+        });
+      }
+      return sessions
+        .map((session) => ({
+          ...session,
+          lastActiveAt: activity.get(session.id) ?? session.createdAt,
+        }))
+        .sort((left, right) => right.lastActiveAt.localeCompare(left.lastActiveAt));
+    },
+
+    appendOwnerSessionSnapshots(snapshots) {
+      appendSnapshots("owner-session.snapshot", "owner-session", "owner-session", snapshots);
+    },
+
+    latestActiveOwnerSessionId() {
+      return (
+        this.readOwnerSessions().find((session) => session.state === "active")?.id ??
+        primaryOwnerSessionId
+      );
     },
 
     recordOwnerInteractionDisposition(ownerTurnId, kind) {
@@ -1262,6 +1385,7 @@ export function openAuthoritativeState(
       const originalAttribution = JSON.parse(ownerTurn.value_json) as {
         modelSelection: ModelSelection;
         modelPolicyRevision: string;
+        sessionId?: string;
       };
       appendFact(
         {
@@ -1269,6 +1393,7 @@ export function openAuthoritativeState(
           value: {
             content,
             turnId,
+            ...(originalAttribution.sessionId ? { sessionId: originalAttribution.sessionId } : {}),
             modelSelection: attribution?.modelSelection ?? originalAttribution.modelSelection,
             modelPolicyRevision:
               attribution?.modelPolicyRevision ?? originalAttribution.modelPolicyRevision,
@@ -1296,6 +1421,7 @@ export function openAuthoritativeState(
       const originalAttribution = JSON.parse(ownerTurn.value_json) as {
         modelSelection: ModelSelection;
         modelPolicyRevision: string;
+        sessionId?: string;
       };
       beginWrite();
       try {
@@ -1322,6 +1448,9 @@ export function openAuthoritativeState(
             JSON.stringify({
               content,
               turnId,
+              ...(originalAttribution.sessionId
+                ? { sessionId: originalAttribution.sessionId }
+                : {}),
               modelSelection: attribution?.modelSelection ?? originalAttribution.modelSelection,
               modelPolicyRevision:
                 attribution?.modelPolicyRevision ?? originalAttribution.modelPolicyRevision,
@@ -2838,6 +2967,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
         'owner.configuration',
         'owner-conversation.owner-message',
         'owner-conversation.lead-agent-message',
+        'owner-session.snapshot',
         'commitment.snapshot',
         'lead-turn-attempt.snapshot',
         'worker-session.snapshot',
@@ -2869,6 +2999,8 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
         'owner.forge-authorities-reconfigured',
         'owner-conversation.owner-message-recorded',
         'owner-conversation.lead-agent-message-recorded',
+        'owner-session.active',
+        'owner-session.archived',
         'commitment.committed',
         'commitment.ready',
         'commitment.active',
@@ -2987,6 +3119,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transitions'")
     .get() as { sql: string };
   if (
+    row.sql.includes("'owner-session.snapshot'") &&
     row.sql.includes("'commitment.snapshot'") &&
     row.sql.includes("'lead-turn-attempt.snapshot'") &&
     row.sql.includes("'worker-session.snapshot'") &&
@@ -3001,6 +3134,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
     row.sql.includes("'forge-owner-action-notice.snapshot'") &&
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
+    transitionsRow.sql.includes("'owner-session.active'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
     transitionsRow.sql.includes("'self-repair.activation-pending'") &&
     transitionsRow.sql.includes("'owner.forge-authorities-reconfigured'") &&
@@ -3024,6 +3158,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
           'owner.configuration',
           'owner-conversation.owner-message',
           'owner-conversation.lead-agent-message',
+          'owner-session.snapshot',
           'commitment.snapshot',
           'lead-turn-attempt.snapshot',
           'worker-session.snapshot',
@@ -3053,6 +3188,8 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
           'owner.forge-authorities-reconfigured',
           'owner-conversation.owner-message-recorded',
           'owner-conversation.lead-agent-message-recorded',
+          'owner-session.active',
+          'owner-session.archived',
           'commitment.committed',
           'commitment.ready',
           'commitment.active',
@@ -3280,6 +3417,8 @@ function factSubject(input: FactDraft): string {
       return `capability-notice:${input.value.id}`;
     case "standing-order.snapshot":
       return `standing-order:${input.value.id}`;
+    case "owner-session.snapshot":
+      return `owner-session:${input.value.id}`;
     case "self-repair.snapshot":
       return `self-repair:${input.value.id}`;
     case "coordination-message.recorded":

@@ -277,6 +277,14 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     },
   });
 
+  pi.registerCommand("sessions", {
+    description: "List sessions; switch with /session use N, start with /session new",
+    handler: async (_args, ctx) => {
+      const response = await input.completeOwnerInput("/session list");
+      ctx.ui.notify(response.content, "info");
+    },
+  });
+
   pi.on("session_shutdown", () => {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;
@@ -433,6 +441,22 @@ export function renderSessionPanel(
   }
   if (snapshot.lead) {
     lines.push(theme.fg("dim", truncate(renderLeadTurnMetrics(snapshot.lead), wide)));
+  }
+  const sessions = snapshot.sessions ?? [];
+  if (sessions.length > 0) {
+    lines.push(theme.bold(theme.fg("accent", "Sessions")));
+    for (const session of sessions.slice(0, 5)) {
+      const name = truncate(session.name || "(unbenannt)", narrow);
+      lines.push(
+        session.current
+          ? theme.fg("accent", "● ") + theme.bold(name)
+          : theme.fg("dim", `○ ${name} · /session use ${session.number}`),
+      );
+    }
+    if (sessions.length > 5) {
+      lines.push(theme.fg("dim", `… ${sessions.length - 5} weitere · /sessions`));
+    }
+    lines.push("");
   }
   if (snapshot.items.length === 0) {
     lines.push(theme.fg("dim", "Keine Work Items."));

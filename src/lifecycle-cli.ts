@@ -279,7 +279,8 @@ async function attach(
 function conversationSeed(stateDirectory: string, writeGeneration: number): LeadHostTranscriptEntry[] {
   const state = openAuthoritativeState(stateDirectory, { writeGeneration });
   try {
-    return (state.readOwnerConversation()?.messages ?? []).map((message) =>
+    // A restarted host replays the session the Owner spoke to last.
+    return (state.readOwnerConversation(state.latestActiveOwnerSessionId())?.messages ?? []).map((message) =>
       message.role === "owner"
         ? { source: "owner" as const, line: message.content }
         : { source: "lead" as const, stream: "stdout" as const, line: `Lead Agent: ${message.content}` }

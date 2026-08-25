@@ -446,11 +446,14 @@ export function renderSessionPanel(
   if (sessions.length > 0) {
     lines.push(theme.bold(theme.fg("accent", "Sessions")));
     for (const session of sessions.slice(0, 5)) {
-      const name = truncate(session.name || "(unbenannt)", narrow);
+      const label = truncate(
+        (session.project ? `[${session.project}] ` : "") + (session.name || "(unbenannt)"),
+        narrow,
+      );
       lines.push(
         session.current
-          ? theme.fg("accent", "● ") + theme.bold(name)
-          : theme.fg("dim", `○ ${name} · /session use ${session.number}`),
+          ? theme.fg("accent", "● ") + theme.bold(label)
+          : theme.fg("dim", `○ ${label} · /session use ${session.number}`),
       );
     }
     if (sessions.length > 5) {

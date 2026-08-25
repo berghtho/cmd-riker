@@ -44,6 +44,8 @@ export type SessionViewSnapshot = {
   standingOrders?: StandingOrderViewEntry[];
   /** Owner Sessions, most recently active first; `current` marks the one the Lead is serving. */
   sessions?: OwnerSessionViewEntry[];
+  /** Configured projects, the default Target Project first. */
+  projects?: OwnerProjectViewEntry[];
 };
 
 export type OwnerSessionViewEntry = {
@@ -53,6 +55,15 @@ export type OwnerSessionViewEntry = {
   current: boolean;
   lastActiveAt: string;
   state: "active" | "archived";
+  /** The configured project this session works in; shown once several projects exist. */
+  project?: string;
+};
+
+export type OwnerProjectViewEntry = {
+  number: number;
+  name: string;
+  path: string;
+  sessionCount: number;
 };
 
 export type StandingOrderViewEntry = {
@@ -84,6 +95,7 @@ export interface SessionViewState {
   readLatestLeadTurnMetrics?(): LeadTurnMetrics | undefined;
   readStandingOrders?(): StandingOrder[];
   readOwnerSessions?(): OwnerSessionView[];
+  readConfiguredProjects?(): Array<{ name: string; path: string }>;
 }
 
 export function projectSessionView(
@@ -156,14 +168,38 @@ export function projectSessionView(
   }
 
   const lead = state.readLatestLeadTurnMetrics?.();
-  const sessions = state.readOwnerSessions?.().map((session, index) => ({
-    number: index + 1,
-    sessionId: session.id,
-    name: session.name,
-    current: session.id === options.activeSessionId,
-    lastActiveAt: session.lastActiveAt,
-    state: session.state,
-  }));
+  const configuredProjects = state.readConfiguredProjects?.() ?? [];
+  const projectNameByPath = new Map(
+    configuredProjects.map((project) => [project.path.toLowerCase(), project.name]),
+  );
+  const defaultProjectName = configuredProjects[0]?.name;
+  const projectOf = (projectPath: string | undefined): string | undefined => {
+    if (!projectPath) return configuredProjects.length > 1 ? defaultProjectName : undefined;
+    return projectNameByPath.get(projectPath.toLowerCase()) ?? projectPath;
+  };
+  const sessions = state.readOwnerSessions?.().map((session, index) => {
+    const project = projectOf(session.projectPath);
+    return {
+      number: index + 1,
+      sessionId: session.id,
+      name: session.name,
+      current: session.id === options.activeSessionId,
+      lastActiveAt: session.lastActiveAt,
+      state: session.state,
+      ...(project ? { project } : {}),
+    };
+  });
+  const projects =
+    configuredProjects.length > 0
+      ? configuredProjects.map((project, index) => ({
+          number: index + 1,
+          name: project.name,
+          path: project.path,
+          sessionCount: (sessions ?? []).filter(
+            (session) => (session.project ?? defaultProjectName) === project.name,
+          ).length,
+        }))
+      : undefined;
   const standingOrders = state.readStandingOrders
     ? projectStandingOrders(state.readStandingOrders())
     : undefined;
@@ -182,7 +218,20 @@ export function projectSessionView(
     ...(lead ? { lead } : {}),
     ...(standingOrders ? { standingOrders } : {}),
     ...(sessions ? { sessions } : {}),
+    ...(projects ? { projects } : {}),
   };
+}
+
+export function renderOwnerProjects(entries: OwnerProjectViewEntry[]): string {
+  if (entries.length === 0) return "No projects configured.";
+  return entries
+    .map(
+      (entry) =>
+        `${entry.number}. ${entry.name} | ${entry.path} | ` +
+        `${entry.sessionCount} session${entry.sessionCount === 1 ? "" : "s"} | ` +
+        `/session new ${entry.name}`,
+    )
+    .join("\n");
 }
 
 export function renderOwnerSessions(entries: OwnerSessionViewEntry[]): string {
@@ -190,7 +239,9 @@ export function renderOwnerSessions(entries: OwnerSessionViewEntry[]): string {
   return entries
     .map(
       (entry) =>
-        `${entry.number}. ${entry.current ? "* " : ""}${entry.name || "(unnamed)"}` +
+        `${entry.number}. ${entry.current ? "* " : ""}` +
+        (entry.project ? `[${entry.project}] ` : "") +
+        (entry.name || "(unnamed)") +
         (entry.state === "archived" ? " | archived" : "") +
         (entry.current ? "" : ` | /session use ${entry.number}`),
     )
@@ -202,11 +253,16 @@ export function parseOwnerSessionControl(
   input: string,
 ):
   | { kind: "list-sessions" }
-  | { kind: "new-session" }
+  | { kind: "list-projects" }
+  | { kind: "new-session"; project?: string }
   | { kind: "use-session"; sessionId: string; name: string }
   | undefined {
   if (/^\/session\s+list\s*$/i.test(input)) return { kind: "list-sessions" };
-  if (/^\/session\s+new\s*$/i.test(input)) return { kind: "new-session" };
+  if (/^\/session\s+projects\s*$/i.test(input)) return { kind: "list-projects" };
+  const create = /^\/session\s+new(?:\s+(\S+))?\s*$/i.exec(input);
+  if (create) {
+    return { kind: "new-session", ...(create[1] ? { project: create[1] } : {}) };
+  }
   const use = /^\/session\s+use\s+(\d+)\s*$/i.exec(input);
   if (!use) return undefined;
   const entry = entries.find(

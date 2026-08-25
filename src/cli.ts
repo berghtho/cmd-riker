@@ -57,6 +57,7 @@ import {
   parseSessionViewControl,
   parseStandingOrderControl,
   projectSessionView,
+  renderOwnerProjects,
   renderOwnerSessions,
   renderSessionItems,
   renderSessionView,
@@ -399,10 +400,38 @@ async function completeOwnerInteraction(
       content: renderOwnerSessions(snapshot.sessions ?? []),
     };
   }
+  if (sessionAction?.kind === "list-projects") {
+    return {
+      source: "Session View",
+      content: renderOwnerProjects(snapshot.projects ?? []),
+    };
+  }
   if (sessionAction?.kind === "new-session" && sessionContext) {
+    let projectPath: string | undefined;
+    if (sessionAction.project) {
+      const projects = snapshot.projects ?? [];
+      const requested = sessionAction.project.toLowerCase();
+      const match = projects.find(
+        (candidate) =>
+          candidate.name.toLowerCase() === requested || String(candidate.number) === requested,
+      );
+      if (!match) {
+        return {
+          source: "Session View",
+          content: `Unknown project "${sessionAction.project}". /session projects lists them.`,
+        };
+      }
+      projectPath = match.path;
+    }
     const sessionId = randomUUID();
     state.appendOwnerSessionSnapshots([
-      { id: sessionId, name: "", createdAt: new Date().toISOString(), state: "active" },
+      {
+        id: sessionId,
+        name: "",
+        createdAt: new Date().toISOString(),
+        ...(projectPath ? { projectPath } : {}),
+        state: "active",
+      },
     ]);
     sessionContext.activeSessionId = sessionId;
     return {
@@ -721,7 +750,9 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     [...legacyKeys, "modelRequirements", "workerModelPolicy"],
     [...legacyKeys, "modelFallbacks", "modelRequirements", "workerModelPolicy"],
   ];
-  const acceptedKeySets = baseKeySets.flatMap((keys) => [keys, [...keys, "forgeAuthorities"]]);
+  const acceptedKeySets = baseKeySets
+    .flatMap((keys) => [keys, [...keys, "projects"]])
+    .flatMap((keys) => [keys, [...keys, "forgeAuthorities"]]);
   if (!acceptedKeySets.some((keys) => isRecordWithKeys(value, keys))) {
     throw invalidConfiguration();
   }
@@ -750,6 +781,9 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   const forgeAuthorities = configuration.forgeAuthorities !== undefined
     ? parseForgeAuthorities(configuration.forgeAuthorities)
     : undefined;
+  const projects = configuration.projects !== undefined
+    ? parseProjects(configuration.projects)
+    : undefined;
   try {
     assertSupportedModelSelection(selection);
     for (const fallback of parsedFallbacks ?? []) assertSupportedModelSelection(fallback);
@@ -758,6 +792,7 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
   }
   return {
     targetProject: { path: targetProject.path },
+    ...(projects ? { projects } : {}),
     ...(forgeAuthorities ? { forgeAuthorities } : {}),
     modelSelection: selection,
     ...(parsedFallbacks ? { modelFallbacks: parsedFallbacks } : {}),
@@ -765,6 +800,22 @@ function parseConfiguration(value: unknown): OwnerConfiguration {
     modelPolicyRevision: configuration.modelPolicyRevision,
     ...(workerModelPolicy ? { workerModelPolicy } : {}),
   };
+}
+
+function parseProjects(value: unknown): NonNullable<OwnerConfiguration["projects"]> {
+  if (!Array.isArray(value) || value.length === 0) throw invalidConfiguration();
+  return value.map((entry) => {
+    if (
+      !isRecordWithKeys(entry, ["name", "path"]) ||
+      typeof entry.name !== "string" ||
+      typeof entry.path !== "string" ||
+      !entry.name.trim() ||
+      !entry.path.trim()
+    ) {
+      throw invalidConfiguration();
+    }
+    return { name: entry.name, path: entry.path };
+  });
 }
 
 function parseForgeAuthorities(value: unknown): NonNullable<OwnerConfiguration["forgeAuthorities"]> {

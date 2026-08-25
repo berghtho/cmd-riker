@@ -100,6 +100,12 @@ async function completeOwnerTurn(input: {
 }): Promise<string> {
   const conversation = input.state.readOwnerConversation(input.sessionId);
   if (!conversation) throw new Error("Authoritative state is not configured.");
+  // A session bound to a configured project works in that checkout; unbound
+  // sessions work in the default Target Project.
+  const sessionProjectPath = input.sessionId
+    ? input.state.readOwnerSessions().find((session) => session.id === input.sessionId)?.projectPath
+    : undefined;
+  const targetProjectPath = sessionProjectPath ?? conversation.targetProject.path;
   const orchestration = createOrchestrationCore(input.state);
   const turnId = input.state.appendOwnerMessage(input.ownerInput, input.sessionId);
   input.onOwnerTurnRecorded?.(turnId);
@@ -192,7 +198,7 @@ async function completeOwnerTurn(input: {
         ownerInput: input.ownerInput,
         modelSelection,
         commitments: input.state.readCommitments(),
-        nativeTools: { cwd: conversation.targetProject.path },
+        nativeTools: { cwd: targetProjectPath },
         standingOrders: orchestration.standingOrdersView(),
         authorityActions: {
           recordStandingOrder: (draft) => orchestration.recordStandingOrder(turnId, draft),
@@ -239,7 +245,7 @@ async function completeOwnerTurn(input: {
                       const { model, ...bounded } = assignment;
                       return supervisor.delegate({
                         ...bounded,
-                        targetProjectPath: conversation.targetProject.path,
+                        targetProjectPath: targetProjectPath,
                         model: model ?? modelFor(harness)!,
                         modelPolicyRevision: workerModelPolicyRevision,
                       });
@@ -264,13 +270,13 @@ async function completeOwnerTurn(input: {
                             return supervisor.delegateEffectful({
                               ...bounded,
                               commitmentId,
-                              targetProjectPath: conversation.targetProject.path,
+                              targetProjectPath: targetProjectPath,
                               model: model ?? modelFor(harness)!,
                               modelPolicyRevision: workerModelPolicyRevision,
                               timeoutMs: (timeoutMinutes ?? 20) * 60_000,
                               verification: {
                                 operation: "test" as const,
-                                workingDirectory: conversation.targetProject.path,
+                                workingDirectory: targetProjectPath,
                                 timeoutMs: 15 * 60_000,
                               },
                             });
@@ -328,7 +334,7 @@ async function completeOwnerTurn(input: {
             orchestration.cancelCommitment(workItemId, turnId, reason),
           recordOwnerVerdict: async (workItemId, ownerVerdictQuote) => {
             const targetProjectHeadCommit = await readTargetProjectHead(
-              conversation.targetProject.path,
+              targetProjectPath,
             );
             return orchestration.recordOwnerVerdict(workItemId, turnId, {
               ownerVerdictQuote,
@@ -343,8 +349,8 @@ async function completeOwnerTurn(input: {
             const result = await input.targetProjectOperations.execute({
               commitmentId,
               operation: { kind: operation, inputs: {} },
-              checkout: conversation.targetProject.path,
-              workingDirectory: conversation.targetProject.path,
+              checkout: targetProjectPath,
+              workingDirectory: targetProjectPath,
               timeoutMs: 15 * 60_000,
             });
             orchestration.observeTargetProjectOperationResult(commitmentId, result);

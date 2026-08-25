@@ -122,6 +122,8 @@ export type OwnerSession = {
   /** Empty until the first prompt names the session. */
   name: string;
   createdAt: string;
+  /** The configured project this session works in; absent means the default Target Project. */
+  projectPath?: string;
   state: "active" | "archived";
 };
 
@@ -220,6 +222,8 @@ export interface AuthoritativeState {
   appendOwnerSessionSnapshots(snapshots: OwnerSession[]): void;
   /** The session the Owner spoke to last — the one a restarted interface resumes. */
   latestActiveOwnerSessionId(): string;
+  /** Every configured project, the default Target Project first (named by its last path segment). */
+  readConfiguredProjects(): Array<{ name: string; path: string }>;
   recordOwnerInteractionDisposition(
     ownerTurnId: string,
     kind: "session-view-control",
@@ -1327,6 +1331,17 @@ export function openAuthoritativeState(
         this.readOwnerSessions().find((session) => session.state === "active")?.id ??
         primaryOwnerSessionId
       );
+    },
+
+    readConfiguredProjects() {
+      const configuration = readConfigurationRow()?.value;
+      if (!configuration) return [];
+      const defaultPath = configuration.targetProject.path;
+      const defaultName = defaultPath.split(/[\\/]/).filter(Boolean).at(-1) ?? defaultPath;
+      return [
+        { name: defaultName, path: defaultPath },
+        ...(configuration.projects ?? []),
+      ];
     },
 
     recordOwnerInteractionDisposition(ownerTurnId, kind) {
@@ -3298,6 +3313,7 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
   const value = JSON.parse(valueJson) as OwnerConfiguration;
   return {
     targetProject: value.targetProject,
+    ...(Array.isArray(value.projects) ? { projects: value.projects } : {}),
     ...(value.forgeAuthorities ? { forgeAuthorities: value.forgeAuthorities } : {}),
     modelSelection: value.modelSelection,
     ...(Array.isArray(value.modelFallbacks) ? { modelFallbacks: value.modelFallbacks } : {}),
@@ -3311,6 +3327,20 @@ function parseConfiguration(valueJson: string): OwnerConfiguration {
 }
 
 function validateConfiguration(configuration: OwnerConfiguration): void {
+  const seenProjectNames = new Set<string>();
+  const seenProjectPaths = new Set<string>([configuration.targetProject.path.toLowerCase()]);
+  for (const project of configuration.projects ?? []) {
+    if (!project.name.trim() || !project.path.trim()) {
+      throw new Error("Every project requires a name and a local source repository path.");
+    }
+    const name = project.name.toLowerCase();
+    const path = project.path.toLowerCase();
+    if (seenProjectNames.has(name) || seenProjectPaths.has(path)) {
+      throw new Error("Project names and paths must be unique across the configuration.");
+    }
+    seenProjectNames.add(name);
+    seenProjectPaths.add(path);
+  }
   const github = configuration.forgeAuthorities?.github;
   if (
     github &&
@@ -3437,6 +3467,7 @@ function factSubject(input: FactDraft): string {
 function sameConfiguration(left: OwnerConfiguration, right: OwnerConfiguration): boolean {
   return (
     left.targetProject.path === right.targetProject.path &&
+    JSON.stringify(left.projects) === JSON.stringify(right.projects) &&
     JSON.stringify(left.forgeAuthorities) === JSON.stringify(right.forgeAuthorities) &&
     sameSelection(left.modelSelection, right.modelSelection) &&
     sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
@@ -3452,6 +3483,7 @@ function sameConfigurationExceptForgeAuthorities(
 ): boolean {
   return (
     left.targetProject.path === right.targetProject.path &&
+    JSON.stringify(left.projects) === JSON.stringify(right.projects) &&
     sameSelection(left.modelSelection, right.modelSelection) &&
     sameSelectionList(left.modelFallbacks ?? [], right.modelFallbacks ?? []) &&
     JSON.stringify(left.modelRequirements) === JSON.stringify(right.modelRequirements) &&

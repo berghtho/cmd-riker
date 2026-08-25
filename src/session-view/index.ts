@@ -1,6 +1,7 @@
 import type {
   CapabilityNotice,
   Commitment,
+  StandingOrder,
   WorkerExecutionAttempt,
   WorkerQuestion,
   WorkerSession,
@@ -38,6 +39,24 @@ export type SessionViewSnapshot = {
   notices: string[];
   /** What the last completed Lead turn ran on; configured selection before the first turn. */
   lead?: LeadTurnMetrics;
+  /** Every recorded Standing Order, current ones first; expiry is derived, never stored. */
+  standingOrders?: StandingOrderViewEntry[];
+};
+
+export type StandingOrderViewEntry = {
+  number: number;
+  standingOrderId: string;
+  title: string;
+  /** "expired" is derived from validUntil; the journal keeps such orders "active". */
+  status: "active" | "expired" | "revoked";
+  instruction: string;
+  effectClasses: string[];
+  targets: string[];
+  allowIrreversibleEffects: boolean;
+  allowExternallyBindingEffects: boolean;
+  maximumIncrementalSpendUsd: number;
+  validUntil: string;
+  revocationReason?: string;
 };
 
 export interface SessionViewState {
@@ -51,6 +70,7 @@ export interface SessionViewState {
   readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
   commitmentRecordedAt?(commitmentId: string): string | undefined;
   readLatestLeadTurnMetrics?(): LeadTurnMetrics | undefined;
+  readStandingOrders?(): StandingOrder[];
 }
 
 export function projectSessionView(
@@ -122,6 +142,15 @@ export function projectSessionView(
   }
 
   const lead = state.readLatestLeadTurnMetrics?.();
+  const standingOrders = state.readStandingOrders
+    ? projectStandingOrders(state.readStandingOrders())
+    : undefined;
+  // Authority that lapsed on its own deserves the same visibility as a failure:
+  // a mission must not discover an expired Standing Order by being refused.
+  for (const order of standingOrders ?? []) {
+    if (order.status !== "expired") continue;
+    notices.push(`Standing Order "${order.title}" has expired; its authority no longer applies.`);
+  }
   return {
     leadAvailability: options.leadAvailability ?? "available",
     activeWorkerCount: visibleWorkers.length,
@@ -129,7 +158,105 @@ export function projectSessionView(
     items,
     notices,
     ...(lead ? { lead } : {}),
+    ...(standingOrders ? { standingOrders } : {}),
   };
+}
+
+export function projectStandingOrders(
+  orders: StandingOrder[],
+  now = Date.now(),
+): StandingOrderViewEntry[] {
+  const status = (order: StandingOrder): StandingOrderViewEntry["status"] =>
+    order.state === "revoked"
+      ? "revoked"
+      : Date.parse(order.validUntil) > now
+        ? "active"
+        : "expired";
+  const rank: Record<StandingOrderViewEntry["status"], number> = {
+    active: 0,
+    expired: 1,
+    revoked: 2,
+  };
+  return orders
+    .map((order) => ({ order, status: status(order) }))
+    .sort((left, right) => rank[left.status] - rank[right.status])
+    .map(({ order, status: orderStatus }, index) => ({
+      number: index + 1,
+      standingOrderId: order.id,
+      title: order.title,
+      status: orderStatus,
+      instruction: order.instruction,
+      effectClasses: [...order.effectClasses],
+      targets: [...order.targets],
+      allowIrreversibleEffects: order.allowIrreversibleEffects,
+      allowExternallyBindingEffects: order.allowExternallyBindingEffects,
+      maximumIncrementalSpendUsd: order.maximumIncrementalSpendUsd,
+      validUntil: order.validUntil,
+      ...(order.revocation ? { revocationReason: order.revocation.reason } : {}),
+    }));
+}
+
+export function renderStandingOrders(entries: StandingOrderViewEntry[]): string {
+  if (entries.length === 0) return "No Standing Orders.";
+  return entries
+    .map((entry) => {
+      const validity =
+        entry.status === "active"
+          ? `until ${entry.validUntil}`
+          : entry.status === "expired"
+            ? `EXPIRED ${entry.validUntil}`
+            : `revoked: ${entry.revocationReason ?? "no reason recorded"}`;
+      return (
+        `${entry.number}. ${entry.status} | ${entry.title} | ${validity}` +
+        (entry.status === "active" ? ` | /session order ${entry.number}` : "")
+      );
+    })
+    .join("\n");
+}
+
+export function renderStandingOrderDetail(entry: StandingOrderViewEntry): string {
+  const bounds = [
+    entry.allowIrreversibleEffects ? "irreversible effects allowed" : "reversible effects only",
+    entry.allowExternallyBindingEffects
+      ? "externally binding effects allowed"
+      : "no externally binding effects",
+    `spend up to ${entry.maximumIncrementalSpendUsd} USD`,
+  ].join("; ");
+  return [
+    `${entry.title} (${entry.status})`,
+    `Instruction: ${entry.instruction}`,
+    `Effects: ${entry.effectClasses.join(", ")}`,
+    `Targets: ${entry.targets.join(", ")}`,
+    `Bounds: ${bounds}`,
+    entry.status === "revoked"
+      ? `Revoked: ${entry.revocationReason ?? "no reason recorded"}`
+      : `Valid until: ${entry.validUntil}${entry.status === "expired" ? " (EXPIRED)" : ""}`,
+    ...(entry.status === "active"
+      ? [`Revoke with /session revoke-order ${entry.number} <reason>`]
+      : []),
+  ].join("\n");
+}
+
+export function parseStandingOrderControl(
+  entries: StandingOrderViewEntry[],
+  input: string,
+):
+  | { kind: "show-order"; entry: StandingOrderViewEntry }
+  | { kind: "revoke-order"; standingOrderId: string; reason: string }
+  | undefined {
+  const show = /^\/session\s+order\s+(\d+)\s*$/i.exec(input);
+  if (show) {
+    const entry = entries.find((candidate) => candidate.number === Number(show[1]));
+    return entry ? { kind: "show-order", entry } : undefined;
+  }
+  const revoke = /^\/session\s+revoke-order\s+(\d+)\s+(\S.*)$/i.exec(input);
+  if (!revoke) return undefined;
+  const entry = entries.find(
+    (candidate) => candidate.number === Number(revoke[1]) && candidate.status === "active",
+  );
+  return entry
+    ? { kind: "revoke-order", standingOrderId: entry.standingOrderId, reason: revoke[2]!.trim() }
+    : undefined;
 }
 
 /**

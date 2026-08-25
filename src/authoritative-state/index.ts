@@ -16,6 +16,7 @@ import { backup as backupDatabase, DatabaseSync } from "node:sqlite";
 
 import {
   assertSupportedModelSelection,
+  type LeadTurnMetrics,
   type ModelSelection,
 } from "../model-selection.ts";
 import {
@@ -104,6 +105,7 @@ export type ConversationMessage =
       modelPolicyRevision: string;
       nativeHarness: null;
       selectionReason?: "fallback-after-ineligible-candidate";
+      turnMetrics?: LeadTurnMetrics;
     };
 
 export type OwnerConversation = OwnerConfiguration & {
@@ -195,6 +197,7 @@ export interface AuthoritativeState {
       modelSelection: ModelSelection;
       modelPolicyRevision: string;
       selectionReason?: "fallback-after-ineligible-candidate";
+      turnMetrics?: LeadTurnMetrics;
     },
   ): void;
   appendLeadAgentMessageWithAccounts(
@@ -208,8 +211,15 @@ export interface AuthoritativeState {
       modelSelection: ModelSelection;
       modelPolicyRevision: string;
       selectionReason?: "fallback-after-ineligible-candidate";
+      turnMetrics?: LeadTurnMetrics;
     },
   ): void;
+  /**
+   * The last completed Lead turn's attributed Model, reasoning budget, and
+   * measured context occupancy; before any completed turn, the configured
+   * selection with no context evidence.
+   */
+  readLatestLeadTurnMetrics(): LeadTurnMetrics | undefined;
   ownerTurnSequence(turnId: string): number | undefined;
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
@@ -1120,6 +1130,7 @@ export function openAuthoritativeState(
           modelSelection: ModelSelection;
           modelPolicyRevision: string;
           selectionReason?: "fallback-after-ineligible-candidate";
+          turnMetrics?: LeadTurnMetrics;
         };
         if (row.kind === "owner-conversation.owner-message") {
           return {
@@ -1141,9 +1152,39 @@ export function openAuthoritativeState(
           modelPolicyRevision: value.modelPolicyRevision,
           nativeHarness: null,
           ...(value.selectionReason ? { selectionReason: value.selectionReason } : {}),
+          ...(value.turnMetrics ? { turnMetrics: value.turnMetrics } : {}),
         };
       });
       return { ...configuration, messages };
+    },
+
+    readLatestLeadTurnMetrics() {
+      const row = database
+        .prepare(`
+          SELECT value_json
+            FROM facts
+           WHERE kind = 'owner-conversation.lead-agent-message'
+           ORDER BY sequence DESC
+           LIMIT 1
+        `)
+        .get() as { value_json: string } | undefined;
+      if (row) {
+        const metrics = (JSON.parse(row.value_json) as { turnMetrics?: LeadTurnMetrics })
+          .turnMetrics;
+        if (metrics) return metrics;
+      }
+      const configuration = readConfigurationRow()?.value;
+      if (!configuration) return undefined;
+      const selection = configuration.modelSelection;
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.api === "openai-codex-responses"
+          ? { thinkingLevel: selection.thinkingLevel ?? ("xhigh" as const) }
+          : {}),
+        contextTokens: 0,
+        contextWindow: null,
+      };
     },
 
     appendOwnerMessage(content) {
@@ -1234,6 +1275,7 @@ export function openAuthoritativeState(
             ...(attribution?.selectionReason
               ? { selectionReason: attribution.selectionReason }
               : {}),
+            ...(attribution?.turnMetrics ? { turnMetrics: attribution.turnMetrics } : {}),
           },
         },
         "owner-conversation.lead-agent-message-recorded",
@@ -1286,6 +1328,7 @@ export function openAuthoritativeState(
               ...(attribution?.selectionReason
                 ? { selectionReason: attribution.selectionReason }
                 : {}),
+              ...(attribution?.turnMetrics ? { turnMetrics: attribution.turnMetrics } : {}),
             }),
             recordedAt,
           );

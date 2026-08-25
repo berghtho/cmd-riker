@@ -12,7 +12,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import type { SessionViewSnapshot } from "./session-view/index.ts";
+import { renderLeadTurnMetrics, type SessionViewSnapshot } from "./session-view/index.ts";
 
 // Pi intentionally does not export its CLI composition root. CMD Riker pins the
 // package version and uses that root so Pi, rather than a look-alike TUI, owns the
@@ -160,6 +160,7 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
         input.readSessionView(),
         panelOpen,
         input.readUpdateStatus?.(),
+        input.readSessionData?.()?.lead,
       ),
     );
     ctx.ui.setTitle(`CMD Riker — ${input.targetProjectPath}`);
@@ -173,7 +174,15 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     ctx.ui.setFooter((_tui, theme) => {
       footerTheme = theme;
       footer = new Text(
-        renderFooter(theme, input.targetProjectPath, status, input.readSessionView(), false, undefined),
+        renderFooter(
+          theme,
+          input.targetProjectPath,
+          status,
+          input.readSessionView(),
+          false,
+          undefined,
+          input.readSessionData?.()?.lead,
+        ),
       );
       return footer;
     });
@@ -362,6 +371,7 @@ function renderFooter(
   sessionView: string,
   panelOpen: boolean,
   update: PiOwnerUpdateStatus | undefined,
+  lead?: SessionViewSnapshot["lead"],
 ): string {
   const label = status === "available"
     ? theme.fg("success", "● bereit")
@@ -373,7 +383,8 @@ function renderFooter(
   const updateHint = update?.updateAvailable
     ? `  ${theme.fg("accent", `⬆ ${renderUpdateNotice(update)}`)}`
     : "";
-  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}  ${theme.fg("dim", hint)}${updateHint}`;
+  const leadSegment = lead ? `  ${theme.fg("dim", renderLeadTurnMetrics(lead))}` : "";
+  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}${leadSegment}  ${theme.fg("dim", hint)}${updateHint}`;
 }
 
 export function renderUpdateNotice(update: PiOwnerUpdateStatus): string {
@@ -411,6 +422,9 @@ export function renderSessionPanel(
   if (!snapshot) {
     lines.push(theme.fg("dim", "Noch keine Session-Daten vom Lead."));
     return lines;
+  }
+  if (snapshot.lead) {
+    lines.push(theme.fg("dim", truncate(renderLeadTurnMetrics(snapshot.lead), wide)));
   }
   if (snapshot.items.length === 0) {
     lines.push(theme.fg("dim", "Keine Work Items."));

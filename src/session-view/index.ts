@@ -7,6 +7,7 @@ import type {
 } from "../orchestration-core/index.ts";
 import type { EffectIntent } from "../target-project-operations/index.ts";
 import type { ForgeOwnerActionNotice } from "../forge-operations/index.ts";
+import type { LeadTurnMetrics } from "../model-selection.ts";
 
 export type SessionViewWorker = {
   number: number;
@@ -35,6 +36,8 @@ export type SessionViewSnapshot = {
   items: SessionViewItem[];
   /** Plain-language problems that deserve the Owner's eye. No identifiers. */
   notices: string[];
+  /** What the last completed Lead turn ran on; configured selection before the first turn. */
+  lead?: LeadTurnMetrics;
 };
 
 export interface SessionViewState {
@@ -47,6 +50,7 @@ export interface SessionViewState {
   readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
   readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
   commitmentRecordedAt?(commitmentId: string): string | undefined;
+  readLatestLeadTurnMetrics?(): LeadTurnMetrics | undefined;
 }
 
 export function projectSessionView(
@@ -117,13 +121,36 @@ export function projectSessionView(
     notices.push(`${notice.provider}: ${notice.detail} Next: ${notice.nextAction}`);
   }
 
+  const lead = state.readLatestLeadTurnMetrics?.();
   return {
     leadAvailability: options.leadAvailability ?? "available",
     activeWorkerCount: visibleWorkers.length,
     workers: visibleWorkers,
     items,
     notices,
+    ...(lead ? { lead } : {}),
   };
+}
+
+/**
+ * One compact status segment for the Lead's Model, reasoning budget, and
+ * context occupancy, e.g. "gpt-5-codex xhigh · 42k/272k (15%)". Context is
+ * omitted until a completed turn has produced measured usage.
+ */
+export function renderLeadTurnMetrics(metrics: LeadTurnMetrics): string {
+  const model = metrics.thinkingLevel
+    ? `${metrics.model} ${metrics.thinkingLevel}`
+    : metrics.model;
+  if (!metrics.contextWindow || metrics.contextTokens <= 0) return model;
+  const thousands = (tokens: number): string => `${Math.round(tokens / 1000)}k`;
+  const percent = Math.min(
+    100,
+    Math.round((metrics.contextTokens / metrics.contextWindow) * 100),
+  );
+  return (
+    `${model} · ${thousands(metrics.contextTokens)}/${thousands(metrics.contextWindow)}` +
+    ` (${percent}%)`
+  );
 }
 
 function sessionViewItem(

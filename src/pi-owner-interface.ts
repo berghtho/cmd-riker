@@ -5,18 +5,30 @@ import {
   getMarkdownTheme,
   loadSkills,
   stripFrontmatter,
-  type Theme,
   type ExtensionAPI,
   type ExtensionContext,
   type InlineExtension,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
-import { renderLeadTurnMetrics, type SessionViewSnapshot } from "./session-view/index.ts";
+import {
+  activityShortcut,
+  closeSurfaceShortcut,
+  formatAge,
+  openSessionsShortcut,
+  OwnerSurface,
+  renderDecisionDock,
+  renderOperationsPanel,
+  renderQuietFooter,
+  renderSessionNavigation,
+  renderUpdateNotice,
+  type OwnerSurfaceUpdateStatus,
+} from "./owner-surface/index.ts";
+import type { SessionViewSnapshot } from "./session-view/index.ts";
 
 // Pi intentionally does not export its CLI composition root. CMD Riker pins the
-// package version and uses that root so Pi, rather than a look-alike TUI, owns the
-// terminal lifecycle and interactive experience.
+// package version and uses that root so Pi owns terminal lifecycle and input.
 import { main as runPi } from "../node_modules/@earendil-works/pi-coding-agent/dist/main.js";
 
 export type PiOwnerTranscriptEntry = {
@@ -27,14 +39,11 @@ export type PiOwnerTranscriptEntry = {
 export type PiOwnerResponse = {
   source: "Lead Agent" | "Session View";
   content: string;
+  /** Direct in-process clients restart after an Owner Session replacement. */
+  reattach?: true;
 };
 
-export type PiOwnerUpdateStatus = {
-  installedRevision: string;
-  installedCommit: string;
-  repositoryCommit: string;
-  updateAvailable: boolean;
-};
+export type PiOwnerUpdateStatus = OwnerSurfaceUpdateStatus;
 
 export type PiOwnerInterfaceInput = {
   targetProjectPath: string;
@@ -52,6 +61,7 @@ export async function runPiOwnerInterface(
 ): Promise<"closed" | "conversation-replaced"> {
   const previousDirectory = process.cwd();
   let conversationReplaced = false;
+  const replacement = { requested: false };
   const wrappedInput: PiOwnerInterfaceInput = input.subscribeConversationReplacements
     ? {
         ...input,
@@ -74,147 +84,95 @@ export async function runPiOwnerInterface(
       "--tui-mode",
       "fullscreen",
     ], {
-      extensionFactories: [rikerOwnerExtension(wrappedInput)],
+      extensionFactories: [rikerOwnerExtension(wrappedInput, replacement)],
     });
-    return conversationReplaced ? "conversation-replaced" : "closed";
+    return conversationReplaced || replacement.requested
+      ? "conversation-replaced"
+      : "closed";
   } finally {
     process.chdir(previousDirectory);
   }
 }
 
-export function rikerOwnerExtension(input: PiOwnerInterfaceInput): InlineExtension {
+export function rikerOwnerExtension(
+  input: PiOwnerInterfaceInput,
+  replacement = { requested: false },
+): InlineExtension {
   return {
     name: "CMD Riker",
     hidden: true,
     factory(pi) {
-      installRikerOwnerExtension(pi, input);
+      installRikerOwnerExtension(pi, input, replacement);
     },
   };
 }
 
-function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInput): void {
-  let footer: Text | undefined;
-  let footerTheme: Theme | undefined;
-  let status: "available" | "responding" | "error" = "available";
+function installRikerOwnerExtension(
+  pi: ExtensionAPI,
+  input: PiOwnerInterfaceInput,
+  replacement: { requested: boolean },
+): void {
+  const surface = new OwnerSurface({
+    targetProjectPath: input.targetProjectPath,
+    readSessionData: () => input.readSessionData?.(),
+    ...(input.readUpdateStatus ? { readUpdateStatus: input.readUpdateStatus } : {}),
+  });
   let refreshTimer: NodeJS.Timeout | undefined;
   let unsubscribeNotices: (() => void) | undefined;
   let unsubscribeConversationReplacements: (() => void) | undefined;
+  let requestRender: (() => void) | undefined;
 
   pi.registerMessageRenderer("riker-owner", (message, { outputPad }, theme) => {
     const box = new Box(outputPad, 0, (text) => theme.bg("userMessageBg", text));
     box.addChild(new Markdown(String(message.content), 1, 1, getMarkdownTheme()));
     return box;
   });
-
   pi.registerMessageRenderer("riker-lead", (message, { outputPad }, theme) => {
     const box = new Box(outputPad, 0);
     box.addChild(new Text(theme.bold(theme.fg("accent", "Riker")), 1, 0));
     box.addChild(new Markdown(String(message.content), 1, 0, getMarkdownTheme()));
     return box;
   });
-
   pi.registerMessageRenderer("riker-error", (message, { outputPad }, theme) => {
     const box = new Box(outputPad, 0);
     box.addChild(new Text(theme.fg("error", `Riker: ${String(message.content)}`), 1, 0));
     return box;
   });
 
-  let panelOpen = false;
-  let sidebar: SessionSidebar | undefined;
-  let closeSidebar: (() => void) | undefined;
-  let requestRender: (() => void) | undefined;
-
-  const openPanel = (ctx: ExtensionContext) => {
-    if (panelOpen || !input.readSessionData) return;
-    panelOpen = true;
-    // The sidebar is a non-capturing full-height overlay on the left, so the
-    // Owner keeps typing while it stays visible - the Copilot CLI layout.
-    void ctx.ui.custom<void>(
-      (tui, theme, _keybindings, done) => {
-        requestRender = () => tui.requestRender();
-        closeSidebar = () => done(undefined);
-        sidebar = new SessionSidebar(theme, input.readSessionData!, input.readUpdateStatus);
-        return sidebar;
-      },
-      {
-        overlay: true,
-        overlayOptions: () => ({
-          anchor: "top-left" as const,
-          width: "32%" as const,
-          minWidth: 34,
-          maxHeight: "100%" as const,
-          nonCapturing: true,
-          visible: (termWidth: number, termHeight: number) => {
-            sidebar?.setViewport(termHeight);
-            return termWidth >= 72;
-          },
-        }),
-      },
-    ).finally(() => {
-      panelOpen = false;
-      sidebar = undefined;
-      closeSidebar = undefined;
-      requestRender = undefined;
-    });
-  };
-
-  const closePanel = () => {
-    closeSidebar?.();
-  };
-
-  const updateFooter = (ctx: ExtensionContext, nextStatus = status) => {
-    status = nextStatus;
-    if (panelOpen && sidebar) {
-      sidebar.invalidate();
-      requestRender?.();
-    }
-    if (!footer || !footerTheme) return;
-    footer.setText(
-      renderFooter(
-        footerTheme,
-        input.targetProjectPath,
-        status,
-        input.readSessionView(),
-        panelOpen,
-        input.readUpdateStatus?.(),
-        input.readSessionData?.()?.lead,
-      ),
-    );
-    ctx.ui.setTitle(`CMD Riker — ${input.targetProjectPath}`);
+  const updateUi = (ctx: ExtensionContext, status?: "available" | "responding" | "error") => {
+    if (status) surface.setStatus(status);
+    ctx.ui.setTitle(surface.title());
+    requestRender?.();
   };
 
   pi.on("session_start", (_event, ctx) => {
-    ctx.ui.setTitle(`CMD Riker — ${input.targetProjectPath}`);
-    ctx.ui.setHeader((_tui, theme) => new Text(
-      `${theme.bold(theme.fg("accent", "CMD Riker"))}  ${theme.fg("dim", input.targetProjectPath)}`,
-    ));
-    ctx.ui.setFooter((_tui, theme) => {
-      footerTheme = theme;
-      footer = new Text(
-        renderFooter(
-          theme,
-          input.targetProjectPath,
-          status,
-          input.readSessionView(),
-          false,
-          undefined,
-          input.readSessionData?.()?.lead,
-        ),
-      );
-      return footer;
+    ctx.ui.setTitle(surface.title());
+    ctx.ui.setHeader((_tui, theme) => new SurfaceText(theme, (activeTheme) => surface.header(activeTheme)));
+    ctx.ui.setFooter((tui, theme) => {
+      requestRender = () => tui.requestRender();
+      return new SurfaceText(theme, (activeTheme) => surface.footer(activeTheme));
     });
+    ctx.ui.setWidget(
+      "riker-owner-surface",
+      (tui, theme) => {
+        requestRender = () => tui.requestRender();
+        return new SurfaceContent(theme, surface);
+      },
+      { placement: "aboveEditor" },
+    );
     ctx.ui.setWorkingMessage("Riker arbeitet …");
     for (const entry of input.transcript) {
       send(pi, entry.source === "owner" ? "riker-owner" : "riker-lead", entry.content);
     }
     unsubscribeNotices = input.subscribeNotices?.((content) => {
       send(pi, "riker-lead", content);
-      updateFooter(ctx);
+      updateUi(ctx);
     });
     unsubscribeConversationReplacements = input.subscribeConversationReplacements?.(() => {
+      replacement.requested = true;
       ctx.shutdown();
     });
-    refreshTimer = setInterval(() => updateFooter(ctx), 500);
+    refreshTimer = setInterval(() => updateUi(ctx), 1_000);
   });
 
   pi.on("input", async (event, ctx) => {
@@ -225,85 +183,69 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
       ctx.ui.notify("Bilder sind in Rikers Owner-Gespräch noch nicht angebunden.", "warning");
       return { action: "handled" as const };
     }
-
     send(pi, "riker-owner", ownerInput);
-    updateFooter(ctx, "responding");
+    updateUi(ctx, "responding");
     try {
-      const response = await input.completeOwnerInput(
-        expandSkillInvocation(ownerInput, input.targetProjectPath),
-      );
+      const response = await input.completeOwnerInput(expandSkillInvocation(ownerInput, input.targetProjectPath));
       send(pi, "riker-lead", response.content);
-      updateFooter(ctx, "available");
+      updateUi(ctx, "available");
+      if (response.reattach) {
+        replacement.requested = true;
+        ctx.shutdown();
+      }
     } catch (error) {
       send(pi, "riker-error", error instanceof Error ? error.message : String(error));
-      updateFooter(ctx, "error");
+      updateUi(ctx, "error");
     }
     return { action: "handled" as const };
   });
 
   pi.registerCommand("riker", {
-    description: "Show CMD Riker's authoritative Session View",
-    handler: async (_args, ctx) => {
-      ctx.ui.notify(input.readSessionView(), "info");
-    },
+    description: "Show CMD Riker's observational Session View",
+    handler: async (_args, ctx) => ctx.ui.notify(input.readSessionView(), "info"),
   });
-
   pi.registerCommand("view", {
-    description: "Toggle the Session View sidebar (shift+left / shift+right)",
+    description: `Toggle Activity (${activityShortcut})`,
     handler: async (_args, ctx) => {
-      if (panelOpen) closePanel();
-      else openPanel(ctx);
-      updateFooter(ctx);
+      surface.toggleActivity();
+      updateUi(ctx);
     },
   });
-
-  pi.registerShortcut("shift+left", {
-    description: "Open the Session View sidebar",
+  pi.registerShortcut(activityShortcut, {
+    description: "Toggle CMD Riker Activity",
     handler: async (ctx) => {
-      openPanel(ctx);
-      updateFooter(ctx);
+      surface.toggleActivity();
+      updateUi(ctx);
     },
   });
-
-  pi.registerShortcut("shift+right", {
-    description: "Close the Session View sidebar",
+  pi.registerShortcut(openSessionsShortcut, {
+    description: "Open CMD Riker session navigation",
     handler: async (ctx) => {
-      closePanel();
-      updateFooter(ctx);
+      surface.openSessions();
+      updateUi(ctx);
     },
   });
-
-  pi.registerCommand("workers", {
-    description: "Inspect CMD Riker Worker Sessions",
-    handler: async (_args, ctx) => {
-      const response = await input.completeOwnerInput("/session workers");
-      ctx.ui.notify(response.content, "info");
+  pi.registerShortcut(closeSurfaceShortcut, {
+    description: "Close CMD Riker inline surface",
+    handler: async (ctx) => {
+      surface.close();
+      updateUi(ctx);
     },
   });
-
-  pi.registerCommand("items", {
-    description: "Show every work item and its plain status",
-    handler: async (_args, ctx) => {
-      const response = await input.completeOwnerInput("/session items");
-      ctx.ui.notify(response.content, "info");
-    },
-  });
-
-  pi.registerCommand("orders", {
-    description: "Show and manage Standing Orders",
-    handler: async (_args, ctx) => {
-      const response = await input.completeOwnerInput("/session orders");
-      ctx.ui.notify(response.content, "info");
-    },
-  });
-
-  pi.registerCommand("sessions", {
-    description: "List sessions; switch with /session use N, start with /session new",
-    handler: async (_args, ctx) => {
-      const response = await input.completeOwnerInput("/session list");
-      ctx.ui.notify(response.content, "info");
-    },
-  });
+  for (const [command, request, description] of [
+    ["workers", "/session workers", "Inspect CMD Riker Worker Sessions"],
+    ["items", "/session items", "Show every work item and its plain status"],
+    ["orders", "/session orders", "Show Standing Orders"],
+    ["sessions", "/session list", "List Owner Sessions"],
+  ] as const) {
+    pi.registerCommand(command, {
+      description,
+      handler: async (_args, ctx) => {
+        const response = await input.completeOwnerInput(request);
+        ctx.ui.notify(response.content, "info");
+      },
+    });
+  }
 
   pi.on("session_shutdown", () => {
     if (refreshTimer) clearInterval(refreshTimer);
@@ -312,58 +254,37 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     unsubscribeNotices = undefined;
     unsubscribeConversationReplacements?.();
     unsubscribeConversationReplacements = undefined;
-    closePanel();
-    footer = undefined;
-    footerTheme = undefined;
+    requestRender = undefined;
   });
 }
 
-// A left-anchored, full-height, non-capturing overlay: the Copilot-style
-// sidebar. It renders live from the freshest Session View snapshot on every
-// frame; the 500ms refresh loop only requests renders.
-class SessionSidebar {
-  private viewportHeight = 0;
+class SurfaceText extends Text {
   private readonly theme: Theme;
-  private readonly readSessionData: () => SessionViewSnapshot | undefined;
-  private readonly readUpdateStatus: (() => PiOwnerUpdateStatus | undefined) | undefined;
+  private readonly readText: (theme: Theme) => string;
 
-  constructor(
-    theme: Theme,
-    readSessionData: () => SessionViewSnapshot | undefined,
-    readUpdateStatus?: () => PiOwnerUpdateStatus | undefined,
-  ) {
+  constructor(theme: Theme, readText: (theme: Theme) => string) {
+    super(readText(theme));
     this.theme = theme;
-    this.readSessionData = readSessionData;
-    this.readUpdateStatus = readUpdateStatus;
+    this.readText = readText;
   }
 
-  setViewport(termHeight: number): void {
-    this.viewportHeight = termHeight;
+  override render(width: number): string[] {
+    this.setText(truncateToWidth(this.readText(this.theme), width));
+    return super.render(width);
   }
+}
 
+class SurfaceContent {
+  private readonly theme: Theme;
+  private readonly surface: OwnerSurface;
+
+  constructor(theme: Theme, surface: OwnerSurface) {
+    this.theme = theme;
+    this.surface = surface;
+  }
   render(width: number): string[] {
-    const usable = Math.max(20, width);
-    const pad = (line: string) => {
-      const cut = truncateToWidth(line, usable - 2);
-      return this.theme.bg(
-        "customMessageBg",
-        ` ${cut}${" ".repeat(Math.max(0, usable - 2 - visibleWidth(cut)))} `,
-      );
-    };
-    const lines = renderSessionPanel(this.theme, this.readSessionData(), Date.now(), usable - 4)
-      .map(pad);
-    const update = this.readUpdateStatus?.();
-    if (update?.updateAvailable) {
-      lines.push(pad(""));
-      lines.push(pad(this.theme.fg("accent", `⬆ ${renderUpdateNotice(update)}`)));
-    }
-    lines.push(pad(""));
-    lines.push(pad(this.theme.fg("dim", "shift+→ schließen · /view")));
-    const targetHeight = Math.max(lines.length, this.viewportHeight);
-    while (lines.length < targetHeight) lines.push(pad(""));
-    return lines;
+    return this.surface.content(this.theme, width);
   }
-
   invalidate(): void {}
 }
 
@@ -371,8 +292,6 @@ function send(pi: ExtensionAPI, customType: string, content: string): void {
   pi.sendMessage({ customType, content, display: true });
 }
 
-// Pi expands /skill: invocations only after the input event, so the Owner
-// extension resolves the same installed skills itself before the Lead turn.
 export function expandSkillInvocation(ownerInput: string, targetProjectPath: string): string {
   if (!ownerInput.startsWith("/skill:")) return ownerInput;
   const spaceIndex = ownerInput.indexOf(" ");
@@ -380,12 +299,7 @@ export function expandSkillInvocation(ownerInput: string, targetProjectPath: str
   const args = spaceIndex === -1 ? "" : ownerInput.slice(spaceIndex + 1).trim();
   let skills;
   try {
-    skills = loadSkills({
-      cwd: targetProjectPath,
-      agentDir: getAgentDir(),
-      skillPaths: [],
-      includeDefaults: true,
-    }).skills;
+    skills = loadSkills({ cwd: targetProjectPath, agentDir: getAgentDir(), skillPaths: [], includeDefaults: true }).skills;
   } catch {
     return ownerInput;
   }
@@ -402,152 +316,11 @@ export function expandSkillInvocation(ownerInput: string, targetProjectPath: str
   }
 }
 
-function renderFooter(
-  theme: Theme,
-  targetProjectPath: string,
-  status: "available" | "responding" | "error",
-  sessionView: string,
-  panelOpen: boolean,
-  update: PiOwnerUpdateStatus | undefined,
-  lead?: SessionViewSnapshot["lead"],
-): string {
-  const label = status === "available"
-    ? theme.fg("success", "● bereit")
-    : status === "responding"
-    ? theme.fg("accent", "● arbeitet")
-    : theme.fg("error", "● Fehler");
-  const compactView = sessionView.replace(/\s+/g, " ").trim();
-  const hint = panelOpen ? "shift+→ Session-View zu" : "shift+← Session-View";
-  const updateHint = update?.updateAvailable
-    ? `  ${theme.fg("accent", `⬆ ${renderUpdateNotice(update)}`)}`
-    : "";
-  const leadSegment = lead ? `  ${theme.fg("dim", renderLeadTurnMetrics(lead))}` : "";
-  return `${label}  ${theme.fg("dim", compactView || targetProjectPath)}${leadSegment}  ${theme.fg("dim", hint)}${updateHint}`;
-}
-
-export function renderUpdateNotice(update: PiOwnerUpdateStatus): string {
-  return (
-    `neue Version im Repo (${update.repositoryCommit.slice(0, 7)}; ` +
-    `installiert ${update.installedRevision} @ ${update.installedCommit.slice(0, 7)}) — riker upgrade`
-  );
-}
-
-export function formatAge(fromIso: string, now = Date.now()): string {
-  const elapsedMs = now - Date.parse(fromIso);
-  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "";
-  const minutes = Math.floor(elapsedMs / 60_000);
-  if (minutes < 1) return "unter 1 min";
-  if (minutes < 60) return `${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} h ${minutes % 60} min`;
-  return `${Math.floor(hours / 24)} d ${hours % 24} h`;
-}
-
-function truncate(text: string, maximum: number): string {
-  const compact = text.replace(/\s+/g, " ").trim();
-  return compact.length <= maximum ? compact : `${compact.slice(0, maximum - 1)}…`;
-}
-
-export function renderSessionPanel(
-  theme: Theme,
-  snapshot: SessionViewSnapshot | undefined,
-  now = Date.now(),
-  contentWidth = 78,
-): string[] {
-  const wide = Math.max(24, contentWidth - 2);
-  const narrow = Math.max(18, contentWidth - 6);
-  const lines: string[] = [theme.bold(theme.fg("accent", "Session View"))];
-  if (!snapshot) {
-    lines.push(theme.fg("dim", "Noch keine Session-Daten vom Lead."));
-    return lines;
-  }
-  if (snapshot.lead) {
-    lines.push(theme.fg("dim", truncate(renderLeadTurnMetrics(snapshot.lead), wide)));
-  }
-  const sessions = snapshot.sessions ?? [];
-  if (sessions.length > 0) {
-    lines.push(theme.bold(theme.fg("accent", "Sessions")));
-    for (const session of sessions.slice(0, 5)) {
-      const label = truncate(
-        (session.project ? `[${session.project}] ` : "") + (session.name || "(unbenannt)"),
-        narrow,
-      );
-      lines.push(
-        session.current
-          ? theme.fg("accent", "● ") + theme.bold(label)
-          : theme.fg("dim", `○ ${label} · /session use ${session.number}`),
-      );
-    }
-    if (sessions.length > 5) {
-      lines.push(theme.fg("dim", `… ${sessions.length - 5} weitere · /sessions`));
-    }
-    lines.push("");
-  }
-  if (snapshot.items.length === 0) {
-    lines.push(theme.fg("dim", "Keine Work Items."));
-  }
-  const workersByItem = new Map<string, SessionViewSnapshot["workers"]>();
-  const unattachedWorkers: SessionViewSnapshot["workers"] = [];
-  for (const worker of snapshot.workers) {
-    if (worker.workItemId) {
-      const list = workersByItem.get(worker.workItemId) ?? [];
-      list.push(worker);
-      workersByItem.set(worker.workItemId, list);
-    } else {
-      unattachedWorkers.push(worker);
-    }
-  }
-  const workerLine = (worker: SessionViewSnapshot["workers"][number]): string => {
-    const age = worker.startedAt ? formatAge(worker.startedAt, now) : "";
-    return (
-      "  " +
-      theme.fg("accent", "⚙ ") +
-      theme.fg("dim", `${worker.status} · `) +
-      truncate(worker.label, narrow) +
-      (age ? theme.fg("dim", ` · seit ${age}`) : "")
-    );
-  };
-  // The panel stays human-sized: finished work collapses to one line, and
-  // what needs the Owner or is actually moving sorts to the top.
-  const doneItems = snapshot.items.filter((item) => item.status.startsWith("done"));
-  const rank = (item: SessionViewSnapshot["items"][number]): number =>
-    item.needsOwner ? 0 : workersByItem.has(item.workItemId) ? 1 : 2;
-  const activeItems = snapshot.items
-    .filter((item) => !item.status.startsWith("done"))
-    .sort((left, right) => rank(left) - rank(right) || left.number - right.number);
-  for (const item of activeItems) {
-    const running = workersByItem.has(item.workItemId);
-    const marker = item.needsOwner ? theme.fg("error", "● ") : theme.fg("accent", "● ");
-    const age = item.since ? formatAge(item.since, now) : "";
-    const outcome = truncate(item.outcome, wide);
-    lines.push(marker + (running ? theme.bold(outcome) : outcome));
-    lines.push(
-      "  " + theme.fg("dim", `${item.status}${age ? ` · seit ${age}` : ""}`),
-    );
-    if (item.detail && item.needsOwner) {
-      lines.push("  " + theme.fg("dim", truncate(item.detail, narrow)));
-    }
-    for (const worker of workersByItem.get(item.workItemId) ?? []) {
-      lines.push(workerLine(worker));
-    }
-  }
-  for (const worker of unattachedWorkers) lines.push(workerLine(worker));
-  if (doneItems.length > 0) {
-    lines.push(
-      theme.fg("success", "✓ ") +
-        theme.fg("dim", `${doneItems.length} erledigt · Details mit /items`),
-    );
-  }
-  const activeOrders = (snapshot.standingOrders ?? []).filter(
-    (order) => order.status === "active",
-  ).length;
-  if (activeOrders > 0) {
-    lines.push(
-      theme.fg("dim", `⚖ ${activeOrders} Standing Order${activeOrders === 1 ? "" : "s"} aktiv · /orders`),
-    );
-  }
-  for (const notice of snapshot.notices) {
-    lines.push(theme.fg("error", "! ") + truncate(notice, wide));
-  }
-  return lines;
-}
+export {
+  formatAge,
+  renderDecisionDock,
+  renderOperationsPanel,
+  renderQuietFooter,
+  renderSessionNavigation,
+  renderUpdateNotice,
+};

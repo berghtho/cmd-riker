@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
 import {
+  decodeHostedOwnerConversation,
   encodeHostedOwnerInput,
   encodeHostedOwnerResponse,
 } from "../src/owner-host-framing.ts";
@@ -322,6 +323,47 @@ test("hosted framing preserves multiline Owner input and Lead responses", async 
   const state = openAuthoritativeState(stateDirectory);
   assert.equal(state.readOwnerConversation()?.messages[0]?.content, ownerInput);
   state.close();
+});
+
+test("session creation is a Lead control and emits a fresh Gateway conversation", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-hosted-reattach-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel(() => "unused");
+  t.after(() => localModel.close());
+  const state = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
+  state.initialize({
+    targetProject: { path: "C:\\target-project" },
+    projects: [{ name: "survivors", path: "C:\\repos\\survivors" }],
+    modelSelection: {
+      provider: "local-openai",
+      model: "owner-model",
+      api: "openai-completions",
+      baseUrl: localModel.baseUrl,
+    },
+    modelPolicyRevision: "owner-policy-1",
+  });
+  state.close();
+
+  const result = await runCli(stateDirectory, `${encodeHostedOwnerInput("/session new survivors")}\n`, [
+    "--write-generation",
+    "1",
+    "--hosted",
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert(result.stdout.includes(encodeHostedOwnerResponse({
+    source: "Lead Agent",
+    content: "New session started. Its first prompt names it.",
+    reattach: true,
+  })));
+  assert.doesNotMatch(result.stdout, /"source":"Session View","content":"New session started/);
+  const conversations = result.stdout
+    .split(/\r?\n/)
+    .map(decodeHostedOwnerConversation)
+    .filter((conversation) => conversation !== undefined);
+  assert.equal(conversations.length, 2);
+  assert.equal(conversations.at(-1)?.targetProjectPath, "C:\\repos\\survivors");
+  assert.deepEqual(conversations.at(-1)?.entries, []);
 });
 
 test("Owner CLI reports malformed configuration as a deterministic host diagnostic", async (t) => {

@@ -226,9 +226,11 @@ export interface AuthoritativeState {
   readConfiguredProjects(): Array<{ name: string; path: string }>;
   recordOwnerInteractionDisposition(
     ownerTurnId: string,
-    kind: "session-view-control",
+    kind: "owner-control",
   ): void;
-  ownerInteractionDisposition(ownerTurnId: string): "session-view-control" | undefined;
+  ownerInteractionDisposition(
+    ownerTurnId: string,
+  ): "session-view-control" | "owner-control" | undefined;
   appendLeadAgentMessage(
     turnId: string,
     content: string,
@@ -1359,7 +1361,7 @@ export function openAuthoritativeState(
           .run(ownerTurnId, kind, new Date().toISOString());
         const recorded = database
           .prepare("SELECT kind FROM owner_interaction_dispositions WHERE owner_turn_id = ?")
-          .get(ownerTurnId) as { kind: "session-view-control" } | undefined;
+          .get(ownerTurnId) as { kind: "session-view-control" | "owner-control" } | undefined;
         if (recorded?.kind !== kind) {
           throw new Error(`Owner turn ${ownerTurnId} has a different durable disposition.`);
         }
@@ -1373,7 +1375,7 @@ export function openAuthoritativeState(
     ownerInteractionDisposition(ownerTurnId) {
       return (database
         .prepare("SELECT kind FROM owner_interaction_dispositions WHERE owner_turn_id = ?")
-        .get(ownerTurnId) as { kind: "session-view-control" } | undefined)?.kind;
+        .get(ownerTurnId) as { kind: "session-view-control" | "owner-control" } | undefined)?.kind;
     },
 
     appendLeadAgentMessage(turnId, content, attribution) {
@@ -3111,10 +3113,28 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
 
     CREATE TABLE IF NOT EXISTS owner_interaction_dispositions (
       owner_turn_id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL CHECK (kind IN ('session-view-control')),
+      kind TEXT NOT NULL CHECK (kind IN ('session-view-control', 'owner-control')),
       recorded_at TEXT NOT NULL
     ) STRICT;
   `);
+  const dispositionTable = database
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'owner_interaction_dispositions'",
+    )
+    .get() as { sql: string };
+  if (!dispositionTable.sql.includes("'owner-control'")) {
+    database.exec(`
+      ALTER TABLE owner_interaction_dispositions RENAME TO owner_interaction_dispositions_legacy;
+      CREATE TABLE owner_interaction_dispositions (
+        owner_turn_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('session-view-control', 'owner-control')),
+        recorded_at TEXT NOT NULL
+      ) STRICT;
+      INSERT INTO owner_interaction_dispositions (owner_turn_id, kind, recorded_at)
+        SELECT owner_turn_id, kind, recorded_at FROM owner_interaction_dispositions_legacy;
+      DROP TABLE owner_interaction_dispositions_legacy;
+    `);
+  }
   const stateIdentityColumns = database
     .prepare("PRAGMA table_info(state_identity)")
     .all() as Array<{ name: string }>;

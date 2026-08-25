@@ -40,10 +40,15 @@ export function decodeHostedOwnerResponse(line: string): PiOwnerResponse | undef
     const value = JSON.parse(line.slice(ownerResponsePrefix.length)) as {
       source?: unknown;
       content?: unknown;
+      reattach?: unknown;
     };
     return (value.source === "Lead Agent" || value.source === "Session View") &&
         typeof value.content === "string"
-      ? { source: value.source, content: value.content }
+      ? {
+          source: value.source,
+          content: value.content,
+          ...(value.reattach === true ? { reattach: true as const } : {}),
+        }
       : undefined;
   } catch {
     return undefined;

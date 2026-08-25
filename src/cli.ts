@@ -53,10 +53,13 @@ import {
 import { runPiOwnerInterface } from "./pi-owner-interface.ts";
 import {
   parseSessionViewControl,
+  parseStandingOrderControl,
   projectSessionView,
   renderSessionItems,
   renderSessionView,
   renderSessionWorkers,
+  renderStandingOrderDetail,
+  renderStandingOrders,
   type SessionViewSnapshot,
 } from "./session-view/index.ts";
 
@@ -379,6 +382,33 @@ async function completeOwnerInteraction(
     return {
       source: "Session View",
       content: renderSessionWorkers(snapshot),
+    };
+  }
+  if (/^\/session\s+orders\s*$/i.test(ownerInput)) {
+    return {
+      source: "Session View",
+      content: renderStandingOrders(snapshot.standingOrders ?? []),
+    };
+  }
+  const orderAction = parseStandingOrderControl(snapshot.standingOrders ?? [], ownerInput);
+  if (orderAction?.kind === "show-order") {
+    return {
+      source: "Session View",
+      content: renderStandingOrderDetail(orderAction.entry),
+    };
+  }
+  if (orderAction?.kind === "revoke-order") {
+    const ownerTurnId = state.appendOwnerMessage(ownerInput);
+    onOwnerTurnRecorded?.(ownerTurnId);
+    createOrchestrationCore(state).revokeStandingOrder(
+      orderAction.standingOrderId,
+      ownerTurnId,
+      orderAction.reason,
+    );
+    state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
+    return {
+      source: "Session View",
+      content: "Standing Order revoked. Effects already dispatched under it are not rolled back.",
     };
   }
   const action = parseSessionViewControl(snapshot, ownerInput);

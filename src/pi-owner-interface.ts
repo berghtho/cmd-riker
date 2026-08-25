@@ -269,6 +269,14 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     },
   });
 
+  pi.registerCommand("orders", {
+    description: "Show and manage Standing Orders",
+    handler: async (_args, ctx) => {
+      const response = await input.completeOwnerInput("/session orders");
+      ctx.ui.notify(response.content, "info");
+    },
+  });
+
   pi.on("session_shutdown", () => {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;
@@ -479,6 +487,14 @@ export function renderSessionPanel(
     lines.push(
       theme.fg("success", "✓ ") +
         theme.fg("dim", `${doneItems.length} erledigt · Details mit /items`),
+    );
+  }
+  const activeOrders = (snapshot.standingOrders ?? []).filter(
+    (order) => order.status === "active",
+  ).length;
+  if (activeOrders > 0) {
+    lines.push(
+      theme.fg("dim", `⚖ ${activeOrders} Standing Order${activeOrders === 1 ? "" : "s"} aktiv · /orders`),
     );
   }
   for (const notice of snapshot.notices) {

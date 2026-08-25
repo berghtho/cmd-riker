@@ -25,6 +25,7 @@ export type LeadAgentRuntime = {
   completeOwnerTurn(
     ownerInput: string,
     onOwnerTurnRecorded?: (turnId: string) => void,
+    sessionId?: string,
   ): Promise<string>;
 };
 
@@ -53,13 +54,14 @@ export function createLeadAgentRuntime(input: {
     createTargetProjectOperations(input.state);
   const forgeOperations = input.forgeOperations ?? createForgeOperations(input.state);
   return {
-    completeOwnerTurn: (ownerInput, onOwnerTurnRecorded) =>
+    completeOwnerTurn: (ownerInput, onOwnerTurnRecorded, sessionId) =>
       completeOwnerTurn({
         ...input,
         targetProjectOperations,
         forgeOperations,
         ownerInput,
         ...(onOwnerTurnRecorded ? { onOwnerTurnRecorded } : {}),
+        ...(sessionId ? { sessionId } : {}),
       }),
   };
 }
@@ -94,11 +96,12 @@ async function completeOwnerTurn(input: {
   targetProjectOperations: TargetProjectOperations;
   forgeOperations: ForgeOperations;
   onOwnerTurnRecorded?: (turnId: string) => void;
+  sessionId?: string;
 }): Promise<string> {
-  const conversation = input.state.readOwnerConversation();
+  const conversation = input.state.readOwnerConversation(input.sessionId);
   if (!conversation) throw new Error("Authoritative state is not configured.");
   const orchestration = createOrchestrationCore(input.state);
-  const turnId = input.state.appendOwnerMessage(input.ownerInput);
+  const turnId = input.state.appendOwnerMessage(input.ownerInput, input.sessionId);
   input.onOwnerTurnRecorded?.(turnId);
   await reconcileUncertainForgeEffects(input.state, orchestration, input.forgeOperations);
   const commitmentsBefore = new Map(

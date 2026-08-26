@@ -309,7 +309,6 @@ async function runScriptableConversation(
   emitSessionData(state, workerSupervisors, sessionContext);
   if (hosted) {
     emitHostedProjectData(state, workerSupervisors);
-    emitConversationData(state, sessionContext);
   }
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInputLine of lines) {
@@ -358,8 +357,6 @@ async function runScriptableConversation(
       emitHostedProjectData(state, workerSupervisors);
       if (turnContext.targetProjectPath) {
         emitHostedProjectProjection(state, workerSupervisors, turnContext.targetProjectPath, turnContext);
-      } else {
-        emitConversationData(state, turnContext);
       }
       process.stdout.write(`${ownerTurnCompleteMarker}\n`);
     }

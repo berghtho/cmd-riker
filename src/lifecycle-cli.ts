@@ -25,6 +25,8 @@ import { createWindowsToastNotifier } from "./owner-notifications/index.ts";
 import {
   decodeHostedOwnerResponse,
   encodeHostedOwnerResponse,
+  ownerConversationPrefix,
+  ownerTurnCompleteMarker,
 } from "./owner-host-framing.ts";
 
 const command = process.argv[2];
@@ -221,6 +223,7 @@ async function host(installRoot: string): Promise<void> {
           durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
           ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
           encodeOwnerInput: true,
+          ownerTurnCompletePrefix: ownerTurnCompleteMarker,
           onTranscriptEntry(entry) {
             if (!toasts || entry.source !== "lead" || entry.stream !== "stdout") return;
             if (!entry.line.startsWith(workerNoticePrefix)) return;
@@ -273,7 +276,7 @@ async function attach(
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   try {
     for await (const line of input) {
-      if (line.trim()) await client.sendOwnerLine(line);
+      if (line.trim()) await client.completeOwnerTurn(line);
     }
   } finally {
     unsubscribe();
@@ -302,6 +305,7 @@ function conversationSeed(stateDirectory: string, writeGeneration: number): Lead
 function renderEntry(entry: LeadHostTranscriptEntry): void {
   if (entry.source === "owner") process.stdout.write(`Owner: ${entry.line}\n`);
   else if (entry.line.startsWith("CMD_RIKER_SESSION_JSON:")) return;
+  else if (entry.line.startsWith(ownerConversationPrefix) || entry.line === ownerTurnCompleteMarker) return;
   else {
     const response = decodeHostedOwnerResponse(entry.line);
     process[entry.stream === "stderr" ? "stderr" : "stdout"].write(

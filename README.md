@@ -121,8 +121,10 @@ riker gateway
 
 The first output message is a `ready` record with `protocolVersion`, the hosted process identity, and
 one current snapshot containing the Target Project, Owner conversation, Work Items, Worker Sessions,
-Standing Orders, and notices. Subsequent `event` records carry semantic conversation, Session View,
-notice, and exit changes. A caller starts an Owner turn with a correlated command:
+Standing Orders, and notices. Internal state identifiers are replaced by presentation-safe numbers.
+Subsequent `event` records carry complete current-conversation replacements, Session View updates,
+Lead availability, notices, and exits; after an exit, reconnecting yields the replacement Lead's new
+`ready` identity and snapshot. A caller starts an Owner turn with a correlated command:
 
 ```json
 {"id":"turn-1","type":"turn","content":"Continue the integration"}

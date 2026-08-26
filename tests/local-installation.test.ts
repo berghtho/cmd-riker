@@ -57,6 +57,9 @@ function fakeClient(hostRunning: { value: boolean }): LocalLeadHostClient {
     transcript: [],
     exit: new Promise(() => {}),
     async sendOwnerLine() {},
+    async completeOwnerTurn() {
+      return { source: "Lead Agent", content: "" };
+    },
     async stop() {
       hostRunning.value = false;
       return { kind: "explicit-stop", code: 0, signal: null };

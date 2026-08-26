@@ -5,18 +5,17 @@ import {
   type LeadHostTranscriptEntry,
   type LocalLeadHostClient,
 } from "../local-host/index.ts";
-import { completeHostedOwnerInput } from "../owner-host-bridge.ts";
 import type { SessionViewSnapshot } from "../session-view/index.ts";
-import { decodeHostedOwnerResponse } from "../owner-host-framing.ts";
+import {
+  decodeHostedOwnerConversation,
+  type HostedOwnerConversationEntry,
+} from "../owner-host-framing.ts";
 
 const targetProjectPrefix = "CMD Riker | Target Project:";
 const sessionViewPrefix = "CMD_RIKER_SESSION_JSON:";
 const workerNoticePrefix = "CMD_RIKER_WORKER_NOTICE: ";
 
-export type OwnerGatewayConversationEntry = {
-  source: "owner" | "lead-agent";
-  content: string;
-};
+export type OwnerGatewayConversationEntry = HostedOwnerConversationEntry;
 
 export type OwnerGatewaySnapshot = {
   targetProjectPath: string;
@@ -25,8 +24,9 @@ export type OwnerGatewaySnapshot = {
 };
 
 export type OwnerGatewayEvent =
-  | { type: "conversation-entry"; entry: OwnerGatewayConversationEntry }
+  | { type: "conversation"; conversation: OwnerGatewayConversationEntry[] }
   | { type: "session-view"; sessionView: SessionViewSnapshot }
+  | { type: "lead-state"; state: "responding" | "available" }
   | { type: "notice"; content: string }
   | { type: "exit"; exit: LeadHostExit };
 
@@ -40,9 +40,9 @@ export type OwnerGatewayClient = {
 
 export async function connectOwnerGateway(
   address: string,
-  options: { readyTimeoutMs?: number } = {},
+  options: { connectTimeoutMs?: number; readyTimeoutMs?: number } = {},
 ): Promise<OwnerGatewayClient> {
-  const client = await connectLocalLeadHost(address);
+  const client = await connectLocalHostWithRetry(address, options.connectTimeoutMs ?? 0);
   const targetProjectPath = await waitForReadySnapshot(
     client,
     options.readyTimeoutMs ?? 60_000,
@@ -51,7 +51,6 @@ export async function connectOwnerGateway(
     throw error;
   });
   const listeners = new Set<(event: OwnerGatewayEvent) => void>();
-  let turnQueue = Promise.resolve();
 
   const publish = (event: OwnerGatewayEvent): void => {
     for (const listener of listeners) {
@@ -63,8 +62,7 @@ export async function connectOwnerGateway(
     }
   };
   const unsubscribeTranscript = client.onTranscriptEntry((entry) => {
-    const event = gatewayEvent(entry);
-    if (event) publish(event);
+    for (const event of gatewayEvents(entry)) publish(event);
   });
   const unsubscribeExit = client.onExit((exit) => publish({ type: "exit", exit }));
 
@@ -74,16 +72,13 @@ export async function connectOwnerGateway(
       return gatewaySnapshot(client.transcript, targetProjectPath);
     },
     completeTurn(ownerInput) {
-      const turn = turnQueue.then(() => completeHostedOwnerInput(client, ownerInput));
-      turnQueue = turn.then(() => {}, () => {});
-      return turn;
+      return client.completeOwnerTurn(ownerInput);
     },
     subscribe(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
     async detach() {
-      await turnQueue;
       unsubscribeExit();
       unsubscribeTranscript();
       listeners.clear();
@@ -92,16 +87,35 @@ export async function connectOwnerGateway(
   };
 }
 
+async function connectLocalHostWithRetry(
+  address: string,
+  timeoutMs: number,
+): Promise<LocalLeadHostClient> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  do {
+    try {
+      return await connectLocalLeadHost(address);
+    } catch (error) {
+      lastError = error;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    }
+  } while (true);
+  throw new Error("Timed out waiting for the protected Lead Agent.", { cause: lastError });
+}
+
 function gatewaySnapshot(
   transcript: readonly LeadHostTranscriptEntry[],
   targetProjectPath: string,
 ): OwnerGatewaySnapshot {
-  const conversation: OwnerGatewayConversationEntry[] = [];
+  let conversation: OwnerGatewayConversationEntry[] = [];
   let sessionView: SessionViewSnapshot | undefined;
   for (const entry of transcript) {
-    const event = gatewayEvent(entry);
-    if (event?.type === "conversation-entry") conversation.push(event.entry);
-    if (event?.type === "session-view") sessionView = event.sessionView;
+    for (const event of gatewayEvents(entry)) {
+      if (event.type === "conversation") conversation = event.conversation;
+      if (event.type === "session-view") sessionView = event.sessionView;
+    }
   }
   return {
     targetProjectPath,
@@ -110,44 +124,28 @@ function gatewaySnapshot(
   };
 }
 
-function gatewayEvent(entry: LeadHostTranscriptEntry): OwnerGatewayEvent | undefined {
-  if (entry.source === "owner") {
-    return { type: "conversation-entry", entry: { source: "owner", content: entry.line } };
-  }
-  if (entry.stream !== "stdout") return undefined;
-  const response = decodeHostedOwnerResponse(entry.line);
-  if (response) {
-    return {
-      type: "conversation-entry",
-      entry: { source: "lead-agent", content: response.content },
-    };
-  }
-  if (entry.line.startsWith("Lead Agent: ")) {
-    return {
-      type: "conversation-entry",
-      entry: { source: "lead-agent", content: entry.line.slice("Lead Agent: ".length) },
-    };
-  }
-  if (entry.line.startsWith("Session View: ")) {
-    return {
-      type: "conversation-entry",
-      entry: { source: "lead-agent", content: entry.line.slice("Session View: ".length) },
-    };
-  }
+function gatewayEvents(entry: LeadHostTranscriptEntry): OwnerGatewayEvent[] {
+  if (entry.source === "owner") return [{ type: "lead-state", state: "responding" }];
+  if (entry.stream !== "stdout") return [];
+  const conversation = decodeHostedOwnerConversation(entry.line);
+  if (conversation) return [{ type: "conversation", conversation }];
   if (entry.line.startsWith(workerNoticePrefix)) {
-    return { type: "notice", content: entry.line.slice(workerNoticePrefix.length) };
+    return [{ type: "notice", content: entry.line.slice(workerNoticePrefix.length) }];
   }
   if (entry.line.startsWith(sessionViewPrefix)) {
     try {
-      return {
-        type: "session-view",
-        sessionView: JSON.parse(entry.line.slice(sessionViewPrefix.length)) as SessionViewSnapshot,
-      };
+      const sessionView = JSON.parse(
+        entry.line.slice(sessionViewPrefix.length),
+      ) as SessionViewSnapshot;
+      return [
+        { type: "session-view", sessionView },
+        { type: "lead-state", state: sessionView.leadAvailability },
+      ];
     } catch {
-      return undefined;
+      return [];
     }
   }
-  return undefined;
+  return [];
 }
 
 function waitForReadySnapshot(
@@ -155,7 +153,9 @@ function waitForReadySnapshot(
   timeoutMs: number,
 ): Promise<string> {
   const existing = latestTargetProject(client.transcript);
-  if (existing && hasSessionView(client.transcript)) return Promise.resolve(existing);
+  if (existing && hasSessionView(client.transcript) && hasConversation(client.transcript)) {
+    return Promise.resolve(existing);
+  }
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       unsubscribe();
@@ -163,7 +163,7 @@ function waitForReadySnapshot(
     }, timeoutMs);
     const unsubscribe = client.onTranscriptEntry((entry) => {
       const path = targetProject(entry) ?? latestTargetProject(client.transcript);
-      if (!path || !hasSessionView(client.transcript)) return;
+      if (!path || !hasSessionView(client.transcript) || !hasConversation(client.transcript)) return;
       clearTimeout(timeout);
       unsubscribe();
       resolve(path);
@@ -172,7 +172,15 @@ function waitForReadySnapshot(
 }
 
 function hasSessionView(transcript: readonly LeadHostTranscriptEntry[]): boolean {
-  return transcript.some((entry) => gatewayEvent(entry)?.type === "session-view");
+  return transcript.some((entry) =>
+    gatewayEvents(entry).some((event) => event.type === "session-view")
+  );
+}
+
+function hasConversation(transcript: readonly LeadHostTranscriptEntry[]): boolean {
+  return transcript.some((entry) =>
+    gatewayEvents(entry).some((event) => event.type === "conversation")
+  );
 }
 
 function latestTargetProject(transcript: readonly LeadHostTranscriptEntry[]): string | undefined {

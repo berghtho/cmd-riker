@@ -16,6 +16,7 @@ test("external clients converse with the Lead and observe orchestration through 
     args: [gatewayLeadHost],
     durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
     encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
     onStopIntent: async () => {},
   });
   t.after(() => server.stop());
@@ -42,6 +43,23 @@ test("external clients converse with the Lead and observe orchestration through 
     isEvent(event, "notice") && event.content === "Worker needs input for build it"
   ));
   assert(events.some((event) => isEvent(event, "session-view")));
+
+  const secondGateway = await connectOwnerGateway(address);
+  t.after(() => secondGateway.detach());
+  const [firstConcurrent, secondConcurrent] = await Promise.all([
+    gateway.completeTurn("first concurrent turn"),
+    secondGateway.completeTurn("second concurrent turn"),
+  ]);
+  assert.equal(firstConcurrent.content, "completed first concurrent turn\nverified");
+  assert.equal(secondConcurrent.content, "completed second concurrent turn\nverified");
+
+  await gateway.completeTurn("/session new");
+  assert.deepEqual(gateway.snapshot.conversation, []);
+  await gateway.completeTurn("new session turn");
+  assert.deepEqual(gateway.snapshot.conversation, [
+    { source: "owner", content: "new session turn" },
+    { source: "lead-agent", content: "completed new session turn\nverified" },
+  ]);
 });
 
 function isEvent(

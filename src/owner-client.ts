@@ -23,7 +23,10 @@ try {
 }
 
 async function runOwnerClient(installationRoot: string): Promise<void> {
-  const gateway = await connectWithRetry(localLeadHostAddress(resolve(installationRoot)), 10_000);
+  const gateway = await connectOwnerGateway(
+    localLeadHostAddress(resolve(installationRoot)),
+    { connectTimeoutMs: 10_000 },
+  );
   try {
     await runPiOwnerInterface({
       targetProjectPath: gateway.snapshot.targetProjectPath,
@@ -105,23 +108,6 @@ function createUpdateStatusReader(
     setInterval(() => void check(), 60_000).unref();
   }
   return () => status;
-}
-
-async function connectWithRetry(
-  address: string,
-  timeoutMs: number,
-): Promise<Awaited<ReturnType<typeof connectOwnerGateway>>> {
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown;
-  while (Date.now() < deadline) {
-    try {
-      return await connectOwnerGateway(address);
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-    }
-  }
-  throw new Error("Timed out waiting for the protected Lead Agent.", { cause: lastError });
 }
 
 function requiredArgument(name: string): string {

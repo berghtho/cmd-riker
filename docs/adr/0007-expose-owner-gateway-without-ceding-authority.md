@@ -2,7 +2,8 @@
 
 External control surfaces attach to CMD Riker through a versioned local Owner Gateway. The gateway
 projects the current Owner conversation and Session View, streams semantic changes, and accepts
-correlated Owner turns. The bundled Pi interface consumes the same gateway module.
+host-correlated Owner turns. Its external protocol substitutes presentation-safe numbers for internal
+state identifiers. The bundled Pi interface consumes the same gateway module.
 
 CMD Riker remains authoritative for Owner Sessions, Command Authority, Work Items, Worker Sessions,
 effects, and Verification. A control surface does not launch Native Harnesses, checkpoint Target

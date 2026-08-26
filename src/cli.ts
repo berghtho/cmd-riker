@@ -17,7 +17,9 @@ import {
 } from "./authoritative-state/index.ts";
 import {
   decodeHostedOwnerInput,
+  encodeHostedOwnerConversation,
   encodeHostedOwnerResponse,
+  ownerTurnCompleteMarker,
 } from "./owner-host-framing.ts";
 import {
   PiAgentTurnAdapter,
@@ -294,12 +296,13 @@ async function runScriptableConversation(
   workerSupervisors: WorkerSupervisors,
   sessionContext: OwnerSessionContext,
 ): Promise<void> {
+  const hosted = process.argv.includes("--hosted");
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
   process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
   emitSessionData(state, workerSupervisors, sessionContext);
+  if (hosted) emitConversationData(state, sessionContext);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInputLine of lines) {
-    const hosted = process.argv.includes("--hosted");
     const ownerInput = hosted ? hostedOwnerInput(ownerInputLine) : ownerInputLine;
     if (!ownerInput.trim()) continue;
     let ownerTurnRecorded = false;
@@ -324,6 +327,10 @@ async function runScriptableConversation(
       : `${output.source}: ${output.content}\n`);
     process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
     emitSessionData(state, workerSupervisors, sessionContext);
+    if (hosted) {
+      emitConversationData(state, sessionContext);
+      process.stdout.write(`${ownerTurnCompleteMarker}\n`);
+    }
   }
 }
 
@@ -340,6 +347,17 @@ function emitSessionData(
   process.stdout.write(
     `CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionViewSnapshot(state, workerSupervisors, "available", sessionContext))}\n`,
   );
+}
+
+function emitConversationData(
+  state: AuthoritativeState,
+  sessionContext: OwnerSessionContext,
+): void {
+  const messages = state.readOwnerConversation(sessionContext.activeSessionId)?.messages ?? [];
+  process.stdout.write(`${encodeHostedOwnerConversation(messages.map((message) => ({
+    source: message.role,
+    content: message.content,
+  })))}\n`);
 }
 
 function runInteractiveConversation(

@@ -43,6 +43,7 @@ test("builds one complete Lead Agent release bundle with its lifecycle tools", {
       "dist/lead-support.js",
       "dist/lifecycle-cli.js",
       "dist/owner-client.js",
+      "dist/owner-gateway-cli.js",
       "dist/owner-launcher.js",
       "node_modules/runtime-dependency/index.js",
       "node_modules/runtime-dependency/package.json",
@@ -134,6 +135,12 @@ test("rejects a Lead dist without the lifecycle and Owner tools", { skip }, asyn
   await assert.rejects(buildRelease(fixture, "no-lifecycle"), /lifecycle-cli\.js/);
 });
 
+test("rejects a Lead dist without the external Owner Gateway", { skip }, async (t) => {
+  const fixture = await releaseFixture(t, "no-owner-gateway");
+  await rm(join(fixture.leadDist, "owner-gateway-cli.js"));
+  await assert.rejects(buildRelease(fixture, "no-owner-gateway"), /owner-gateway-cli\.js/);
+});
+
 async function releaseFixture(t: test.TestContext, suffix = "release") {
   const root = await mkdtemp(join(tmpdir(), `cmd-riker-build-${suffix}-`));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -145,6 +152,7 @@ async function releaseFixture(t: test.TestContext, suffix = "release") {
   await writeFixtureFile(leadDist, "lifecycle-cli.js", "export const lifecycle = true;\n");
   await writeFixtureFile(leadDist, "owner-launcher.js", "export const launcher = true;\n");
   await writeFixtureFile(leadDist, "owner-client.js", "export const client = true;\n");
+  await writeFixtureFile(leadDist, "owner-gateway-cli.js", "export const gateway = true;\n");
   await writeFixtureFile(
     leadNodeModules,
     "runtime-dependency/index.js",

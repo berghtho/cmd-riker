@@ -16,6 +16,12 @@ import {
   type PostBackupEffectReconciliation,
 } from "./authoritative-state/index.ts";
 import {
+  decodeHostedOwnerInput,
+  encodeHostedOwnerConversation,
+  encodeHostedOwnerResponse,
+  ownerTurnCompleteMarker,
+} from "./owner-host-framing.ts";
+import {
   PiAgentTurnAdapter,
   type PiTurnAdapter,
 } from "./conversation-runtime/index.ts";
@@ -290,13 +296,15 @@ async function runScriptableConversation(
   workerSupervisors: WorkerSupervisors,
   sessionContext: OwnerSessionContext,
 ): Promise<void> {
+  const hosted = process.argv.includes("--hosted");
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
   process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
   emitSessionData(state, workerSupervisors, sessionContext);
+  if (hosted) emitConversationData(state, sessionContext);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  for await (const ownerInput of lines) {
+  for await (const ownerInputLine of lines) {
+    const ownerInput = hosted ? hostedOwnerInput(ownerInputLine) : ownerInputLine;
     if (!ownerInput.trim()) continue;
-    const hosted = process.argv.includes("--hosted");
     let ownerTurnRecorded = false;
     const output = await completeOwnerInteraction(
       state,
@@ -314,10 +322,21 @@ async function runScriptableConversation(
     if (hosted && !ownerTurnRecorded) {
       process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
     }
-    process.stdout.write(`${output.source}: ${output.content}\n`);
+    process.stdout.write(hosted
+      ? `${encodeHostedOwnerResponse(output)}\n`
+      : `${output.source}: ${output.content}\n`);
     process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
     emitSessionData(state, workerSupervisors, sessionContext);
+    if (hosted) {
+      emitConversationData(state, sessionContext);
+      process.stdout.write(`${ownerTurnCompleteMarker}\n`);
+    }
   }
+}
+
+function hostedOwnerInput(line: string): string {
+  // Invalid framing remains ordinary Owner input rather than becoming a host command.
+  return decodeHostedOwnerInput(line) ?? line;
 }
 
 function emitSessionData(
@@ -328,6 +347,22 @@ function emitSessionData(
   process.stdout.write(
     `CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionViewSnapshot(state, workerSupervisors, "available", sessionContext))}\n`,
   );
+}
+
+function emitConversationData(
+  state: AuthoritativeState,
+  sessionContext: OwnerSessionContext,
+): void {
+  const conversation = state.readOwnerConversation(sessionContext.activeSessionId);
+  const session = state.readOwnerSessions().find((entry) => entry.id === sessionContext.activeSessionId);
+  process.stdout.write(`${encodeHostedOwnerConversation({
+    sessionId: sessionContext.activeSessionId,
+    targetProjectPath: session?.projectPath ?? conversation?.targetProject.path ?? process.cwd(),
+    entries: (conversation?.messages ?? []).map((message) => ({
+      source: message.role,
+      content: message.content,
+    })),
+  })}\n`);
 }
 
 function runInteractiveConversation(
@@ -362,7 +397,7 @@ function runInteractiveConversation(
         ownerNotices.deliver = previous;
       };
     },
-  });
+  }).then(() => {});
 }
 
 type OwnerInteractionOutput = {

@@ -4,9 +4,21 @@ import { createServer, createConnection, type Server, type Socket } from "node:n
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import {
+  decodeHostedOwnerResponse,
+  encodeHostedOwnerInput,
+  ownerConversationPrefix,
+  ownerTurnCompleteMarker,
+} from "../owner-host-framing.ts";
+import type { PiOwnerResponse } from "../pi-owner-interface.ts";
+
 const defaultTranscriptByteLimit = 256 * 1024;
 const defaultStopGraceMs = 2_000;
 const defaultDurableOwnerAckTimeoutMs = 15_000;
+const targetProjectPrefix = "CMD Riker | Target Project:";
+const sessionViewPrefix = "CMD_RIKER_SESSION_JSON:";
+
+export type LeadHostState = "starting" | "available" | "responding";
 
 export type LeadHostTranscriptEntry =
   | { source: "owner"; line: string }
@@ -33,9 +45,11 @@ export type LocalLeadHostServer = {
 export type LocalLeadHostClient = {
   readonly address: string;
   readonly childPid: number;
+  readonly leadState: LeadHostState;
   readonly transcript: readonly LeadHostTranscriptEntry[];
   readonly exit: Promise<LeadHostExit>;
   sendOwnerLine(line: string): Promise<void>;
+  completeOwnerTurn(input: string): Promise<PiOwnerResponse>;
   stop(): Promise<LeadHostExit>;
   detach(): Promise<void>;
   onTranscriptEntry(listener: (entry: LeadHostTranscriptEntry) => void): () => void;
@@ -53,6 +67,10 @@ export type StartLocalLeadHostOptions = {
   stopGraceMs?: number;
   durableOwnerAckPrefix?: string;
   ownerHandledMarker?: string;
+  /** Frames multiline Owner content into one physical child-stdin line. */
+  encodeOwnerInput?: boolean;
+  /** Marks semantic Owner turn completion for host-wide response correlation. */
+  ownerTurnCompletePrefix?: string;
   durableOwnerAckTimeoutMs?: number;
   onStopIntent: () => Promise<void>;
   /** Observes live transcript entries (not the seed); must not disturb the host. */
@@ -62,16 +80,20 @@ export type StartLocalLeadHostOptions = {
 type ClientRequest =
   | { type: "attach" }
   | { type: "owner"; requestId: number; line: string }
+  | { type: "turn"; requestId: number; input: string }
   | { type: "stop"; requestId: number };
 
 type ServerMessage =
   | {
       type: "attached";
       childPid: number;
+      leadState: LeadHostState;
       transcript: LeadHostTranscriptEntry[];
     }
   | { type: "entry"; entry: LeadHostTranscriptEntry }
+  | { type: "lead-state"; state: LeadHostState }
   | { type: "ack"; requestId: number }
+  | { type: "turn-result"; requestId: number; response: PiOwnerResponse }
   | { type: "request-error"; requestId: number; message: string }
   | { type: "exit"; exit: LeadHostExit };
 
@@ -122,19 +144,38 @@ export async function startLocalLeadHost(
 
   const sockets = new Map<Socket, { attached: boolean }>();
   const transcript: LeadHostTranscriptEntry[] = [];
+  const stickyEntries = new Map<
+    "target-project" | "session-view" | "conversation",
+    LeadHostTranscriptEntry
+  >();
   let transcriptBytes = 0;
+  let leadState: LeadHostState = "starting";
   let acceptingOwnerLines = true;
   let controlledChildShutdown = false;
   let childError: Error | undefined;
   let childExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let writeQueue = Promise.resolve();
+  let semanticTurnQueue = Promise.resolve();
+  let activeSemanticTurn:
+    | {
+        response?: PiOwnerResponse;
+        completion: ReturnType<typeof Promise.withResolvers<PiOwnerResponse>>;
+      }
+    | undefined;
   const durableOwnerAcks: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
   let stopOperation: Promise<LeadHostExit> | undefined;
   let shutdownOperation: Promise<LeadHostExit> | undefined;
   let finalizeOperation: Promise<LeadHostExit> | undefined;
   const exitResolution = Promise.withResolvers<LeadHostExit>();
 
+  const rememberStickyEntry = (entry: LeadHostTranscriptEntry): void => {
+    if (entry.source !== "lead" || entry.stream !== "stdout") return;
+    if (entry.line.startsWith(targetProjectPrefix)) stickyEntries.set("target-project", entry);
+    else if (entry.line.startsWith(sessionViewPrefix)) stickyEntries.set("session-view", entry);
+    else if (entry.line.startsWith(ownerConversationPrefix)) stickyEntries.set("conversation", entry);
+  };
   const appendTranscript = (entry: LeadHostTranscriptEntry): void => {
+    rememberStickyEntry(entry);
     const bytes = entryBytes(entry);
     transcript.push(entry);
     transcriptBytes += bytes;
@@ -201,6 +242,9 @@ export async function startLocalLeadHost(
     for (const acknowledgement of durableOwnerAcks.splice(0)) {
       acknowledgement.reject(new Error("The Lead Agent exited before Owner input became durable."));
     }
+    activeSemanticTurn?.completion.reject(
+      new Error("The Lead Agent exited before the Owner turn completed."),
+    );
     if (!controlledChildShutdown && !stopOperation) void finalize(unexpectedExit());
   });
   readLines(child.stdout, (line) => {
@@ -211,7 +255,24 @@ export async function startLocalLeadHost(
       durableOwnerAcks.shift()?.resolve();
       return;
     }
+    const response = decodeHostedOwnerResponse(line);
+    if (response && activeSemanticTurn) activeSemanticTurn.response = response;
     recordEntry({ source: "lead", stream: "stdout", line });
+    if (leadState === "starting" && line.startsWith(sessionViewPrefix)) setLeadState("available");
+    if (line === ownerTurnCompleteMarker) setLeadState("available");
+    if (
+      options.ownerTurnCompletePrefix &&
+      line.startsWith(options.ownerTurnCompletePrefix) &&
+      activeSemanticTurn
+    ) {
+      if (activeSemanticTurn.response) {
+        activeSemanticTurn.completion.resolve(activeSemanticTurn.response);
+      } else {
+        activeSemanticTurn.completion.reject(
+          new Error("The Lead Agent completed the Owner turn without a framed response."),
+        );
+      }
+    }
   });
   readLines(child.stderr, (line) => recordEntry({ source: "lead", stream: "stderr", line }));
 
@@ -225,7 +286,7 @@ export async function startLocalLeadHost(
         : undefined;
       if (acknowledgement) durableOwnerAcks.push(acknowledgement);
       try {
-        await writeLine(child, line);
+        await writeLine(child, options.encodeOwnerInput ? encodeHostedOwnerInput(line) : line);
         if (acknowledgement) {
           await Promise.race([
             acknowledgement.promise,
@@ -246,9 +307,41 @@ export async function startLocalLeadHost(
         throw error;
       }
       recordEntry({ source: "owner", line });
+      setLeadState("responding");
     });
     writeQueue = queued.catch(() => {});
     return queued;
+  };
+
+  const setLeadState = (state: LeadHostState): void => {
+    if (leadState === state) return;
+    leadState = state;
+    broadcast({ type: "lead-state", state });
+  };
+
+  const completeOwnerTurn = (input: string): Promise<PiOwnerResponse> => {
+    if (!options.ownerTurnCompletePrefix) {
+      return Promise.reject(new Error("Semantic Owner turns are unavailable on this host."));
+    }
+    const operation = semanticTurnQueue.then(async () => {
+      const completion = Promise.withResolvers<PiOwnerResponse>();
+      // Child exit may reject both delivery and completion in the same tick.
+      void completion.promise.catch(() => {});
+      activeSemanticTurn = { completion };
+      const timeout = setTimeout(() => {
+        completion.reject(new Error("The Lead Agent did not finish the Owner turn within one hour."));
+      }, 60 * 60_000);
+      timeout.unref();
+      try {
+        await writeOwnerLine(input);
+        return await completion.promise;
+      } finally {
+        clearTimeout(timeout);
+        activeSemanticTurn = undefined;
+      }
+    });
+    semanticTurnQueue = operation.then(() => {}, () => {});
+    return operation;
   };
 
   const requestStop = (): Promise<LeadHostExit> => {
@@ -318,10 +411,15 @@ export async function startLocalLeadHost(
       if (!state) return;
       if (request.type === "attach" && !state.attached) {
         state.attached = true;
+        const replay = [...transcript];
+        for (const entry of stickyEntries.values()) {
+          if (!replay.includes(entry)) replay.unshift(entry);
+        }
         send(socket, {
           type: "attached",
           childPid: child.pid!,
-          transcript: [...transcript],
+          leadState,
+          transcript: replay,
         });
         return;
       }
@@ -330,7 +428,15 @@ export async function startLocalLeadHost(
         return;
       }
       if (request.type === "owner") {
-        if (!isSingleLine(request.line)) {
+        if (options.ownerTurnCompletePrefix) {
+          send(socket, {
+            type: "request-error",
+            requestId: request.requestId,
+            message: "This host requires correlated Owner turns.",
+          });
+          return;
+        }
+        if (typeof request.line !== "string" || (!options.encodeOwnerInput && !isSingleLine(request.line))) {
           send(socket, {
             type: "request-error",
             requestId: request.requestId,
@@ -346,6 +452,25 @@ export async function startLocalLeadHost(
               requestId: request.requestId,
               message: error instanceof Error ? error.message : "Owner input delivery failed.",
             }),
+        );
+        return;
+      }
+      if (request.type === "turn") {
+        if (typeof request.input !== "string") {
+          send(socket, {
+            type: "request-error",
+            requestId: request.requestId,
+            message: "Owner turn input must be a string.",
+          });
+          return;
+        }
+        void completeOwnerTurn(request.input).then(
+          (response) => send(socket, { type: "turn-result", requestId: request.requestId, response }),
+          (error: unknown) => send(socket, {
+            type: "request-error",
+            requestId: request.requestId,
+            message: error instanceof Error ? error.message : "The Owner turn failed.",
+          }),
         );
         return;
       }
@@ -384,17 +509,27 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       resolution: ReturnType<typeof Promise.withResolvers<void>>;
     }
   >();
+  const pendingTurns = new Map<
+    number,
+    ReturnType<typeof Promise.withResolvers<PiOwnerResponse>>
+  >();
   const attached = Promise.withResolvers<number>();
   const exitResolution = Promise.withResolvers<LeadHostExit>();
   let nextRequestId = 1;
   let observedExit: LeadHostExit | undefined;
+  let leadState: LeadHostState = "starting";
   let detached = false;
 
   readLines(socket, (line) => {
     const message = JSON.parse(line) as ServerMessage;
     if (message.type === "attached") {
       transcript.push(...message.transcript);
+      leadState = message.leadState;
       attached.resolve(message.childPid);
+      return;
+    }
+    if (message.type === "lead-state") {
+      leadState = message.state;
       return;
     }
     if (message.type === "entry") {
@@ -407,9 +542,16 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       pending.delete(message.requestId);
       return;
     }
+    if (message.type === "turn-result") {
+      pendingTurns.get(message.requestId)?.resolve(message.response);
+      pendingTurns.delete(message.requestId);
+      return;
+    }
     if (message.type === "request-error") {
       pending.get(message.requestId)?.resolution.reject(new Error(message.message));
       pending.delete(message.requestId);
+      pendingTurns.get(message.requestId)?.reject(new Error(message.message));
+      pendingTurns.delete(message.requestId);
       return;
     }
     observedExit = message.exit;
@@ -419,12 +561,18 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       else request.resolution.reject(new Error("The Lead Agent exited before input was acknowledged."));
     }
     pending.clear();
+    for (const turn of pendingTurns.values()) {
+      turn.reject(new Error("The Lead Agent exited before the Owner turn completed."));
+    }
+    pendingTurns.clear();
     for (const listener of exitListeners) listener(message.exit);
   });
   socket.once("error", (error) => {
     attached.reject(error);
     for (const request of pending.values()) request.resolution.reject(error);
     pending.clear();
+    for (const turn of pendingTurns.values()) turn.reject(error);
+    pendingTurns.clear();
   });
   socket.once("close", () => {
     if (!detached && !observedExit) {
@@ -432,6 +580,8 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       attached.reject(error);
       for (const request of pending.values()) request.resolution.reject(error);
       pending.clear();
+      for (const turn of pendingTurns.values()) turn.reject(error);
+      pendingTurns.clear();
     }
   });
   socket.write(`${JSON.stringify({ type: "attach" } satisfies ClientRequest)}\n`);
@@ -458,15 +608,32 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
   return {
     address,
     childPid,
+    get leadState() {
+      return leadState;
+    },
     get transcript() {
       return transcript;
     },
     exit: exitResolution.promise,
     sendOwnerLine(line) {
-      if (!isSingleLine(line)) {
-        return Promise.reject(new Error("Owner input must be exactly one line."));
-      }
       return request("owner", (requestId) => ({ type: "owner", requestId, line }));
+    },
+    completeOwnerTurn(input) {
+      if (detached || socket.destroyed) {
+        return Promise.reject(new Error("The local Lead Agent host client is detached."));
+      }
+      const requestId = nextRequestId++;
+      const resolution = Promise.withResolvers<PiOwnerResponse>();
+      pendingTurns.set(requestId, resolution);
+      socket.write(
+        `${JSON.stringify({ type: "turn", requestId, input } satisfies ClientRequest)}\n`,
+        (error) => {
+          if (!error) return;
+          pendingTurns.delete(requestId);
+          resolution.reject(error);
+        },
+      );
+      return resolution.promise;
     },
     async stop() {
       const stopRequest = request("stop", (requestId) => ({ type: "stop", requestId }));
@@ -481,6 +648,8 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       const error = new Error("The local Lead Agent host client detached.");
       for (const request of pending.values()) request.resolution.reject(error);
       pending.clear();
+      for (const turn of pendingTurns.values()) turn.reject(error);
+      pendingTurns.clear();
       if (socket.destroyed) return;
       const closed = Promise.withResolvers<void>();
       socket.once("close", () => closed.resolve());

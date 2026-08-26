@@ -76,6 +76,7 @@ async function main() {
   requireEntrypoint(leadFiles, "lifecycle-cli.js", "Lead Agent");
   requireEntrypoint(leadFiles, "owner-launcher.js", "Lead Agent");
   requireEntrypoint(leadFiles, "owner-client.js", "Lead Agent");
+  requireEntrypoint(leadFiles, "owner-gateway-cli.js", "Lead Agent");
 
   const temporary = join(
     dirname(output),

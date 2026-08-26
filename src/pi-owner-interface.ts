@@ -44,10 +44,25 @@ export type PiOwnerInterfaceInput = {
   readSessionData?(): SessionViewSnapshot | undefined;
   readUpdateStatus?(): PiOwnerUpdateStatus | undefined;
   subscribeNotices?(listener: (content: string) => void): () => void;
+  subscribeConversationReplacements?(listener: () => void): () => void;
 };
 
-export async function runPiOwnerInterface(input: PiOwnerInterfaceInput): Promise<void> {
+export async function runPiOwnerInterface(
+  input: PiOwnerInterfaceInput,
+): Promise<"closed" | "conversation-replaced"> {
   const previousDirectory = process.cwd();
+  let conversationReplaced = false;
+  const wrappedInput: PiOwnerInterfaceInput = input.subscribeConversationReplacements
+    ? {
+        ...input,
+        subscribeConversationReplacements(listener) {
+          return input.subscribeConversationReplacements!(() => {
+            conversationReplaced = true;
+            listener();
+          });
+        },
+      }
+    : input;
   process.chdir(input.targetProjectPath);
   try {
     await runPi([
@@ -59,8 +74,9 @@ export async function runPiOwnerInterface(input: PiOwnerInterfaceInput): Promise
       "--tui-mode",
       "fullscreen",
     ], {
-      extensionFactories: [rikerOwnerExtension(input)],
+      extensionFactories: [rikerOwnerExtension(wrappedInput)],
     });
+    return conversationReplaced ? "conversation-replaced" : "closed";
   } finally {
     process.chdir(previousDirectory);
   }
@@ -82,6 +98,7 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
   let status: "available" | "responding" | "error" = "available";
   let refreshTimer: NodeJS.Timeout | undefined;
   let unsubscribeNotices: (() => void) | undefined;
+  let unsubscribeConversationReplacements: (() => void) | undefined;
 
   pi.registerMessageRenderer("riker-owner", (message, { outputPad }, theme) => {
     const box = new Box(outputPad, 0, (text) => theme.bg("userMessageBg", text));
@@ -194,6 +211,9 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
       send(pi, "riker-lead", content);
       updateFooter(ctx);
     });
+    unsubscribeConversationReplacements = input.subscribeConversationReplacements?.(() => {
+      ctx.shutdown();
+    });
     refreshTimer = setInterval(() => updateFooter(ctx), 500);
   });
 
@@ -290,6 +310,8 @@ function installRikerOwnerExtension(pi: ExtensionAPI, input: PiOwnerInterfaceInp
     refreshTimer = undefined;
     unsubscribeNotices?.();
     unsubscribeNotices = undefined;
+    unsubscribeConversationReplacements?.();
+    unsubscribeConversationReplacements = undefined;
     closePanel();
     footer = undefined;
     footerTheme = undefined;

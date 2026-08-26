@@ -22,6 +22,12 @@ import {
 } from "./local-host/index.ts";
 import { verifyLocalReleaseCandidate } from "./local-release/index.ts";
 import { createWindowsToastNotifier } from "./owner-notifications/index.ts";
+import {
+  decodeHostedOwnerResponse,
+  encodeHostedOwnerResponse,
+  ownerConversationPrefix,
+  ownerTurnCompleteMarker,
+} from "./owner-host-framing.ts";
 
 const command = process.argv[2];
 
@@ -216,6 +222,8 @@ async function host(installRoot: string): Promise<void> {
           transcriptSeed: conversationSeed(paths.state, generation),
           durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
           ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
+          encodeOwnerInput: true,
+          ownerTurnCompletePrefix: ownerTurnCompleteMarker,
           onTranscriptEntry(entry) {
             if (!toasts || entry.source !== "lead" || entry.stream !== "stdout") return;
             if (!entry.line.startsWith(workerNoticePrefix)) return;
@@ -268,7 +276,7 @@ async function attach(
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   try {
     for await (const line of input) {
-      if (line.trim()) await client.sendOwnerLine(line);
+      if (line.trim()) await client.completeOwnerTurn(line);
     }
   } finally {
     unsubscribe();
@@ -283,7 +291,11 @@ function conversationSeed(stateDirectory: string, writeGeneration: number): Lead
     return (state.readOwnerConversation(state.latestActiveOwnerSessionId())?.messages ?? []).map((message) =>
       message.role === "owner"
         ? { source: "owner" as const, line: message.content }
-        : { source: "lead" as const, stream: "stdout" as const, line: `Lead Agent: ${message.content}` }
+        : {
+            source: "lead" as const,
+            stream: "stdout" as const,
+            line: encodeHostedOwnerResponse({ source: "Lead Agent", content: message.content }),
+          }
     );
   } finally {
     state.close();
@@ -293,7 +305,13 @@ function conversationSeed(stateDirectory: string, writeGeneration: number): Lead
 function renderEntry(entry: LeadHostTranscriptEntry): void {
   if (entry.source === "owner") process.stdout.write(`Owner: ${entry.line}\n`);
   else if (entry.line.startsWith("CMD_RIKER_SESSION_JSON:")) return;
-  else process[entry.stream === "stderr" ? "stderr" : "stdout"].write(`${entry.line}\n`);
+  else if (entry.line.startsWith(ownerConversationPrefix) || entry.line === ownerTurnCompleteMarker) return;
+  else {
+    const response = decodeHostedOwnerResponse(entry.line);
+    process[entry.stream === "stderr" ? "stderr" : "stdout"].write(
+      response ? `${response.source}: ${response.content}\n` : `${entry.line}\n`,
+    );
+  }
 }
 
 function argumentValue(name: string): string | undefined {

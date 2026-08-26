@@ -109,6 +109,32 @@ riker inspect
 riker stop
 ```
 
+### External Owner Gateway
+
+Desktop or web control surfaces running on the same machine can attach through the versioned Owner
+Gateway instead of parsing the Pi terminal. The launcher starts or reuses the protected Lead Agent,
+then keeps a JSON-lines protocol on standard input and output until the caller closes input:
+
+```powershell
+riker gateway
+```
+
+The first output message is a `ready` record with `protocolVersion`, the hosted process identity, and
+one current snapshot containing the Target Project, Owner conversation, Work Items, Worker Sessions,
+Standing Orders, and notices. Internal state identifiers are replaced by presentation-safe numbers.
+Subsequent `event` records carry complete current-conversation replacements, Session View updates,
+Lead availability, notices, and exits; after an exit, reconnecting yields the replacement Lead's new
+`ready` identity and snapshot. A caller starts an Owner turn with a correlated command:
+
+```json
+{"id":"turn-1","type":"turn","content":"Continue the integration"}
+```
+
+The gateway returns either `turn-result` or `turn-error` with the same `id`. Standard output contains
+protocol records only; host failures go to standard error. The gateway is a local presentation seam,
+not a second orchestrator: CMD Riker remains authoritative for conversations, Command Authority,
+Work Items, Worker Sessions, effects, and Verification.
+
 Inside the `riker` terminal, `/items` lists every work item with a plain status ("in progress",
 "needs you", "done", …); `/workers` and `/riker` show Worker Sessions and the Session View. The
 Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"

@@ -22,6 +22,7 @@ const bundlePayload = {
   "dist/lifecycle-cli.js": Buffer.from("console.log('lifecycle');\n"),
   "dist/owner-launcher.js": Buffer.from("console.log('launcher');\n"),
   "dist/owner-client.js": Buffer.from("console.log('client');\n"),
+  "dist/owner-gateway-cli.js": Buffer.from("console.log('gateway');\n"),
   "runtime/node.exe": Buffer.from("fake pinned node runtime"),
 };
 
@@ -53,9 +54,13 @@ function fakeClient(hostRunning: { value: boolean }): LocalLeadHostClient {
   return {
     address: "fake",
     childPid: 1,
+    leadState: "available",
     transcript: [],
     exit: new Promise(() => {}),
     async sendOwnerLine() {},
+    async completeOwnerTurn() {
+      return { source: "Lead Agent", content: "" };
+    },
     async stop() {
       hostRunning.value = false;
       return { kind: "explicit-stop", code: 0, signal: null };
@@ -132,9 +137,13 @@ test("install stages the bundle, snapshots initial state, and writes the v2 laun
 
   const manifest = JSON.parse(
     await readFile(join(paths.launcher, "installation.json"), "utf8"),
-  ) as { formatVersion: number; leadAgent: { lifecyclePath: string; runtimePath: string } };
+  ) as {
+    formatVersion: number;
+    leadAgent: { lifecyclePath: string; runtimePath: string; ownerGatewayPath: string };
+  };
   assert.equal(manifest.formatVersion, 2);
   assert.ok(manifest.leadAgent.lifecyclePath.endsWith("lifecycle-cli.js"));
+  assert.ok(manifest.leadAgent.ownerGatewayPath.endsWith("owner-gateway-cli.js"));
   const riker = await readFile(join(paths.launcher, "riker.cmd"), "utf8");
   assert.match(riker, /owner-launcher\.js/);
 

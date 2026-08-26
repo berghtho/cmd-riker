@@ -11,16 +11,20 @@ const commandArguments = forwarded.slice(1);
 
 try {
   const installation = await readInstallation(installRoot);
-  if (command === "start") {
+  if (command === "start" || command === "gateway") {
     await run(installation.leadAgent.runtimePath, [
       installation.leadAgent.lifecyclePath,
       "start",
       "--install-root",
       installRoot,
     ], "ignore", true);
+    const ownerEntrypoint = command === "gateway"
+      ? installation.leadAgent.ownerGatewayPath ??
+        join(installation.leadAgent.path, "dist", "owner-gateway-cli.js")
+      : installation.leadAgent.ownerClientPath ??
+        join(installation.leadAgent.path, "dist", "owner-client.js");
     await run(installation.leadAgent.runtimePath, [
-      installation.leadAgent.ownerClientPath ??
-        join(installation.leadAgent.path, "dist", "owner-client.js"),
+      ownerEntrypoint,
       "--install-root",
       installRoot,
     ], "inherit", false);
@@ -46,6 +50,7 @@ type InstallationManifest = {
     runtimePath: string;
     lifecyclePath: string;
     ownerClientPath?: string;
+    ownerGatewayPath?: string;
   };
 };
 

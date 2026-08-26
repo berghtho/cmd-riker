@@ -3,19 +3,13 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import {
-  connectLocalLeadHost,
-  localLeadHostAddress,
-  type LeadHostTranscriptEntry,
-  type LocalLeadHostClient,
-} from "./local-host/index.ts";
+import { localLeadHostAddress } from "./local-host/index.ts";
 import {
   runPiOwnerInterface,
-  type PiOwnerTranscriptEntry,
   type PiOwnerUpdateStatus,
 } from "./pi-owner-interface.ts";
-import { completeHostedOwnerInput } from "./owner-host-bridge.ts";
-import type { SessionViewSnapshot } from "./session-view/index.ts";
+import { connectOwnerGateway } from "./owner-gateway/index.ts";
+import { renderSessionView } from "./session-view/index.ts";
 
 const installRoot = requiredArgument("--install-root");
 
@@ -29,26 +23,35 @@ try {
 }
 
 async function runOwnerClient(installationRoot: string): Promise<void> {
-  const client = await connectWithRetry(localLeadHostAddress(resolve(installationRoot)), 10_000);
-  const targetProjectPath = await waitForTargetProjectPath(client, 60_000);
+  const gateway = await connectOwnerGateway(
+    localLeadHostAddress(resolve(installationRoot)),
+    { connectTimeoutMs: 10_000 },
+  );
   try {
-    await runPiOwnerInterface({
-      targetProjectPath,
-      transcript: readTranscript(client.transcript),
-      completeOwnerInput: (ownerInput) => completeHostedOwnerInput(client, ownerInput),
-      readSessionView: () => readLatestSessionView(client.transcript),
-      readSessionData: () => readLatestSessionData(client.transcript),
-      readUpdateStatus: createUpdateStatusReader(resolve(installationRoot)),
-      subscribeNotices: (listener) =>
-        client.onTranscriptEntry((entry: LeadHostTranscriptEntry) => {
-          const prefix = "CMD_RIKER_WORKER_NOTICE: ";
-          if (entry.source === "lead" && entry.stream === "stdout" && entry.line.startsWith(prefix)) {
-            listener(entry.line.slice(prefix.length));
-          }
+    const readUpdateStatus = createUpdateStatusReader(resolve(installationRoot));
+    let outcome: Awaited<ReturnType<typeof runPiOwnerInterface>>;
+    do {
+      outcome = await runPiOwnerInterface({
+        targetProjectPath: gateway.snapshot.targetProjectPath,
+        transcript: gateway.snapshot.conversation,
+        completeOwnerInput: (ownerInput) => gateway.completeTurn(ownerInput),
+        readSessionView: () => gateway.snapshot.sessionView
+          ? renderSessionView(gateway.snapshot.sessionView)
+          : "Lead starting | Worker Sessions unavailable | status pending",
+        readSessionData: () => gateway.snapshot.sessionView,
+        readUpdateStatus,
+        subscribeNotices: (listener) => gateway.subscribe((event) => {
+          if (event.type === "notice") listener(event.content);
         }),
-    });
+        subscribeConversationReplacements: (listener) => {
+          return gateway.subscribe((event) => {
+            if (event.type === "conversation" && event.replaced) listener();
+          });
+        },
+      });
+    } while (outcome === "conversation-replaced");
   } finally {
-    await client.detach();
+    await gateway.detach();
   }
 }
 
@@ -114,100 +117,6 @@ function createUpdateStatusReader(
     setInterval(() => void check(), 60_000).unref();
   }
   return () => status;
-}
-
-// The Lead prints its Target Project during boot; a freshly started host has an
-// open pipe before that line exists, so wait for it instead of reading once.
-function waitForTargetProjectPath(
-  client: LocalLeadHostClient,
-  timeoutMs: number,
-): Promise<string> {
-  const prefix = "CMD Riker | Target Project:";
-  const parse = (entry: LeadHostTranscriptEntry): string | undefined =>
-    entry.source === "lead" && entry.stream === "stdout" && entry.line.startsWith(prefix)
-      ? entry.line.slice(prefix.length).trim()
-      : undefined;
-  for (let index = client.transcript.length - 1; index >= 0; index -= 1) {
-    const found = parse(client.transcript[index]!);
-    if (found !== undefined) return Promise.resolve(found);
-  }
-  return new Promise((resolvePromise, reject) => {
-    const timeout = setTimeout(() => {
-      unsubscribe();
-      reject(new Error("The Lead Agent did not identify its Target Project in time."));
-    }, timeoutMs);
-    const unsubscribe = client.onTranscriptEntry((entry) => {
-      const found = parse(entry);
-      if (found === undefined) return;
-      clearTimeout(timeout);
-      unsubscribe();
-      resolvePromise(found);
-    });
-  });
-}
-
-function readLatestSessionView(transcript: readonly LeadHostTranscriptEntry[]): string {
-  for (let index = transcript.length - 1; index >= 0; index -= 1) {
-    const entry = transcript[index];
-    if (
-      entry?.source === "lead" &&
-      entry.stream === "stdout" &&
-      /^Lead (?:available|responding)\s+\|/.test(entry.line)
-    ) {
-      return entry.line;
-    }
-  }
-  return "Lead starting | Worker Sessions unavailable | status pending";
-}
-
-function readLatestSessionData(
-  transcript: readonly LeadHostTranscriptEntry[],
-): SessionViewSnapshot | undefined {
-  const prefix = "CMD_RIKER_SESSION_JSON:";
-  for (let index = transcript.length - 1; index >= 0; index -= 1) {
-    const entry = transcript[index];
-    if (entry?.source !== "lead" || entry.stream !== "stdout") continue;
-    if (!entry.line.startsWith(prefix)) continue;
-    try {
-      return JSON.parse(entry.line.slice(prefix.length)) as SessionViewSnapshot;
-    } catch {
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
-function readTranscript(
-  transcript: readonly LeadHostTranscriptEntry[],
-): PiOwnerTranscriptEntry[] {
-  const result: PiOwnerTranscriptEntry[] = [];
-  for (const entry of transcript) {
-    if (entry.source === "owner") {
-      result.push({ source: "owner", content: entry.line });
-      continue;
-    }
-    if (entry.stream !== "stdout") continue;
-    if (entry.line.startsWith("Lead Agent: ")) {
-      result.push({ source: "lead-agent", content: entry.line.slice("Lead Agent: ".length) });
-    } else if (entry.line.startsWith("Session View: ")) {
-      result.push({ source: "lead-agent", content: entry.line.slice("Session View: ".length) });
-    }
-  }
-  return result;
-}
-
-async function connectWithRetry(address: string, timeoutMs: number): Promise<LocalLeadHostClient> {
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown;
-  while (Date.now() < deadline) {
-    try {
-      return await connectLocalLeadHost(address);
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-    }
-  }
-  throw new Error("Timed out waiting for the protected Lead Agent.", { cause: lastError });
 }
 
 function requiredArgument(name: string): string {

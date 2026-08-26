@@ -2,12 +2,14 @@ import type { PiOwnerResponse } from "../pi-owner-interface.ts";
 import {
   connectLocalLeadHost,
   type LeadHostExit,
+  type LeadHostState,
   type LeadHostTranscriptEntry,
   type LocalLeadHostClient,
 } from "../local-host/index.ts";
 import type { SessionViewSnapshot } from "../session-view/index.ts";
 import {
   decodeHostedOwnerConversation,
+  ownerTurnCompleteMarker,
   type HostedOwnerConversationEntry,
 } from "../owner-host-framing.ts";
 
@@ -19,6 +21,7 @@ export type OwnerGatewayConversationEntry = HostedOwnerConversationEntry;
 
 export type OwnerGatewaySnapshot = {
   targetProjectPath: string;
+  leadState: LeadHostState;
   conversation: OwnerGatewayConversationEntry[];
   sessionView?: SessionViewSnapshot;
 };
@@ -62,14 +65,18 @@ export async function connectOwnerGateway(
     }
   };
   const unsubscribeTranscript = client.onTranscriptEntry((entry) => {
-    for (const event of gatewayEvents(entry)) publish(event);
+    for (const event of gatewayEvents(entry)) {
+      publish(event.type === "session-view"
+        ? { type: "session-view", sessionView: withLeadState(event.sessionView, client.leadState) }
+        : event);
+    }
   });
   const unsubscribeExit = client.onExit((exit) => publish({ type: "exit", exit }));
 
   return {
     childPid: client.childPid,
     get snapshot() {
-      return gatewaySnapshot(client.transcript, targetProjectPath);
+      return gatewaySnapshot(client.transcript, targetProjectPath, client.leadState);
     },
     completeTurn(ownerInput) {
       return client.completeOwnerTurn(ownerInput);
@@ -108,6 +115,7 @@ async function connectLocalHostWithRetry(
 function gatewaySnapshot(
   transcript: readonly LeadHostTranscriptEntry[],
   targetProjectPath: string,
+  leadState: LeadHostState,
 ): OwnerGatewaySnapshot {
   let conversation: OwnerGatewayConversationEntry[] = [];
   let sessionView: SessionViewSnapshot | undefined;
@@ -119,9 +127,19 @@ function gatewaySnapshot(
   }
   return {
     targetProjectPath,
+    leadState,
     conversation,
-    ...(sessionView ? { sessionView } : {}),
+    ...(sessionView ? { sessionView: withLeadState(sessionView, leadState) } : {}),
   };
+}
+
+function withLeadState(
+  sessionView: SessionViewSnapshot,
+  leadState: LeadHostState,
+): SessionViewSnapshot {
+  return leadState === "starting"
+    ? sessionView
+    : { ...sessionView, leadAvailability: leadState };
 }
 
 function gatewayEvents(entry: LeadHostTranscriptEntry): OwnerGatewayEvent[] {
@@ -129,6 +147,9 @@ function gatewayEvents(entry: LeadHostTranscriptEntry): OwnerGatewayEvent[] {
   if (entry.stream !== "stdout") return [];
   const conversation = decodeHostedOwnerConversation(entry.line);
   if (conversation) return [{ type: "conversation", conversation }];
+  if (entry.line === ownerTurnCompleteMarker) {
+    return [{ type: "lead-state", state: "available" }];
+  }
   if (entry.line.startsWith(workerNoticePrefix)) {
     return [{ type: "notice", content: entry.line.slice(workerNoticePrefix.length) }];
   }
@@ -137,10 +158,7 @@ function gatewayEvents(entry: LeadHostTranscriptEntry): OwnerGatewayEvent[] {
       const sessionView = JSON.parse(
         entry.line.slice(sessionViewPrefix.length),
       ) as SessionViewSnapshot;
-      return [
-        { type: "session-view", sessionView },
-        { type: "lead-state", state: sessionView.leadAvailability },
-      ];
+      return [{ type: "session-view", sessionView }];
     } catch {
       return [];
     }

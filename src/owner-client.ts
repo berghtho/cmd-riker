@@ -28,22 +28,45 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
     { connectTimeoutMs: 10_000 },
   );
   try {
-    await runPiOwnerInterface({
-      targetProjectPath: gateway.snapshot.targetProjectPath,
-      transcript: gateway.snapshot.conversation,
-      completeOwnerInput: (ownerInput) => gateway.completeTurn(ownerInput),
-      readSessionView: () => gateway.snapshot.sessionView
-        ? renderSessionView(gateway.snapshot.sessionView)
-        : "Lead starting | Worker Sessions unavailable | status pending",
-      readSessionData: () => gateway.snapshot.sessionView,
-      readUpdateStatus: createUpdateStatusReader(resolve(installationRoot)),
-      subscribeNotices: (listener) => gateway.subscribe((event) => {
-        if (event.type === "notice") listener(event.content);
-      }),
-    });
+    const readUpdateStatus = createUpdateStatusReader(resolve(installationRoot));
+    let outcome: Awaited<ReturnType<typeof runPiOwnerInterface>>;
+    do {
+      outcome = await runPiOwnerInterface({
+        targetProjectPath: gateway.snapshot.targetProjectPath,
+        transcript: gateway.snapshot.conversation,
+        completeOwnerInput: (ownerInput) => gateway.completeTurn(ownerInput),
+        readSessionView: () => gateway.snapshot.sessionView
+          ? renderSessionView(gateway.snapshot.sessionView)
+          : "Lead starting | Worker Sessions unavailable | status pending",
+        readSessionData: () => gateway.snapshot.sessionView,
+        readUpdateStatus,
+        subscribeNotices: (listener) => gateway.subscribe((event) => {
+          if (event.type === "notice") listener(event.content);
+        }),
+        subscribeConversationReplacements: (listener) => {
+          let conversation = gateway.snapshot.conversation;
+          return gateway.subscribe((event) => {
+            if (event.type !== "conversation") return;
+            const previous = conversation;
+            conversation = event.conversation;
+            if (!continuesConversation(previous, conversation)) listener();
+          });
+        },
+      });
+    } while (outcome === "conversation-replaced");
   } finally {
     await gateway.detach();
   }
+}
+
+function continuesConversation(
+  previous: ReadonlyArray<{ source: string; content: string }>,
+  current: ReadonlyArray<{ source: string; content: string }>,
+): boolean {
+  return previous.length <= current.length && previous.every((entry, index) => {
+    const next = current[index];
+    return next?.source === entry.source && next.content === entry.content;
+  });
 }
 
 // The installed bundle records its source repository and commit; the client

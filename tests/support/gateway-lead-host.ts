@@ -27,9 +27,12 @@ for await (const wireLine of lines) {
   const line = wireLine.startsWith("CMD_RIKER_OWNER_INPUT:")
     ? (JSON.parse(wireLine.slice("CMD_RIKER_OWNER_INPUT:".length)) as { content: string }).content
     : wireLine;
+  if (line === "exit before durable acknowledgement") process.exit(23);
   const display = line.replaceAll("\n", " / ");
   process.stdout.write(`CMD_RIKER_OWNER_RECORDED:turn-${display}\n`);
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) =>
+    line === "slow turn" ? setTimeout(resolve, 100) : setImmediate(resolve)
+  );
   process.stdout.write(`CMD_RIKER_WORKER_NOTICE: Worker needs input for ${display}\n`);
   process.stdout.write(
     `CMD_RIKER_OWNER_RESPONSE:${JSON.stringify({

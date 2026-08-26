@@ -54,6 +54,7 @@ function fakeClient(hostRunning: { value: boolean }): LocalLeadHostClient {
   return {
     address: "fake",
     childPid: 1,
+    leadState: "available",
     transcript: [],
     exit: new Promise(() => {}),
     async sendOwnerLine() {},

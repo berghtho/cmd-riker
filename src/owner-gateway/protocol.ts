@@ -41,6 +41,7 @@ export type OwnerGatewayProtocolSessionView = {
 
 export type OwnerGatewayProtocolSnapshot = {
   targetProjectPath: string;
+  leadState: OwnerGatewaySnapshot["leadState"];
   conversation: OwnerGatewayConversationEntry[];
   sessionView?: OwnerGatewayProtocolSessionView;
 };
@@ -121,6 +122,7 @@ export async function runOwnerGatewayProtocol(
 function protocolSnapshot(snapshot: OwnerGatewaySnapshot): OwnerGatewayProtocolSnapshot {
   return {
     targetProjectPath: snapshot.targetProjectPath,
+    leadState: snapshot.leadState,
     conversation: snapshot.conversation,
     ...(snapshot.sessionView
       ? { sessionView: protocolSessionView(snapshot.sessionView) }

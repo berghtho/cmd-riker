@@ -17,6 +17,7 @@ test("external clients converse with the Lead and observe orchestration through 
     durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
     encodeOwnerInput: true,
     ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    transcriptByteLimit: 256,
     onStopIntent: async () => {},
   });
   t.after(() => server.stop());
@@ -60,6 +61,42 @@ test("external clients converse with the Lead and observe orchestration through 
     { source: "owner", content: "new session turn" },
     { source: "lead-agent", content: "completed new session turn\nverified" },
   ]);
+
+  const slowTurn = gateway.completeTurn("slow turn");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(gateway.snapshot.leadState, "responding");
+  const attachedWhileResponding = await connectOwnerGateway(address);
+  t.after(() => attachedWhileResponding.detach());
+  assert.equal(attachedWhileResponding.snapshot.leadState, "responding");
+  await slowTurn;
+  assert.equal(gateway.snapshot.leadState, "available");
+});
+
+test("host exit before durable acknowledgement rejects one turn without an unhandled rejection", async (t) => {
+  const address = localLeadHostAddress(`C:\\cmd-riker-test-installations\\${randomUUID()}`);
+  const server = await startLocalLeadHost({
+    address,
+    executable: process.execPath,
+    args: [gatewayLeadHost],
+    durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+    encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    onStopIntent: async () => {},
+  });
+  t.after(() => server.stop());
+  const gateway = await connectOwnerGateway(address);
+  t.after(() => gateway.detach());
+  const unhandled: unknown[] = [];
+  const recordUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", recordUnhandled);
+  t.after(() => process.off("unhandledRejection", recordUnhandled));
+
+  await assert.rejects(
+    gateway.completeTurn("exit before durable acknowledgement"),
+    /exited before (?:Owner input became durable|the Owner turn completed)|connection closed/,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(unhandled, []);
 });
 
 function isEvent(

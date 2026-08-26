@@ -63,6 +63,54 @@ test("Pi Owner interface handles one Riker turn in-process", async () => {
   ]);
 });
 
+test("Pi Owner interface restarts when the current Owner Session conversation is replaced", async () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let replacement: (() => void) | undefined;
+  let shutdowns = 0;
+  const pi = {
+    on(event: string, handler: (...args: unknown[]) => unknown) {
+      handlers.set(event, handler);
+    },
+    registerMessageRenderer() {},
+    registerCommand() {},
+    registerShortcut() {},
+    sendMessage() {},
+  } as unknown as ExtensionAPI;
+  const extension = rikerOwnerExtension({
+    targetProjectPath: "C:\\target-project",
+    transcript: [],
+    async completeOwnerInput() {
+      return { source: "Lead Agent", content: "unused" };
+    },
+    readSessionView() {
+      return "Lead available | 0 Workers | all quiet";
+    },
+    subscribeConversationReplacements(listener) {
+      replacement = listener;
+      return () => { replacement = undefined; };
+    },
+  });
+  if (typeof extension === "function") throw new Error("Expected a named inline extension.");
+  await extension.factory(pi);
+  const context = {
+    shutdown() {
+      shutdowns += 1;
+    },
+    ui: {
+      setTitle() {},
+      setHeader() {},
+      setFooter() {},
+      setWorkingMessage() {},
+    },
+  } as unknown as ExtensionContext;
+
+  await handlers.get("session_start")?.({}, context);
+  replacement?.();
+  assert.equal(shutdowns, 1);
+  await handlers.get("session_shutdown")?.({}, context);
+  assert.equal(replacement, undefined);
+});
+
 const plainTheme = {
   fg: (_color: string, text: string) => text,
   bg: (_color: string, text: string) => text,

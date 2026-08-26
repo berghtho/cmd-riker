@@ -392,7 +392,7 @@ function runInteractiveConversation(
         ownerNotices.deliver = previous;
       };
     },
-  });
+  }).then(() => {});
 }
 
 type OwnerInteractionOutput = {

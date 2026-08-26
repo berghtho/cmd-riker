@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { connectOwnerGateway } from "../src/owner-gateway/index.ts";
@@ -101,6 +104,130 @@ test("host exit before durable acknowledgement rejects one turn without an unhan
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(unhandled, []);
 });
+
+test("a bound gateway matches a junction and exposes the requested canonical real project path", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cmd-riker-gateway-identity-"));
+  const project = join(root, "Configured Project");
+  const junction = join(root, "project-link");
+  await mkdir(project);
+  await symlink(project, junction, process.platform === "win32" ? "junction" : "dir");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const address = localLeadHostAddress(`C:\\cmd-riker-test-installations\\${randomUUID()}`);
+  const server = await startLocalLeadHost({
+    address,
+    executable: process.execPath,
+    args: [gatewayLeadHost],
+    env: {
+      ...process.env,
+      CMD_RIKER_TEST_PROJECTS: JSON.stringify([`${project}${process.platform === "win32" ? "\\." : "/."}`]),
+    },
+    durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+    encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    onStopIntent: async () => {},
+  });
+  t.after(() => server.stop());
+  const gateway = await connectOwnerGateway(address, {
+    projectPath: `${junction.replaceAll("\\", "/")}/`,
+  });
+  t.after(() => gateway.detach());
+  const canonicalPath = await realpath(junction);
+  assert.equal(gateway.snapshot.targetProjectPath, canonicalPath);
+  assert.equal(gateway.snapshot.sessionView?.projects?.[0]?.path, canonicalPath);
+  const conversationTarget = Promise.withResolvers<string>();
+  gateway.subscribe((event) => {
+    if (event.type === "conversation") conversationTarget.resolve(event.targetProjectPath);
+  });
+
+  await gateway.completeTurn("through the junction");
+
+  assert.equal(await conversationTarget.promise, canonicalPath);
+});
+
+test("project-bound gateways isolate projects and retain private same-project cursors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cmd-riker-gateway-projects-"));
+  const targetProject = join(root, "target-project");
+  const secondProject = join(root, "second-project");
+  await Promise.all([mkdir(targetProject), mkdir(secondProject)]);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const address = localLeadHostAddress(`C:\\cmd-riker-test-installations\\${randomUUID()}`);
+  const server = await startLocalLeadHost({
+    address,
+    executable: process.execPath,
+    args: [gatewayLeadHost],
+    env: {
+      ...process.env,
+      CMD_RIKER_TEST_PROJECTS: JSON.stringify([targetProject, secondProject]),
+    },
+    durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+    encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    onStopIntent: async () => {},
+  });
+  t.after(() => server.stop());
+  const targetA = await connectOwnerGateway(address, {
+    projectPath: process.platform === "win32" ? targetProject.toUpperCase() : targetProject,
+  });
+  const targetB = await connectOwnerGateway(address, { projectPath: targetProject });
+  const second = await connectOwnerGateway(address, { projectPath: secondProject });
+  t.after(async () => {
+    await Promise.all([targetA.detach(), targetB.detach(), second.detach()]);
+  });
+
+  assert.equal(targetA.snapshot.targetProjectPath, await realpath(targetProject));
+  assert.equal(second.snapshot.targetProjectPath, await realpath(secondProject));
+  assert.equal(targetA.snapshot.sessionView?.lead?.model, "initial-session-model");
+  assert.equal(targetB.snapshot.sessionView?.lead?.model, "initial-session-model");
+  const targetBObservedSharedSession = Promise.withResolvers<void>();
+  const unsubscribeTargetB = targetB.subscribe((event) => {
+    if (event.type === "conversation" && event.conversation[0]?.content === "target only") {
+      targetBObservedSharedSession.resolve();
+    }
+  });
+  t.after(unsubscribeTargetB);
+  await stage("target turn", targetA.completeTurn("target only"));
+  await targetBObservedSharedSession.promise;
+  assert.deepEqual(targetA.snapshot.conversation.map((entry) => entry.content), [
+    "target only",
+    "completed target only\nverified",
+  ]);
+  assert.deepEqual(targetB.snapshot.conversation, targetA.snapshot.conversation);
+  assert.equal(second.snapshot.conversation.length, 0);
+
+  const targetBRevision = targetB.snapshot.ownerSessionRevision;
+  await stage("new target session", targetA.completeTurn("/session new"));
+  assert.deepEqual(targetA.snapshot.conversation, []);
+  assert.equal(targetA.snapshot.ownerSessionRevision, targetBRevision + 1);
+  assert.equal(targetB.snapshot.ownerSessionRevision, targetBRevision);
+  assert.equal(targetA.snapshot.sessionView?.lead?.model, "new-session-model");
+  assert.equal(targetA.snapshot.sessionView?.lead?.contextTokens, 200);
+  assert.equal(targetB.snapshot.sessionView?.lead?.model, "initial-session-model");
+  assert.equal(targetB.snapshot.sessionView?.lead?.contextTokens, 100);
+  assert.deepEqual(targetB.snapshot.conversation.map((entry) => entry.content), [
+    "target only",
+    "completed target only\nverified",
+  ]);
+
+  await stage("second-project turn", second.completeTurn("second only"));
+  assert.deepEqual(second.snapshot.conversation.map((entry) => entry.content), [
+    "second only",
+    "completed second only\nverified",
+  ]);
+  assert.deepEqual(targetB.snapshot.conversation.map((entry) => entry.content), [
+    "target only",
+    "completed target only\nverified",
+  ]);
+});
+
+async function stage<T>(name: string, operation: Promise<T>): Promise<T> {
+  try {
+    return await operation;
+  } catch (error) {
+    throw new Error(`${name}: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    });
+  }
+}
 
 function isEvent(
   value: unknown,

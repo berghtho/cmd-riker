@@ -18,8 +18,12 @@ import {
 import {
   decodeHostedOwnerInput,
   encodeHostedOwnerConversation,
+  encodeHostedOwnerError,
+  encodeHostedOwnerProjects,
   encodeHostedOwnerResponse,
+  encodeHostedOwnerSessionView,
   ownerTurnCompleteMarker,
+  type HostedOwnerInput,
 } from "./owner-host-framing.ts";
 import {
   PiAgentTurnAdapter,
@@ -264,6 +268,9 @@ async function main(): Promise<void> {
     ownerNotices.deliver = (content) => {
       deliverNotice(content);
       emitSessionData(state, workerSupervisors, sessionContext);
+      if (process.argv.includes("--hosted")) {
+        emitHostedProjectData(state, workerSupervisors);
+      }
     };
 
     if (process.stdin.isTTY && process.stdout.isTTY) {
@@ -300,11 +307,31 @@ async function runScriptableConversation(
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
   process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
   emitSessionData(state, workerSupervisors, sessionContext);
-  if (hosted) emitConversationData(state, sessionContext);
+  if (hosted) {
+    emitHostedProjectData(state, workerSupervisors);
+    emitConversationData(state, sessionContext);
+  }
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const ownerInputLine of lines) {
-    const ownerInput = hosted ? hostedOwnerInput(ownerInputLine) : ownerInputLine;
+    const framedInput = hosted ? hostedOwnerInput(ownerInputLine) : { content: ownerInputLine };
+    const ownerInput = framedInput.content;
     if (!ownerInput.trim()) continue;
+    let turnContext = sessionContext;
+    if (framedInput.targetProjectPath) {
+      try {
+        turnContext = scopedSessionContext(state, {
+          ...framedInput,
+          targetProjectPath: framedInput.targetProjectPath,
+        });
+      } catch (error) {
+        process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
+        process.stdout.write(`${encodeHostedOwnerError(
+          error instanceof Error ? error.message : "Invalid scoped Owner turn.",
+        )}\n`);
+        process.stdout.write(`${ownerTurnCompleteMarker}\n`);
+        continue;
+      }
+    }
     let ownerTurnRecorded = false;
     const output = await completeOwnerInteraction(
       state,
@@ -317,7 +344,7 @@ async function runScriptableConversation(
             process.stdout.write(`CMD_RIKER_OWNER_RECORDED:${turnId}\n`);
           }
         : undefined,
-      sessionContext,
+      turnContext,
     );
     if (hosted && !ownerTurnRecorded) {
       process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
@@ -325,18 +352,23 @@ async function runScriptableConversation(
     process.stdout.write(hosted
       ? `${encodeHostedOwnerResponse(output)}\n`
       : `${output.source}: ${output.content}\n`);
-    process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
-    emitSessionData(state, workerSupervisors, sessionContext);
+    process.stdout.write(`${currentSessionView(state, workerSupervisors, turnContext)}\n`);
+    emitSessionData(state, workerSupervisors, turnContext);
     if (hosted) {
-      emitConversationData(state, sessionContext);
+      emitHostedProjectData(state, workerSupervisors);
+      if (turnContext.targetProjectPath) {
+        emitHostedProjectProjection(state, workerSupervisors, turnContext.targetProjectPath, turnContext);
+      } else {
+        emitConversationData(state, turnContext);
+      }
       process.stdout.write(`${ownerTurnCompleteMarker}\n`);
     }
   }
 }
 
-function hostedOwnerInput(line: string): string {
+function hostedOwnerInput(line: string): HostedOwnerInput {
   // Invalid framing remains ordinary Owner input rather than becoming a host command.
-  return decodeHostedOwnerInput(line) ?? line;
+  return decodeHostedOwnerInput(line) ?? { content: line };
 }
 
 function emitSessionData(
@@ -353,16 +385,64 @@ function emitConversationData(
   state: AuthoritativeState,
   sessionContext: OwnerSessionContext,
 ): void {
-  const conversation = state.readOwnerConversation(sessionContext.activeSessionId);
-  const session = state.readOwnerSessions().find((entry) => entry.id === sessionContext.activeSessionId);
+  const session = sessionContext.activeSessionId
+    ? state.readOwnerSessions().find((entry) => entry.id === sessionContext.activeSessionId)
+    : undefined;
+  const projectPath = sessionContext.targetProjectPath ??
+    sessionProjectPath(state, session?.projectPath);
+  const conversation = sessionContext.activeSessionId
+    ? state.readOwnerConversation(sessionContext.activeSessionId)
+    : undefined;
+  if (!sessionContext.activeSessionId || (!session && conversation?.messages.length === 0)) {
+    process.stdout.write(`${encodeHostedOwnerConversation({
+      targetProjectPath: projectPath,
+      entries: [],
+    })}\n`);
+    return;
+  }
   process.stdout.write(`${encodeHostedOwnerConversation({
     sessionId: sessionContext.activeSessionId,
-    targetProjectPath: session?.projectPath ?? conversation?.targetProject.path ?? process.cwd(),
+    targetProjectPath: projectPath,
     entries: (conversation?.messages ?? []).map((message) => ({
       source: message.role,
       content: message.content,
     })),
   })}\n`);
+}
+
+function emitHostedProjectData(
+  state: AuthoritativeState,
+  workerSupervisors: WorkerSupervisors,
+): void {
+  const projects = state.readConfiguredProjects();
+  const projections = projects.map((project) => ({
+    project,
+    session: latestProjectSession(state, project.path),
+  }));
+  process.stdout.write(`${encodeHostedOwnerProjects(projections.map(({ project, session }) => ({
+    targetProjectPath: project.path,
+    ...(session ? { sessionId: session.id } : {}),
+  })))}\n`);
+  for (const { project, session } of projections) {
+    emitHostedProjectProjection(state, workerSupervisors, project.path, {
+      ...(session ? { activeSessionId: session.id } : {}),
+      targetProjectPath: project.path,
+    });
+  }
+}
+
+function emitHostedProjectProjection(
+  state: AuthoritativeState,
+  workerSupervisors: WorkerSupervisors,
+  targetProjectPath: string,
+  sessionContext: OwnerSessionContext,
+): void {
+  process.stdout.write(`${encodeHostedOwnerSessionView({
+    targetProjectPath,
+    ...(sessionContext.activeSessionId ? { sessionId: sessionContext.activeSessionId } : {}),
+    snapshot: sessionViewSnapshot(state, workerSupervisors, "available", sessionContext),
+  })}\n`);
+  emitConversationData(state, sessionContext);
 }
 
 function runInteractiveConversation(
@@ -405,8 +485,8 @@ type OwnerInteractionOutput = {
   content: string;
 };
 
-/** Which Owner Session the Lead is currently serving; switching mutates it in place. */
-type OwnerSessionContext = { activeSessionId: string };
+/** Which Owner Session one presentation client is serving; switching mutates only this cursor. */
+type OwnerSessionContext = { activeSessionId?: string; targetProjectPath?: string };
 
 async function completeOwnerInteraction(
   state: AuthoritativeState,
@@ -417,6 +497,16 @@ async function completeOwnerInteraction(
   sessionContext?: OwnerSessionContext,
 ): Promise<OwnerInteractionOutput> {
   if (!/^\/session\s+/i.test(ownerInput)) {
+    if (sessionContext?.targetProjectPath && !sessionContext.activeSessionId) {
+      sessionContext.activeSessionId = randomUUID();
+      state.appendOwnerSessionSnapshots([{
+        id: sessionContext.activeSessionId,
+        name: "",
+        createdAt: new Date().toISOString(),
+        projectPath: sessionContext.targetProjectPath,
+        state: "active",
+      }]);
+    }
     return {
       source: "Lead Agent",
       content: await createLeadAgentRuntime({
@@ -442,7 +532,7 @@ async function completeOwnerInteraction(
     };
   }
   if (sessionAction?.kind === "new-session" && sessionContext) {
-    let projectPath: string | undefined;
+    let projectPath = sessionContext.targetProjectPath;
     if (sessionAction.project) {
       const projects = snapshot.projects ?? [];
       const requested = sessionAction.project.toLowerCase();
@@ -454,6 +544,12 @@ async function completeOwnerInteraction(
         return {
           source: "Session View",
           content: `Unknown project "${sessionAction.project}". /session projects lists them.`,
+        };
+      }
+      if (sessionContext.targetProjectPath && !samePath(match.path, sessionContext.targetProjectPath)) {
+        return {
+          source: "Session View",
+          content: "This gateway can start sessions only in its bound project.",
         };
       }
       projectPath = match.path;
@@ -507,7 +603,7 @@ async function completeOwnerInteraction(
     };
   }
   if (orderAction?.kind === "revoke-order") {
-    const ownerTurnId = state.appendOwnerMessage(ownerInput);
+    const ownerTurnId = state.appendOwnerMessage(ownerInput, sessionContext?.activeSessionId);
     onOwnerTurnRecorded?.(ownerTurnId);
     createOrchestrationCore(state).revokeStandingOrder(
       orderAction.standingOrderId,
@@ -527,7 +623,7 @@ async function completeOwnerInteraction(
       content: "That control is not available right now.",
     };
   }
-  const ownerTurnId = state.appendOwnerMessage(ownerInput);
+  const ownerTurnId = state.appendOwnerMessage(ownerInput, sessionContext?.activeSessionId);
   onOwnerTurnRecorded?.(ownerTurnId);
   const supervisor = supervisorOfWorker(state, workerSupervisors, action.workerSessionId);
   if (!supervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
@@ -563,8 +659,55 @@ function sessionViewSnapshot(
   return projectSessionView(state, {
     leadAvailability,
     cancellationAvailable: Object.keys(workerSupervisors).length > 0,
-    ...(sessionContext ? { activeSessionId: sessionContext.activeSessionId } : {}),
+    ...(sessionContext?.activeSessionId
+      ? { activeSessionId: sessionContext.activeSessionId }
+      : {}),
+    ...(sessionContext?.targetProjectPath
+      ? { targetProjectPath: sessionContext.targetProjectPath }
+      : {}),
   });
+}
+
+function scopedSessionContext(
+  state: AuthoritativeState,
+  input: HostedOwnerInput & { targetProjectPath: string },
+): OwnerSessionContext {
+  const targetProjectPath = configuredProjectPath(state, input.targetProjectPath);
+  if (!targetProjectPath) {
+    throw new Error(`Unknown configured project path "${input.targetProjectPath}".`);
+  }
+  if (input.sessionId) {
+    const session = state.readOwnerSessions().find((candidate) => candidate.id === input.sessionId);
+    if (!session || !samePath(sessionProjectPath(state, session.projectPath), targetProjectPath)) {
+      throw new Error("The selected Owner Session does not belong to the gateway project.");
+    }
+    return { activeSessionId: session.id, targetProjectPath };
+  }
+  const latest = latestProjectSession(state, targetProjectPath);
+  return {
+    ...(latest ? { activeSessionId: latest.id } : {}),
+    targetProjectPath,
+  };
+}
+
+function latestProjectSession(state: AuthoritativeState, targetProjectPath: string) {
+  return state.readOwnerSessions().find((session) =>
+    session.state === "active" &&
+    samePath(sessionProjectPath(state, session.projectPath), targetProjectPath)
+  );
+}
+
+function sessionProjectPath(state: AuthoritativeState, projectPath: string | undefined): string {
+  return projectPath ?? state.readConfiguredProjects()[0]!.path;
+}
+
+function configuredProjectPath(state: AuthoritativeState, requestedPath: string): string | undefined {
+  return state.readConfiguredProjects().find((project) => samePath(project.path, requestedPath))?.path;
+}
+
+function samePath(left: string, right: string): boolean {
+  return left.replaceAll("/", "\\").toLowerCase() ===
+    right.replaceAll("/", "\\").toLowerCase();
 }
 
 function supervisorOfWorker(

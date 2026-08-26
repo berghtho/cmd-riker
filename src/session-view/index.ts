@@ -89,13 +89,17 @@ export interface SessionViewState {
   readEffectIntents(): EffectIntent[];
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
-  readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
+  readCapabilityNotice(
+    id: CapabilityNotice["id"],
+    targetProjectPath?: string,
+  ): CapabilityNotice | undefined;
   readForgeOwnerActionNotices(): ForgeOwnerActionNotice[];
   commitmentRecordedAt?(commitmentId: string): string | undefined;
-  readLatestLeadTurnMetrics?(): LeadTurnMetrics | undefined;
+  readLatestLeadTurnMetrics?(sessionId?: string): LeadTurnMetrics | undefined;
   readStandingOrders?(): StandingOrder[];
   readOwnerSessions?(): OwnerSessionView[];
   readConfiguredProjects?(): Array<{ name: string; path: string }>;
+  ownerSessionIdForTurn?(ownerTurnId: string): string | undefined;
 }
 
 export function projectSessionView(
@@ -104,11 +108,32 @@ export function projectSessionView(
     leadAvailability?: SessionViewSnapshot["leadAvailability"];
     cancellationAvailable?: boolean;
     activeSessionId?: string;
+    targetProjectPath?: string;
   } = {},
 ): SessionViewSnapshot {
   const cancellationAvailable = options.cancellationAvailable ?? true;
-  const workers = state.readWorkerSessions();
-  const commitments = state.readCommitments();
+  const configuredProjects = state.readConfiguredProjects?.() ?? [];
+  const defaultProjectPath = configuredProjects[0]?.path;
+  const ownerSessions = state.readOwnerSessions?.() ?? [];
+  const sessionById = new Map(ownerSessions.map((session) => [session.id, session]));
+  const projectPathOfSession = (sessionId: string | undefined): string | undefined =>
+    sessionById.get(sessionId ?? "")?.projectPath ?? defaultProjectPath;
+  const inProject = (path: string | undefined): boolean =>
+    !options.targetProjectPath || (path !== undefined && samePath(path, options.targetProjectPath));
+  const workers = state.readWorkerSessions().filter((worker) =>
+    inProject(worker.assignment.targetProjectPath)
+  );
+  const commitmentProject = new Map<string, string>();
+  for (const worker of state.readWorkerSessions()) {
+    if (worker.assignment.commitmentId) {
+      commitmentProject.set(worker.assignment.commitmentId, worker.assignment.targetProjectPath);
+    }
+  }
+  const commitments = state.readCommitments().filter((commitment) => {
+    const workerProject = commitmentProject.get(commitment.id);
+    const ownerSessionId = state.ownerSessionIdForTurn?.(commitment.createdByOwnerTurnId);
+    return inProject(workerProject ?? projectPathOfSession(ownerSessionId));
+  });
   const unsettledWorkerByCommitment = new Map<string, WorkerSession>();
   for (const worker of workers) {
     if (worker.assignment.commitmentId && !isTerminalWorker(worker)) {
@@ -145,6 +170,10 @@ export function projectSessionView(
 
   const notices: string[] = [];
   for (const effect of state.readEffectIntents()) {
+    if (
+      options.targetProjectPath &&
+      !inProject(effect.authorization.targetProjectPath ?? commitmentProject.get(effect.commitmentId))
+    ) continue;
     if (effect.status !== "unknown") continue;
     notices.push(
       "One effect could not be confirmed as applied or not applied; it needs reconciliation before a retry.",
@@ -158,7 +187,7 @@ export function projectSessionView(
       );
     }
   }
-  const capability = state.readCapabilityNotice("codex-worker");
+  const capability = state.readCapabilityNotice("codex-worker", options.targetProjectPath);
   if (capability?.state === "active") {
     notices.push(`The Codex Worker capability is unavailable: ${capability.detail}`);
   }
@@ -167,8 +196,7 @@ export function projectSessionView(
     notices.push(`${notice.provider}: ${notice.detail} Next: ${notice.nextAction}`);
   }
 
-  const lead = state.readLatestLeadTurnMetrics?.();
-  const configuredProjects = state.readConfiguredProjects?.() ?? [];
+  const lead = state.readLatestLeadTurnMetrics?.(options.activeSessionId);
   const projectNameByPath = new Map(
     configuredProjects.map((project) => [project.path.toLowerCase(), project.name]),
   );
@@ -177,7 +205,10 @@ export function projectSessionView(
     if (!projectPath) return configuredProjects.length > 1 ? defaultProjectName : undefined;
     return projectNameByPath.get(projectPath.toLowerCase()) ?? projectPath;
   };
-  const sessions = state.readOwnerSessions?.().map((session, index) => {
+  const projectSessions = ownerSessions.filter((session) =>
+    inProject(session.projectPath ?? defaultProjectPath)
+  );
+  const sessions = (state.readOwnerSessions ? projectSessions : undefined)?.map((session, index) => {
     const project = projectOf(session.projectPath);
     return {
       number: index + 1,
@@ -189,9 +220,12 @@ export function projectSessionView(
       ...(project ? { project } : {}),
     };
   });
+  const visibleProjects = options.targetProjectPath
+    ? configuredProjects.filter((project) => samePath(project.path, options.targetProjectPath!))
+    : configuredProjects;
   const projects =
-    configuredProjects.length > 0
-      ? configuredProjects.map((project, index) => ({
+    visibleProjects.length > 0
+      ? visibleProjects.map((project, index) => ({
           number: index + 1,
           name: project.name,
           path: project.path,
@@ -220,6 +254,11 @@ export function projectSessionView(
     ...(sessions ? { sessions } : {}),
     ...(projects ? { projects } : {}),
   };
+}
+
+function samePath(left: string, right: string): boolean {
+  return left.replaceAll("/", "\\").toLowerCase() ===
+    right.replaceAll("/", "\\").toLowerCase();
 }
 
 export function renderOwnerProjects(entries: OwnerProjectViewEntry[]): string {

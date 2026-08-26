@@ -2,10 +2,14 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, createConnection, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import {
+  decodeHostedOwnerConversation,
+  decodeHostedOwnerError,
+  decodeHostedOwnerProjects,
   decodeHostedOwnerResponse,
+  decodeHostedOwnerSessionView,
   encodeHostedOwnerInput,
   ownerConversationPrefix,
   ownerTurnCompleteMarker,
@@ -50,6 +54,10 @@ export type LocalLeadHostClient = {
   readonly exit: Promise<LeadHostExit>;
   sendOwnerLine(line: string): Promise<void>;
   completeOwnerTurn(input: string): Promise<PiOwnerResponse>;
+  completeScopedOwnerTurn(
+    input: string,
+    scope: { targetProjectPath: string; sessionId?: string },
+  ): Promise<{ response: PiOwnerResponse; sessionId?: string }>;
   stop(): Promise<LeadHostExit>;
   detach(): Promise<void>;
   onTranscriptEntry(listener: (entry: LeadHostTranscriptEntry) => void): () => void;
@@ -80,7 +88,13 @@ export type StartLocalLeadHostOptions = {
 type ClientRequest =
   | { type: "attach" }
   | { type: "owner"; requestId: number; line: string }
-  | { type: "turn"; requestId: number; input: string }
+  | {
+      type: "turn";
+      requestId: number;
+      input: string;
+      targetProjectPath?: string;
+      sessionId?: string;
+    }
   | { type: "stop"; requestId: number };
 
 type ServerMessage =
@@ -93,7 +107,7 @@ type ServerMessage =
   | { type: "entry"; entry: LeadHostTranscriptEntry }
   | { type: "lead-state"; state: LeadHostState }
   | { type: "ack"; requestId: number }
-  | { type: "turn-result"; requestId: number; response: PiOwnerResponse }
+  | { type: "turn-result"; requestId: number; response: PiOwnerResponse; sessionId?: string }
   | { type: "request-error"; requestId: number; message: string }
   | { type: "exit"; exit: LeadHostExit };
 
@@ -144,10 +158,8 @@ export async function startLocalLeadHost(
 
   const sockets = new Map<Socket, { attached: boolean }>();
   const transcript: LeadHostTranscriptEntry[] = [];
-  const stickyEntries = new Map<
-    "target-project" | "session-view" | "conversation",
-    LeadHostTranscriptEntry
-  >();
+  const stickyEntries = new Map<string, LeadHostTranscriptEntry>();
+  const latestSessionByProject = new Map<string, string | undefined>();
   let transcriptBytes = 0;
   let leadState: LeadHostState = "starting";
   let acceptingOwnerLines = true;
@@ -159,7 +171,13 @@ export async function startLocalLeadHost(
   let activeSemanticTurn:
     | {
         response?: PiOwnerResponse;
-        completion: ReturnType<typeof Promise.withResolvers<PiOwnerResponse>>;
+        error?: string;
+        targetProjectPath?: string;
+        sessionId?: string;
+        completion: ReturnType<typeof Promise.withResolvers<{
+          response: PiOwnerResponse;
+          sessionId?: string;
+        }>>;
       }
     | undefined;
   const durableOwnerAcks: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
@@ -172,7 +190,38 @@ export async function startLocalLeadHost(
     if (entry.source !== "lead" || entry.stream !== "stdout") return;
     if (entry.line.startsWith(targetProjectPrefix)) stickyEntries.set("target-project", entry);
     else if (entry.line.startsWith(sessionViewPrefix)) stickyEntries.set("session-view", entry);
-    else if (entry.line.startsWith(ownerConversationPrefix)) stickyEntries.set("conversation", entry);
+    else if (entry.line.startsWith(ownerConversationPrefix)) {
+      const conversation = decodeHostedOwnerConversation(entry.line);
+      if (!conversation) stickyEntries.set("conversation", entry);
+      else {
+        const projectKey = pathKey(conversation.targetProjectPath);
+        if (
+          latestSessionByProject.has(projectKey) &&
+          latestSessionByProject.get(projectKey) === conversation.sessionId
+        ) stickyEntries.set(`conversation:${projectKey}`, entry);
+      }
+    } else if (entry.line.startsWith("CMD_RIKER_OWNER_SESSION_VIEW:")) {
+      const view = decodeHostedOwnerSessionView(entry.line);
+      if (!view) stickyEntries.set("owner-session-view", entry);
+      else {
+        const projectKey = pathKey(view.targetProjectPath);
+        if (
+          latestSessionByProject.has(projectKey) &&
+          latestSessionByProject.get(projectKey) === view.sessionId
+        ) stickyEntries.set(`owner-session-view:${projectKey}`, entry);
+      }
+    } else {
+      const projects = decodeHostedOwnerProjects(entry.line);
+      if (!projects) return;
+      latestSessionByProject.clear();
+      for (const project of projects) {
+        const projectKey = pathKey(project.targetProjectPath);
+        latestSessionByProject.set(projectKey, project.sessionId);
+        stickyEntries.delete(`conversation:${projectKey}`);
+        stickyEntries.delete(`owner-session-view:${projectKey}`);
+      }
+      stickyEntries.set("owner-projects", entry);
+    }
   };
   const appendTranscript = (entry: LeadHostTranscriptEntry): void => {
     rememberStickyEntry(entry);
@@ -257,6 +306,17 @@ export async function startLocalLeadHost(
     }
     const response = decodeHostedOwnerResponse(line);
     if (response && activeSemanticTurn) activeSemanticTurn.response = response;
+    const hostedError = decodeHostedOwnerError(line);
+    if (hostedError && activeSemanticTurn) activeSemanticTurn.error = hostedError;
+    const conversation = decodeHostedOwnerConversation(line);
+    if (
+      conversation &&
+      activeSemanticTurn?.targetProjectPath &&
+      samePath(conversation.targetProjectPath, activeSemanticTurn.targetProjectPath)
+    ) {
+      if (conversation.sessionId) activeSemanticTurn.sessionId = conversation.sessionId;
+      else delete activeSemanticTurn.sessionId;
+    }
     recordEntry({ source: "lead", stream: "stdout", line });
     if (leadState === "starting" && line.startsWith(sessionViewPrefix)) setLeadState("available");
     if (line === ownerTurnCompleteMarker) setLeadState("available");
@@ -265,8 +325,15 @@ export async function startLocalLeadHost(
       line.startsWith(options.ownerTurnCompletePrefix) &&
       activeSemanticTurn
     ) {
-      if (activeSemanticTurn.response) {
-        activeSemanticTurn.completion.resolve(activeSemanticTurn.response);
+      if (activeSemanticTurn.error) {
+        activeSemanticTurn.completion.reject(new Error(activeSemanticTurn.error));
+      } else if (activeSemanticTurn.response) {
+        activeSemanticTurn.completion.resolve({
+          response: activeSemanticTurn.response,
+          ...(activeSemanticTurn.sessionId
+            ? { sessionId: activeSemanticTurn.sessionId }
+            : {}),
+        });
       } else {
         activeSemanticTurn.completion.reject(
           new Error("The Lead Agent completed the Owner turn without a framed response."),
@@ -276,7 +343,10 @@ export async function startLocalLeadHost(
   });
   readLines(child.stderr, (line) => recordEntry({ source: "lead", stream: "stderr", line }));
 
-  const writeOwnerLine = (line: string): Promise<void> => {
+  const writeOwnerLine = (
+    line: string,
+    scope?: { targetProjectPath: string; sessionId?: string },
+  ): Promise<void> => {
     const queued = writeQueue.then(async () => {
       if (!acceptingOwnerLines || childExit) {
         throw new Error("The local Lead Agent host is stopping or has exited.");
@@ -286,7 +356,10 @@ export async function startLocalLeadHost(
         : undefined;
       if (acknowledgement) durableOwnerAcks.push(acknowledgement);
       try {
-        await writeLine(child, options.encodeOwnerInput ? encodeHostedOwnerInput(line) : line);
+        await writeLine(
+          child,
+          options.encodeOwnerInput ? encodeHostedOwnerInput(line, scope) : line,
+        );
         if (acknowledgement) {
           await Promise.race([
             acknowledgement.promise,
@@ -319,21 +392,35 @@ export async function startLocalLeadHost(
     broadcast({ type: "lead-state", state });
   };
 
-  const completeOwnerTurn = (input: string): Promise<PiOwnerResponse> => {
+  const completeOwnerTurn = (
+    input: string,
+    scope?: { targetProjectPath: string; sessionId?: string },
+  ): Promise<{ response: PiOwnerResponse; sessionId?: string }> => {
     if (!options.ownerTurnCompletePrefix) {
       return Promise.reject(new Error("Semantic Owner turns are unavailable on this host."));
     }
     const operation = semanticTurnQueue.then(async () => {
-      const completion = Promise.withResolvers<PiOwnerResponse>();
+      const completion = Promise.withResolvers<{
+        response: PiOwnerResponse;
+        sessionId?: string;
+      }>();
       // Child exit may reject both delivery and completion in the same tick.
       void completion.promise.catch(() => {});
-      activeSemanticTurn = { completion };
+      activeSemanticTurn = {
+        completion,
+        ...(scope
+          ? {
+              targetProjectPath: scope.targetProjectPath,
+              ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
+            }
+          : {}),
+      };
       const timeout = setTimeout(() => {
         completion.reject(new Error("The Lead Agent did not finish the Owner turn within one hour."));
       }, 60 * 60_000);
       timeout.unref();
       try {
-        await writeOwnerLine(input);
+        await writeOwnerLine(input, scope);
         return await completion.promise;
       } finally {
         clearTimeout(timeout);
@@ -464,8 +551,39 @@ export async function startLocalLeadHost(
           });
           return;
         }
-        void completeOwnerTurn(request.input).then(
-          (response) => send(socket, { type: "turn-result", requestId: request.requestId, response }),
+        const hasTargetProjectPath = "targetProjectPath" in request;
+        const hasSessionId = "sessionId" in request;
+        if (
+          (hasTargetProjectPath &&
+            (typeof request.targetProjectPath !== "string" ||
+              !request.targetProjectPath.trim() ||
+              !isAbsolute(request.targetProjectPath))) ||
+          (hasSessionId &&
+            (typeof request.sessionId !== "string" || !request.sessionId.trim())) ||
+          (hasSessionId && !hasTargetProjectPath)
+        ) {
+          send(socket, {
+            type: "request-error",
+            requestId: request.requestId,
+            message: "Scoped Owner turns require an absolute targetProjectPath and optional non-empty sessionId.",
+          });
+          return;
+        }
+        void completeOwnerTurn(
+          request.input,
+          request.targetProjectPath
+            ? {
+                targetProjectPath: request.targetProjectPath,
+                ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+              }
+            : undefined,
+        ).then(
+          (result) => send(socket, {
+            type: "turn-result",
+            requestId: request.requestId,
+            response: result.response,
+            ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+          }),
           (error: unknown) => send(socket, {
             type: "request-error",
             requestId: request.requestId,
@@ -511,7 +629,10 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
   >();
   const pendingTurns = new Map<
     number,
-    ReturnType<typeof Promise.withResolvers<PiOwnerResponse>>
+    ReturnType<typeof Promise.withResolvers<{
+      response: PiOwnerResponse;
+      sessionId?: string;
+    }>>
   >();
   const attached = Promise.withResolvers<number>();
   const exitResolution = Promise.withResolvers<LeadHostExit>();
@@ -543,7 +664,10 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       return;
     }
     if (message.type === "turn-result") {
-      pendingTurns.get(message.requestId)?.resolve(message.response);
+      pendingTurns.get(message.requestId)?.resolve({
+        response: message.response,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+      });
       pendingTurns.delete(message.requestId);
       return;
     }
@@ -619,21 +743,10 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       return request("owner", (requestId) => ({ type: "owner", requestId, line }));
     },
     completeOwnerTurn(input) {
-      if (detached || socket.destroyed) {
-        return Promise.reject(new Error("The local Lead Agent host client is detached."));
-      }
-      const requestId = nextRequestId++;
-      const resolution = Promise.withResolvers<PiOwnerResponse>();
-      pendingTurns.set(requestId, resolution);
-      socket.write(
-        `${JSON.stringify({ type: "turn", requestId, input } satisfies ClientRequest)}\n`,
-        (error) => {
-          if (!error) return;
-          pendingTurns.delete(requestId);
-          resolution.reject(error);
-        },
-      );
-      return resolution.promise;
+      return completeTurnRequest(input).then((result) => result.response);
+    },
+    completeScopedOwnerTurn(input, scope) {
+      return completeTurnRequest(input, scope);
     },
     async stop() {
       const stopRequest = request("stop", (requestId) => ({ type: "stop", requestId }));
@@ -666,6 +779,35 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
       return () => exitListeners.delete(listener);
     },
   };
+
+  function completeTurnRequest(
+    input: string,
+    scope?: { targetProjectPath: string; sessionId?: string },
+  ): Promise<{ response: PiOwnerResponse; sessionId?: string }> {
+    if (detached || socket.destroyed) {
+      return Promise.reject(new Error("The local Lead Agent host client is detached."));
+    }
+    const requestId = nextRequestId++;
+    const resolution = Promise.withResolvers<{
+      response: PiOwnerResponse;
+      sessionId?: string;
+    }>();
+    pendingTurns.set(requestId, resolution);
+    socket.write(
+      `${JSON.stringify({
+        type: "turn",
+        requestId,
+        input,
+        ...(scope ?? {}),
+      } satisfies ClientRequest)}\n`,
+      (error) => {
+        if (!error) return;
+        pendingTurns.delete(requestId);
+        resolution.reject(error);
+      },
+    );
+    return resolution.promise;
+  }
 }
 
 function listen(server: Server, address: string): Promise<void> {
@@ -767,4 +909,13 @@ function isSingleLine(line: unknown): line is string {
 
 function entryBytes(entry: LeadHostTranscriptEntry): number {
   return Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+}
+
+function pathKey(path: string): string {
+  const normalized = resolve(path).replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { createConnection } from "node:net";
+import { createInterface } from "node:readline";
 import test from "node:test";
 
 import {
@@ -10,9 +13,136 @@ import {
   type LocalLeadHostClient,
   type LocalLeadHostServer,
 } from "../src/local-host/index.ts";
+import {
+  decodeHostedOwnerInput,
+  encodeHostedOwnerInput,
+} from "../src/owner-host-framing.ts";
 
 const echoLeadHost = new URL("./support/echo-lead-host.ts", import.meta.url)
   .pathname.replace(/^\/(.:)/, "$1");
+const gatewayLeadHost = new URL("./support/gateway-lead-host.ts", import.meta.url)
+  .pathname.replace(/^\/(.:)/, "$1");
+
+test("scoped hosted framing carries project and private session cursor on one physical line", () => {
+  const encoded = encodeHostedOwnerInput("first\nsecond", {
+    targetProjectPath: "C:\\target-project",
+    sessionId: "internal-session",
+  });
+  assert.equal(encoded.includes("\n"), false);
+  assert.deepEqual(decodeHostedOwnerInput(encoded), {
+    content: "first\nsecond",
+    targetProjectPath: "C:\\target-project",
+    sessionId: "internal-session",
+  });
+});
+
+test("the local host returns the child-selected private session cursor for a scoped turn", async (t) => {
+  const server = await startLocalLeadHost({
+    address: testAddress(),
+    executable: process.execPath,
+    args: [gatewayLeadHost],
+    durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+    encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    onStopIntent: async () => {},
+  });
+  t.after(() => server.stop());
+  const client = await connectLocalLeadHost(server.address);
+  t.after(() => client.detach());
+
+  const result = await client.completeScopedOwnerTurn("scoped turn", {
+    targetProjectPath: "C:\\target-project",
+  });
+
+  assert.equal(result.sessionId, "target-session-1");
+  assert.equal(result.response.content, "completed scoped turn\nverified");
+});
+
+test("malformed scoped turn fields return request-error without becoming unscoped input", async (t) => {
+  const server = await startLocalLeadHost({
+    address: testAddress(),
+    executable: process.execPath,
+    args: [gatewayLeadHost],
+    durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+    encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    onStopIntent: async () => {},
+  });
+  t.after(() => server.stop());
+  const socket = createConnection(server.address);
+  t.after(() => socket.destroy());
+  await once(socket, "connect");
+  const lines = createInterface({ input: socket, crlfDelay: Infinity })[Symbol.asyncIterator]();
+  socket.write(`${JSON.stringify({ type: "attach" })}\n`);
+  assert.equal(JSON.parse((await lines.next()).value!).type, "attached");
+
+  const malformed = [
+    { type: "turn", requestId: 41, input: "numeric path", targetProjectPath: 7 },
+    { type: "turn", requestId: 42, input: "orphan cursor", sessionId: "private" },
+    { type: "turn", requestId: 43, input: "relative path", targetProjectPath: "relative" },
+    {
+      type: "turn",
+      requestId: 44,
+      input: "empty cursor",
+      targetProjectPath: "C:\\target-project",
+      sessionId: "",
+    },
+  ];
+  for (const request of malformed) {
+    socket.write(`${JSON.stringify(request)}\n`);
+    const response = JSON.parse((await lines.next()).value!);
+    assert.equal(response.type, "request-error");
+    assert.equal(response.requestId, request.requestId);
+  }
+
+  const observer = await connectLocalLeadHost(server.address);
+  t.after(() => observer.detach());
+  assert.equal(
+    observer.transcript.some((entry) =>
+      entry.source === "owner" && malformed.some((request) => request.input === entry.line)
+    ),
+    false,
+  );
+});
+
+test("sticky scoped projections retain only the latest session per project", async (t) => {
+  const server = await startLocalLeadHost({
+    address: testAddress(),
+    executable: process.execPath,
+    args: [gatewayLeadHost],
+    durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
+    encodeOwnerInput: true,
+    ownerTurnCompletePrefix: "CMD_RIKER_OWNER_TURN_COMPLETE",
+    transcriptByteLimit: 1,
+    onStopIntent: async () => {},
+  });
+  t.after(() => server.stop());
+  const client = await connectLocalLeadHost(server.address);
+  let sessionId: string | undefined;
+  for (let index = 0; index < 12; index += 1) {
+    const result = await client.completeScopedOwnerTurn("/session new", {
+      targetProjectPath: "C:\\target-project",
+      ...(sessionId ? { sessionId } : {}),
+    });
+    sessionId = result.sessionId;
+  }
+  await client.detach();
+
+  const attached = await connectLocalLeadHost(server.address);
+  t.after(() => attached.detach());
+  assert.equal(
+    attached.transcript.filter((entry) =>
+      entry.source === "lead" && entry.line.startsWith("CMD_RIKER_OWNER_CONVERSATION:")
+    ).length,
+    2,
+  );
+  assert.equal(
+    attached.transcript.filter((entry) =>
+      entry.source === "lead" && entry.line.startsWith("CMD_RIKER_OWNER_SESSION_VIEW:")
+    ).length,
+    2,
+  );
+});
 
 test("one child continues work while its client detaches and reconnects", async (t) => {
   const server = await startTestHost();

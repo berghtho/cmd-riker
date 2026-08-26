@@ -16,7 +16,7 @@ import type {
   StandingOrderViewEntry,
 } from "../session-view/index.ts";
 
-export const ownerGatewayProtocolVersion = 1;
+export const ownerGatewayProtocolVersion = 2;
 
 export type OwnerGatewayProtocolSessionView = {
   leadAvailability: SessionViewSnapshot["leadAvailability"];

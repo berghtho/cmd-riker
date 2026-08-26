@@ -214,6 +214,7 @@ export interface AuthoritativeState {
   commitmentRecordedAt(commitmentId: string): string | undefined;
   readOwnerConversation(sessionId?: string): OwnerConversation | undefined;
   ownerMessage(ownerTurnId: string): string | undefined;
+  ownerSessionIdForTurn(ownerTurnId: string): string | undefined;
   latestOwnerTurnId(): string | undefined;
   leadAgentResponse(ownerTurnId: string): string | undefined;
   appendOwnerMessage(content: string, sessionId?: string): string;
@@ -258,7 +259,7 @@ export interface AuthoritativeState {
    * measured context occupancy; before any completed turn, the configured
    * selection with no context evidence.
    */
-  readLatestLeadTurnMetrics(): LeadTurnMetrics | undefined;
+  readLatestLeadTurnMetrics(sessionId?: string): LeadTurnMetrics | undefined;
   ownerTurnSequence(turnId: string): number | undefined;
   readCommitments(): Commitment[];
   readCommitment(commitmentId: string): Commitment | undefined;
@@ -295,7 +296,10 @@ export interface AuthoritativeState {
     effectIntent: WorkerAssignmentEffectIntent,
     commitmentSnapshots: Commitment[],
   ): void;
-  readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
+  readCapabilityNotice(
+    id: CapabilityNotice["id"],
+    targetProjectPath?: string,
+  ): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
   readStandingOrder(standingOrderId: string): StandingOrder | undefined;
   readStandingOrders(): StandingOrder[];
@@ -472,19 +476,24 @@ export function openAuthoritativeState(
 
   const readCapabilityNoticeRow = (
     id: CapabilityNotice["id"],
+    targetProjectPath?: string,
   ): { id: string; value: CapabilityNotice } | undefined => {
     const row = database
-      .prepare(`
-        SELECT id, value_json
-          FROM facts current
-         WHERE current.kind = 'capability-notice.snapshot'
-           AND current.subject_id = ?
-           AND NOT EXISTS (
-             SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
-           )
-         LIMIT 1
-      `)
-      .get(`capability-notice:${id}`) as { id: string; value_json: string } | undefined;
+        .prepare(`
+          SELECT id, value_json
+            FROM facts current
+          WHERE current.kind = 'capability-notice.snapshot'
+            AND json_extract(current.value_json, '$.id') = ?
+            AND (? IS NULL OR lower(json_extract(current.value_json, '$.targetProjectPath')) = lower(?))
+            AND NOT EXISTS (
+              SELECT 1 FROM facts successor WHERE successor.supersedes_fact_id = current.id
+            )
+          ORDER BY current.sequence DESC
+          LIMIT 1
+        `)
+        .get(id, targetProjectPath ?? null, targetProjectPath ?? null) as
+          | { id: string; value_json: string }
+          | undefined;
     return row
       ? { id: row.id, value: JSON.parse(row.value_json) as CapabilityNotice }
       : undefined;
@@ -1205,16 +1214,17 @@ export function openAuthoritativeState(
       return { ...configuration, messages };
     },
 
-    readLatestLeadTurnMetrics() {
+    readLatestLeadTurnMetrics(sessionId) {
       const row = database
         .prepare(`
           SELECT value_json
             FROM facts
            WHERE kind = 'owner-conversation.lead-agent-message'
+             AND (? IS NULL OR COALESCE(json_extract(value_json, '$.sessionId'), 'primary') = ?)
            ORDER BY sequence DESC
            LIMIT 1
         `)
-        .get() as { value_json: string } | undefined;
+        .get(sessionId ?? null, sessionId ?? null) as { value_json: string } | undefined;
       if (row) {
         const metrics = (JSON.parse(row.value_json) as { turnMetrics?: LeadTurnMetrics })
           .turnMetrics;
@@ -1374,6 +1384,19 @@ export function openAuthoritativeState(
       return (database
         .prepare("SELECT kind FROM owner_interaction_dispositions WHERE owner_turn_id = ?")
         .get(ownerTurnId) as { kind: "session-view-control" } | undefined)?.kind;
+    },
+
+    ownerSessionIdForTurn(ownerTurnId) {
+      const row = database
+        .prepare(`
+          SELECT COALESCE(json_extract(value_json, '$.sessionId'), 'primary') AS session_id
+            FROM facts
+           WHERE kind = 'owner-conversation.owner-message'
+             AND json_extract(value_json, '$.turnId') = ?
+           LIMIT 1
+        `)
+        .get(ownerTurnId) as { session_id: string } | undefined;
+      return row?.session_id;
     },
 
     appendLeadAgentMessage(turnId, content, attribution) {
@@ -1924,12 +1947,12 @@ export function openAuthoritativeState(
       }
     },
 
-    readCapabilityNotice(id) {
-      return readCapabilityNoticeRow(id)?.value;
+    readCapabilityNotice(id, targetProjectPath) {
+      return readCapabilityNoticeRow(id, targetProjectPath)?.value;
     },
 
     appendCapabilityNotice(notice) {
-      const current = readCapabilityNoticeRow(notice.id);
+      const current = readCapabilityNoticeRow(notice.id, notice.targetProjectPath);
       appendFact(
         { kind: "capability-notice.snapshot", value: notice },
         `capability-notice.${notice.state}`,
@@ -3444,7 +3467,7 @@ function factSubject(input: FactDraft): string {
     case "worker-question.snapshot":
       return `worker-question:${input.value.id}`;
     case "capability-notice.snapshot":
-      return `capability-notice:${input.value.id}`;
+      return `capability-notice:${input.value.id}:${input.value.targetProjectPath.toLowerCase()}`;
     case "standing-order.snapshot":
       return `standing-order:${input.value.id}`;
     case "owner-session.snapshot":

@@ -2,8 +2,17 @@ import type { PiOwnerResponse } from "./pi-owner-interface.ts";
 
 export const ownerInputPrefix = "CMD_RIKER_OWNER_INPUT:";
 export const ownerResponsePrefix = "CMD_RIKER_OWNER_RESPONSE:";
+export const ownerErrorPrefix = "CMD_RIKER_OWNER_ERROR:";
 export const ownerConversationPrefix = "CMD_RIKER_OWNER_CONVERSATION:";
+export const ownerSessionViewPrefix = "CMD_RIKER_OWNER_SESSION_VIEW:";
+export const ownerProjectsPrefix = "CMD_RIKER_OWNER_PROJECTS:";
 export const ownerTurnCompleteMarker = "CMD_RIKER_OWNER_TURN_COMPLETE";
+
+export type HostedOwnerInput = {
+  content: string;
+  targetProjectPath?: string;
+  sessionId?: string;
+};
 
 export type HostedOwnerConversationEntry = {
   source: "owner" | "lead-agent";
@@ -11,20 +20,56 @@ export type HostedOwnerConversationEntry = {
 };
 
 export type HostedOwnerConversation = {
-  sessionId: string;
+  sessionId?: string;
   targetProjectPath: string;
   entries: HostedOwnerConversationEntry[];
 };
 
-export function encodeHostedOwnerInput(content: string): string {
-  return `${ownerInputPrefix}${JSON.stringify({ content })}`;
+export type HostedOwnerSessionView<T> = {
+  targetProjectPath: string;
+  sessionId?: string;
+  snapshot: T;
+};
+
+export function encodeHostedOwnerInput(
+  content: string,
+  scope: { targetProjectPath: string; sessionId?: string } | undefined = undefined,
+): string {
+  return `${ownerInputPrefix}${JSON.stringify({ content, ...scope })}`;
 }
 
-export function decodeHostedOwnerInput(line: string): string | undefined {
+export function decodeHostedOwnerInput(line: string): HostedOwnerInput | undefined {
   if (!line.startsWith(ownerInputPrefix)) return undefined;
   try {
-    const value = JSON.parse(line.slice(ownerInputPrefix.length)) as { content?: unknown };
-    return typeof value.content === "string" ? value.content : undefined;
+    const value = JSON.parse(line.slice(ownerInputPrefix.length)) as {
+      content?: unknown;
+      targetProjectPath?: unknown;
+      sessionId?: unknown;
+    };
+    if (
+      typeof value.content !== "string" ||
+      (value.targetProjectPath !== undefined && typeof value.targetProjectPath !== "string") ||
+      (value.sessionId !== undefined && typeof value.sessionId !== "string")
+    ) return undefined;
+    return {
+      content: value.content,
+      ...(value.targetProjectPath ? { targetProjectPath: value.targetProjectPath } : {}),
+      ...(value.sessionId ? { sessionId: value.sessionId } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function encodeHostedOwnerError(message: string): string {
+  return `${ownerErrorPrefix}${JSON.stringify({ message })}`;
+}
+
+export function decodeHostedOwnerError(line: string): string | undefined {
+  if (!line.startsWith(ownerErrorPrefix)) return undefined;
+  try {
+    const value = JSON.parse(line.slice(ownerErrorPrefix.length)) as { message?: unknown };
+    return typeof value.message === "string" ? value.message : undefined;
   } catch {
     return undefined;
   }
@@ -65,8 +110,7 @@ export function decodeHostedOwnerConversation(
     if (
       typeof value !== "object" ||
       value === null ||
-      !("sessionId" in value) ||
-      typeof value.sessionId !== "string" ||
+      ("sessionId" in value && value.sessionId !== undefined && typeof value.sessionId !== "string") ||
       !("targetProjectPath" in value) ||
       typeof value.targetProjectPath !== "string" ||
       !("entries" in value) ||
@@ -85,10 +129,74 @@ export function decodeHostedOwnerConversation(
       entries.push({ source: entry.source, content: entry.content });
     }
     return {
-      sessionId: value.sessionId,
+      ...("sessionId" in value && typeof value.sessionId === "string"
+        ? { sessionId: value.sessionId }
+        : {}),
       targetProjectPath: value.targetProjectPath,
       entries,
     };
+  } catch {
+    return undefined;
+  }
+}
+
+export function encodeHostedOwnerSessionView<T>(view: HostedOwnerSessionView<T>): string {
+  return `${ownerSessionViewPrefix}${JSON.stringify(view)}`;
+}
+
+export function decodeHostedOwnerSessionView<T>(
+  line: string,
+): HostedOwnerSessionView<T> | undefined {
+  if (!line.startsWith(ownerSessionViewPrefix)) return undefined;
+  try {
+    const value = JSON.parse(line.slice(ownerSessionViewPrefix.length)) as {
+      targetProjectPath?: unknown;
+      sessionId?: unknown;
+      snapshot?: unknown;
+    };
+    if (
+      typeof value.targetProjectPath !== "string" ||
+      (value.sessionId !== undefined && typeof value.sessionId !== "string") ||
+      typeof value.snapshot !== "object" ||
+      value.snapshot === null
+    ) return undefined;
+    return {
+      targetProjectPath: value.targetProjectPath,
+      ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
+      snapshot: value.snapshot as T,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export type HostedOwnerProject = { targetProjectPath: string; sessionId?: string };
+
+export function encodeHostedOwnerProjects(projects: readonly HostedOwnerProject[]): string {
+  return `${ownerProjectsPrefix}${JSON.stringify({ projects })}`;
+}
+
+export function decodeHostedOwnerProjects(line: string): HostedOwnerProject[] | undefined {
+  if (!line.startsWith(ownerProjectsPrefix)) return undefined;
+  try {
+    const value = JSON.parse(line.slice(ownerProjectsPrefix.length)) as { projects?: unknown };
+    if (!Array.isArray(value.projects)) return undefined;
+    const projects: HostedOwnerProject[] = [];
+    for (const project of value.projects) {
+      if (
+        typeof project !== "object" ||
+        project === null ||
+        !("targetProjectPath" in project) ||
+        typeof project.targetProjectPath !== "string" ||
+        ("sessionId" in project && project.sessionId !== undefined &&
+          typeof project.sessionId !== "string")
+      ) return undefined;
+      projects.push({
+        targetProjectPath: project.targetProjectPath,
+        ...(typeof project.sessionId === "string" ? { sessionId: project.sessionId } : {}),
+      });
+    }
+    return projects;
   } catch {
     return undefined;
   }

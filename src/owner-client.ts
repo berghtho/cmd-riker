@@ -44,12 +44,8 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
           if (event.type === "notice") listener(event.content);
         }),
         subscribeConversationReplacements: (listener) => {
-          let conversation = gateway.snapshot.conversation;
           return gateway.subscribe((event) => {
-            if (event.type !== "conversation") return;
-            const previous = conversation;
-            conversation = event.conversation;
-            if (!continuesConversation(previous, conversation)) listener();
+            if (event.type === "conversation" && event.replaced) listener();
           });
         },
       });
@@ -57,16 +53,6 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
   } finally {
     await gateway.detach();
   }
-}
-
-function continuesConversation(
-  previous: ReadonlyArray<{ source: string; content: string }>,
-  current: ReadonlyArray<{ source: string; content: string }>,
-): boolean {
-  return previous.length <= current.length && previous.every((entry, index) => {
-    const next = current[index];
-    return next?.source === entry.source && next.content === entry.content;
-  });
 }
 
 // The installed bundle records its source repository and commit; the client

@@ -54,8 +54,11 @@ test("external clients converse with the Lead and observe orchestration through 
   assert.equal(firstConcurrent.content, "completed first concurrent turn\nverified");
   assert.equal(secondConcurrent.content, "completed second concurrent turn\nverified");
 
-  await gateway.completeTurn("/session new");
+  const initialRevision = gateway.snapshot.ownerSessionRevision;
+  await gateway.completeTurn("/session new second-project");
   assert.deepEqual(gateway.snapshot.conversation, []);
+  assert.equal(gateway.snapshot.targetProjectPath, "C:\\second-project");
+  assert.equal(gateway.snapshot.ownerSessionRevision, initialRevision + 1);
   await gateway.completeTurn("new session turn");
   assert.deepEqual(gateway.snapshot.conversation, [
     { source: "owner", content: "new session turn" },

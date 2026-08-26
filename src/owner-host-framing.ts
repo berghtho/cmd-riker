@@ -10,6 +10,12 @@ export type HostedOwnerConversationEntry = {
   content: string;
 };
 
+export type HostedOwnerConversation = {
+  sessionId: string;
+  targetProjectPath: string;
+  entries: HostedOwnerConversationEntry[];
+};
+
 export function encodeHostedOwnerInput(content: string): string {
   return `${ownerInputPrefix}${JSON.stringify({ content })}`;
 }
@@ -45,20 +51,29 @@ export function decodeHostedOwnerResponse(line: string): PiOwnerResponse | undef
 }
 
 export function encodeHostedOwnerConversation(
-  conversation: readonly HostedOwnerConversationEntry[],
+  conversation: HostedOwnerConversation,
 ): string {
   return `${ownerConversationPrefix}${JSON.stringify(conversation)}`;
 }
 
 export function decodeHostedOwnerConversation(
   line: string,
-): HostedOwnerConversationEntry[] | undefined {
+): HostedOwnerConversation | undefined {
   if (!line.startsWith(ownerConversationPrefix)) return undefined;
   try {
     const value = JSON.parse(line.slice(ownerConversationPrefix.length)) as unknown;
-    if (!Array.isArray(value)) return undefined;
-    const conversation: HostedOwnerConversationEntry[] = [];
-    for (const entry of value) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !("sessionId" in value) ||
+      typeof value.sessionId !== "string" ||
+      !("targetProjectPath" in value) ||
+      typeof value.targetProjectPath !== "string" ||
+      !("entries" in value) ||
+      !Array.isArray(value.entries)
+    ) return undefined;
+    const entries: HostedOwnerConversationEntry[] = [];
+    for (const entry of value.entries) {
       if (
         typeof entry !== "object" ||
         entry === null ||
@@ -67,9 +82,13 @@ export function decodeHostedOwnerConversation(
         !("content" in entry) ||
         typeof entry.content !== "string"
       ) return undefined;
-      conversation.push({ source: entry.source, content: entry.content });
+      entries.push({ source: entry.source, content: entry.content });
     }
-    return conversation;
+    return {
+      sessionId: value.sessionId,
+      targetProjectPath: value.targetProjectPath,
+      entries,
+    };
   } catch {
     return undefined;
   }

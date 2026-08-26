@@ -20,7 +20,16 @@ process.stdout.write("CMD Riker | Target Project: C:\\target-project\n");
 process.stdout.write("Lead available | 1 Worker running | status clear\n");
 process.stdout.write(`CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionView)}\n`);
 const conversation: Array<{ source: "owner" | "lead-agent"; content: string }> = [];
-process.stdout.write(`CMD_RIKER_OWNER_CONVERSATION:${JSON.stringify(conversation)}\n`);
+let sessionId = "session-1";
+let targetProjectPath = "C:\\target-project";
+const emitConversation = () => process.stdout.write(
+  `CMD_RIKER_OWNER_CONVERSATION:${JSON.stringify({
+    sessionId,
+    targetProjectPath,
+    entries: conversation,
+  })}\n`,
+);
+emitConversation();
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const wireLine of lines) {
@@ -42,13 +51,17 @@ for await (const wireLine of lines) {
   );
   process.stdout.write("Lead available | 1 Worker running | status clear\n");
   process.stdout.write(`CMD_RIKER_SESSION_JSON:${JSON.stringify(sessionView)}\n`);
-  if (line === "/session new") conversation.splice(0);
+  if (line === "/session new second-project") {
+    conversation.splice(0);
+    sessionId = "session-2";
+    targetProjectPath = "C:\\second-project";
+  }
   else {
     conversation.push(
       { source: "owner", content: line },
       { source: "lead-agent", content: `completed ${display}\nverified` },
     );
   }
-  process.stdout.write(`CMD_RIKER_OWNER_CONVERSATION:${JSON.stringify(conversation)}\n`);
+  emitConversation();
   process.stdout.write("CMD_RIKER_OWNER_TURN_COMPLETE\n");
 }

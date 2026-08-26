@@ -353,11 +353,16 @@ function emitConversationData(
   state: AuthoritativeState,
   sessionContext: OwnerSessionContext,
 ): void {
-  const messages = state.readOwnerConversation(sessionContext.activeSessionId)?.messages ?? [];
-  process.stdout.write(`${encodeHostedOwnerConversation(messages.map((message) => ({
-    source: message.role,
-    content: message.content,
-  })))}\n`);
+  const conversation = state.readOwnerConversation(sessionContext.activeSessionId);
+  const session = state.readOwnerSessions().find((entry) => entry.id === sessionContext.activeSessionId);
+  process.stdout.write(`${encodeHostedOwnerConversation({
+    sessionId: sessionContext.activeSessionId,
+    targetProjectPath: session?.projectPath ?? conversation?.targetProject.path ?? process.cwd(),
+    entries: (conversation?.messages ?? []).map((message) => ({
+      source: message.role,
+      content: message.content,
+    })),
+  })}\n`);
 }
 
 function runInteractiveConversation(

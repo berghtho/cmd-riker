@@ -1,12 +1,30 @@
 name: cmd-riker-skills
 version: "1.0.0"
-description: Locked planning and design workflows for CMD Riker
+description: Locked engineering workflows for CMD Riker
 targets:
   - agent-skills
 dependencies:
   apm:
     - git: https://github.com/mattpocock/skills
       ref: main
+      skills:
+        - code-review
+        - codebase-design
+        - diagnosing-bugs
+        - domain-modeling
+        - grilling
+        - handoff
+        - improve-codebase-architecture
+        - prototype
+        - research
+        - tdd
+        - to-questionnaire
+        - to-spec
+        - to-tickets
+        - triage
+        - wait-what
+        - wayfinder
+        - writing-for-agents
     - git: https://github.com/berghtho/cmd-riker
       path: skills/design-council
       ref: main

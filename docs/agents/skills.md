@@ -6,7 +6,12 @@ APM is the repository's skill-distribution authority. `apm.yml` declares package
 The locked graph contains:
 
 - CMD Riker's shipped `design-council`, sourced from `skills/design-council` in this repository.
-- The complete `mattpocock/skills` package, including `wayfinder` and `grill-me`.
+- A curated `mattpocock/skills` selection declared in `apm.yml`.
+
+The Matt selection excludes workflows that duplicate CMD Riker's orchestration, conflict with its
+delivery contract, or do not fit its Windows-first runtime: `ask-matt`, `grill-me`,
+`grill-with-docs`, `implement`, `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `teach`, and
+`wizard`. A Target Project may still lock one of these skills for its own mission.
 
 Materialize the committed graph with APM 0.28.0 or newer:
 

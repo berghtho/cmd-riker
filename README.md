@@ -335,7 +335,7 @@ and the Lead reads a skill's file itself when it uses one.
 The Pi Owner interface also loads the installed Pi skills normally. Invoking `/skill:<name>` in the
 `riker` terminal inlines that skill's content into the Owner turn.
 
-CMD Riker ships its generic `design-council` skill and locks the complete
+CMD Riker ships its generic `design-council` skill and locks a curated selection from the
 [`mattpocock/skills`](https://github.com/mattpocock/skills) package through APM. Materialize the
 committed graph with APM 0.28.0 or newer:
 

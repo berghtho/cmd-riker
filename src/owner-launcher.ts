@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 const installRoot = resolve(requiredArgument("--install-root"));
 const forwarded = process.argv.slice(2).filter((value, index, values) =>
@@ -12,6 +12,10 @@ const commandArguments = forwarded.slice(1);
 try {
   const installation = await readInstallation(installRoot);
   if (command === "start" || command === "gateway") {
+    const projectPath = command === "gateway" ? requiredCommandArgument("--project") : undefined;
+    if (projectPath && !isAbsolute(projectPath)) {
+      throw new Error("--project must be an absolute configured project path.");
+    }
     await run(installation.leadAgent.runtimePath, [
       installation.leadAgent.lifecyclePath,
       "start",
@@ -27,6 +31,7 @@ try {
       ownerEntrypoint,
       "--install-root",
       installRoot,
+      ...(projectPath ? ["--project", projectPath] : []),
     ], "inherit", false);
   } else {
     await run(installation.leadAgent.runtimePath, [
@@ -92,5 +97,12 @@ function requiredArgument(name: string): string {
   const index = process.argv.lastIndexOf(name);
   const value = index >= 0 ? process.argv[index + 1] : undefined;
   if (!value) throw new Error(`${name} is required.`);
+  return value;
+}
+
+function requiredCommandArgument(name: string): string {
+  const index = commandArguments.lastIndexOf(name);
+  const value = index >= 0 ? commandArguments[index + 1] : undefined;
+  if (!value) throw new Error(`${name} is required for gateway mode.`);
   return value;
 }

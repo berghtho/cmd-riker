@@ -600,7 +600,10 @@ export interface OrchestrationState {
     effectIntent: Extract<EffectIntent, { kind: "worker-assignment" }>,
     commitmentSnapshots: Commitment[],
   ): void;
-  readCapabilityNotice(id: CapabilityNotice["id"]): CapabilityNotice | undefined;
+  readCapabilityNotice(
+    id: CapabilityNotice["id"],
+    targetProjectPath?: string,
+  ): CapabilityNotice | undefined;
   appendCapabilityNotice(notice: CapabilityNotice): void;
   readStandingOrder(standingOrderId: string): StandingOrder | undefined;
   readStandingOrders(): StandingOrder[];
@@ -978,7 +981,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
 
     observeCodexCapabilityUnavailable(detail, targetProjectPath) {
       const fingerprint = `codex-cli|ChatGPT|${targetProjectPath}|${detail}`;
-      const current = state.readCapabilityNotice("codex-worker");
+      const current = state.readCapabilityNotice("codex-worker", targetProjectPath);
       if (current?.state === "active" && current.fingerprint === fingerprint) {
         return "deduplicated";
       }

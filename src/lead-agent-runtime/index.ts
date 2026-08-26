@@ -218,8 +218,8 @@ async function completeOwnerTurn(input: {
                   conversation.workerModelPolicy!.selection.nativeHarness,
                 detail: supervisors.size > 0
                   ? "No enabled harness has a configured Worker model; the Owner can set one conversationally."
-                  : input.state.readCapabilityNotice("codex-worker")?.state === "active"
-                    ? input.state.readCapabilityNotice("codex-worker")!.detail
+                  : input.state.readCapabilityNotice("codex-worker", targetProjectPath)?.state === "active"
+                    ? input.state.readCapabilityNotice("codex-worker", targetProjectPath)!.detail
                     : "The Worker capability could not be proven at start.",
               },
             }

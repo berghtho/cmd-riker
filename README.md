@@ -116,12 +116,17 @@ Gateway instead of parsing the Pi terminal. The launcher starts or reuses the pr
 then keeps a JSON-lines protocol on standard input and output until the caller closes input:
 
 ```powershell
-riker gateway
+riker gateway --project C:\absolute\path\to\configured-project
 ```
 
-The first output message is a `ready` record with `protocolVersion`, the hosted process identity, and
-one current snapshot containing the Target Project, Owner conversation, Work Items, Worker Sessions,
-Standing Orders, and notices. Internal state identifiers are replaced by presentation-safe numbers.
+Gateway protocol v2 requires an existing absolute path that exactly identifies one configured project
+(path matching is case-insensitive on Windows); there is no default project for gateway mode.
+Nonexistent, unknown, or unconfigured paths fail before `ready`. The first output message is a
+`ready` record with
+`protocolVersion: 2`, the hosted process identity, and one current snapshot containing that project's
+canonical real filesystem path (with junctions and symlinks resolved), Owner conversation, Work
+Items, Worker Sessions, Standing Orders, and notices. Internal state identifiers are replaced by
+presentation-safe numbers.
 Subsequent `event` records carry complete current-conversation replacements, Session View updates,
 Lead availability, notices, and exits; after an exit, reconnecting yields the replacement Lead's new
 `ready` identity and snapshot. A caller starts an Owner turn with a correlated command:
@@ -133,7 +138,9 @@ Lead availability, notices, and exits; after an exit, reconnecting yields the re
 The gateway returns either `turn-result` or `turn-error` with the same `id`. Standard output contains
 protocol records only; host failures go to standard error. The gateway is a local presentation seam,
 not a second orchestrator: CMD Riker remains authoritative for conversations, Command Authority,
-Work Items, Worker Sessions, effects, and Verification.
+Work Items, Worker Sessions, effects, and Verification. Concurrent gateways are isolated by project;
+gateways on the same project also keep private Owner Session cursors when one switches or creates a
+session.
 
 Inside the `riker` terminal, `/items` lists every work item with a plain status ("in progress",
 "needs you", "done", …); `/workers` and `/riker` show Worker Sessions and the Session View. The

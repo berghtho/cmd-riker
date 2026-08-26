@@ -130,3 +130,33 @@ test("any configured project passes the effectful delegation path gate", async (
     /configured project checkout/i,
   );
 });
+
+test("Capability Notices remain scoped to their configured project", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-project-capability-test-"));
+  const state = openAuthoritativeState(stateDirectory);
+  t.after(() => {
+    state.close();
+    return rm(stateDirectory, { recursive: true, force: true });
+  });
+  state.initialize(ownerConfiguration());
+  const orchestration = createOrchestrationCore(state);
+  orchestration.observeCodexCapabilityUnavailable("default unavailable", "C:\\repos\\cmd-riker-target");
+  orchestration.observeCodexCapabilityUnavailable("survivors unavailable", "C:\\repos\\survivors");
+
+  assert.equal(
+    state.readCapabilityNotice("codex-worker", "C:\\repos\\cmd-riker-target")?.detail,
+    "default unavailable",
+  );
+  assert.equal(
+    state.readCapabilityNotice("codex-worker", "C:\\repos\\survivors")?.detail,
+    "survivors unavailable",
+  );
+  assert.deepEqual(
+    projectSessionView(state, { targetProjectPath: "C:\\repos\\cmd-riker-target" }).notices,
+    ["The Codex Worker capability is unavailable: default unavailable"],
+  );
+  assert.deepEqual(
+    projectSessionView(state, { targetProjectPath: "C:\\repos\\survivors" }).notices,
+    ["The Codex Worker capability is unavailable: survivors unavailable"],
+  );
+});

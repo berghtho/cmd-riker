@@ -1,4 +1,6 @@
 import type { PiOwnerResponse } from "../pi-owner-interface.ts";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   connectLocalLeadHost,
   type LeadHostExit,
@@ -9,9 +11,13 @@ import {
 import type { SessionViewSnapshot } from "../session-view/index.ts";
 import {
   decodeHostedOwnerConversation,
+  decodeHostedOwnerProjects,
+  decodeHostedOwnerSessionView,
   ownerTurnCompleteMarker,
   type HostedOwnerConversation,
   type HostedOwnerConversationEntry,
+  type HostedOwnerProject,
+  type HostedOwnerSessionView,
 } from "../owner-host-framing.ts";
 
 const sessionViewPrefix = "CMD_RIKER_SESSION_JSON:";
@@ -50,19 +56,30 @@ export type OwnerGatewayClient = {
 
 export async function connectOwnerGateway(
   address: string,
-  options: { connectTimeoutMs?: number; readyTimeoutMs?: number } = {},
+  options: { projectPath?: string; connectTimeoutMs?: number; readyTimeoutMs?: number } = {},
 ): Promise<OwnerGatewayClient> {
+  const requestedProject = options.projectPath
+    ? projectIdentity(options.projectPath)
+    : undefined;
   const client = await connectLocalHostWithRetry(address, options.connectTimeoutMs ?? 0);
-  const initialConversation = await waitForReadySnapshot(
+  const initial = await waitForReadySnapshot(
     client,
+    requestedProject,
     options.readyTimeoutMs ?? 60_000,
   ).catch(async (error: unknown) => {
     await client.detach();
     throw error;
   });
+  const boundProjectPath = requestedProject?.canonicalPath;
+  const configuredProjectPath = requestedProject ? initial.configuredProjectPath : undefined;
   const listeners = new Set<(event: OwnerGatewayEvent) => void>();
-  let activeSessionId = initialConversation.sessionId;
+  let activeSessionId = initial.conversation.sessionId;
+  let currentProjectPath = initial.conversation.targetProjectPath;
   let ownerSessionRevision = 1;
+  let conversation = initial.conversation.entries;
+  let sessionView = initial.sessionView
+    ? privateSessionView(initial.sessionView.snapshot, activeSessionId, boundProjectPath)
+    : undefined;
 
   const publish = (event: OwnerGatewayEvent): void => {
     for (const listener of listeners) {
@@ -73,24 +90,45 @@ export async function connectOwnerGateway(
       }
     }
   };
+  const publishConversation = (replaced: boolean): void => publish({
+    type: "conversation",
+    conversation,
+    targetProjectPath: boundProjectPath ?? currentProjectPath,
+    ownerSessionRevision,
+    replaced,
+  });
+
   const unsubscribeTranscript = client.onTranscriptEntry((entry) => {
-    const conversation = conversationFrame(entry);
-    if (conversation) {
-      const replaced = conversation.sessionId !== activeSessionId;
-      if (replaced) {
-        activeSessionId = conversation.sessionId;
+    const conversationUpdate = conversationFrame(entry);
+    if (conversationUpdate) {
+      if (boundProjectPath) {
+        if (
+          !sameProjectPath(conversationUpdate.targetProjectPath, configuredProjectPath!) ||
+          conversationUpdate.sessionId !== activeSessionId
+        ) return;
+      } else if (conversationUpdate.sessionId !== activeSessionId) {
+        activeSessionId = conversationUpdate.sessionId;
         ownerSessionRevision += 1;
       }
-      publish({
-        type: "conversation",
-        conversation: conversation.entries,
-        targetProjectPath: conversation.targetProjectPath,
-        ownerSessionRevision,
-        replaced,
-      });
+      if (!boundProjectPath) currentProjectPath = conversationUpdate.targetProjectPath;
+      conversation = conversationUpdate.entries;
+      publishConversation(false);
+      return;
+    }
+    const scopedView = sessionViewFrame(entry);
+    if (scopedView) {
+      if (
+        boundProjectPath &&
+        (!sameProjectPath(scopedView.targetProjectPath, configuredProjectPath!) ||
+          scopedView.sessionId !== activeSessionId)
+      ) return;
+      sessionView = privateSessionView(scopedView.snapshot, activeSessionId, boundProjectPath);
+      publish({ type: "session-view", sessionView: withLeadState(sessionView, client.leadState) });
       return;
     }
     for (const event of gatewayEvents(entry)) {
+      if (boundProjectPath && (event.type === "session-view" || event.type === "notice")) continue;
+      if (event.type === "session-view") sessionView = event.sessionView;
       publish(event.type === "session-view"
         ? { type: "session-view", sessionView: withLeadState(event.sessionView, client.leadState) }
         : event);
@@ -101,10 +139,37 @@ export async function connectOwnerGateway(
   return {
     childPid: client.childPid,
     get snapshot() {
-      return gatewaySnapshot(client.transcript, client.leadState, ownerSessionRevision);
+      return {
+        targetProjectPath: boundProjectPath ?? currentProjectPath,
+        ownerSessionRevision,
+        leadState: client.leadState,
+        conversation,
+        ...(sessionView ? { sessionView: withLeadState(sessionView, client.leadState) } : {}),
+      };
     },
-    completeTurn(ownerInput) {
-      return client.completeOwnerTurn(ownerInput);
+    async completeTurn(ownerInput) {
+      if (!boundProjectPath) return client.completeOwnerTurn(ownerInput);
+      const previousSessionId = activeSessionId;
+      const result = await client.completeScopedOwnerTurn(ownerInput, {
+        targetProjectPath: configuredProjectPath!,
+        ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+      });
+      activeSessionId = result.sessionId;
+      if (activeSessionId !== previousSessionId) ownerSessionRevision += 1;
+      const latest = latestConversation(client.transcript, configuredProjectPath, activeSessionId);
+      if (latest) conversation = latest.entries;
+      const latestView = latestSessionView(
+        client.transcript,
+        configuredProjectPath!,
+        activeSessionId,
+        true,
+      );
+      if (latestView) {
+        sessionView = privateSessionView(latestView.snapshot, activeSessionId, boundProjectPath);
+        publish({ type: "session-view", sessionView: withLeadState(sessionView, client.leadState) });
+      }
+      if (activeSessionId !== previousSessionId) publishConversation(true);
+      return result.response;
     },
     subscribe(listener) {
       listeners.add(listener);
@@ -137,51 +202,52 @@ async function connectLocalHostWithRetry(
   throw new Error("Timed out waiting for the protected Lead Agent.", { cause: lastError });
 }
 
-function gatewaySnapshot(
-  transcript: readonly LeadHostTranscriptEntry[],
-  leadState: LeadHostState,
-  ownerSessionRevision: number,
-): OwnerGatewaySnapshot {
-  let conversation = latestConversation(transcript);
-  let sessionView: SessionViewSnapshot | undefined;
-  for (const entry of transcript) {
-    for (const event of gatewayEvents(entry)) {
-      if (event.type === "session-view") sessionView = event.sessionView;
-    }
-  }
-  return {
-    targetProjectPath: conversation?.targetProjectPath ?? "",
-    ownerSessionRevision,
-    leadState,
-    conversation: conversation?.entries ?? [],
-    ...(sessionView ? { sessionView: withLeadState(sessionView, leadState) } : {}),
-  };
-}
-
 function withLeadState(
-  sessionView: SessionViewSnapshot,
+  snapshot: SessionViewSnapshot,
   leadState: LeadHostState,
 ): SessionViewSnapshot {
-  return leadState === "starting"
-    ? sessionView
-    : { ...sessionView, leadAvailability: leadState };
+  return leadState === "starting" ? snapshot : { ...snapshot, leadAvailability: leadState };
+}
+
+function privateSessionView(
+  snapshot: SessionViewSnapshot,
+  activeSessionId: string | undefined,
+  publicProjectPath?: string,
+): SessionViewSnapshot {
+  return {
+    ...snapshot,
+    ...(snapshot.sessions
+      ? {
+          sessions: snapshot.sessions.map((session) => ({
+            ...session,
+            current: session.sessionId === activeSessionId,
+          })),
+        }
+      : {}),
+    ...(publicProjectPath && snapshot.projects
+      ? {
+          projects: snapshot.projects.map((project) => ({
+            ...project,
+            path: publicProjectPath,
+          })),
+        }
+      : {}),
+  };
 }
 
 function gatewayEvents(entry: LeadHostTranscriptEntry): OwnerGatewayEvent[] {
   if (entry.source === "owner") return [{ type: "lead-state", state: "responding" }];
   if (entry.stream !== "stdout") return [];
-  if (entry.line === ownerTurnCompleteMarker) {
-    return [{ type: "lead-state", state: "available" }];
-  }
+  if (entry.line === ownerTurnCompleteMarker) return [{ type: "lead-state", state: "available" }];
   if (entry.line.startsWith(workerNoticePrefix)) {
     return [{ type: "notice", content: entry.line.slice(workerNoticePrefix.length) }];
   }
   if (entry.line.startsWith(sessionViewPrefix)) {
     try {
-      const sessionView = JSON.parse(
-        entry.line.slice(sessionViewPrefix.length),
-      ) as SessionViewSnapshot;
-      return [{ type: "session-view", sessionView }];
+      return [{
+        type: "session-view",
+        sessionView: JSON.parse(entry.line.slice(sessionViewPrefix.length)) as SessionViewSnapshot,
+      }];
     } catch {
       return [];
     }
@@ -189,41 +255,131 @@ function gatewayEvents(entry: LeadHostTranscriptEntry): OwnerGatewayEvent[] {
   return [];
 }
 
+type ReadySnapshot = {
+  conversation: HostedOwnerConversation;
+  sessionView?: HostedOwnerSessionView<SessionViewSnapshot>;
+  configuredProjectPath?: string;
+};
+
+type ProjectIdentity = { canonicalPath: string; comparisonKey: string };
+
 function waitForReadySnapshot(
   client: LocalLeadHostClient,
+  requestedProject: ProjectIdentity | undefined,
   timeoutMs: number,
-): Promise<HostedOwnerConversation> {
-  const existing = latestConversation(client.transcript);
-  if (existing && hasSessionView(client.transcript)) {
-    return Promise.resolve(existing);
-  }
+): Promise<ReadySnapshot> {
+  const inspect = (): ReadySnapshot | Error | undefined => {
+    if (!requestedProject) {
+      const conversation = latestConversation(client.transcript);
+      const snapshot = latestLegacySessionView(client.transcript);
+      if (conversation && snapshot) {
+        return {
+          conversation,
+          sessionView: { targetProjectPath: conversation.targetProjectPath, snapshot },
+        };
+      }
+      return undefined;
+    }
+    const projects = latestConfiguredProjects(client.transcript);
+    let project: HostedOwnerProject | undefined;
+    try {
+      project = projects?.find((candidate) =>
+        sameProjectIdentity(projectIdentity(candidate.targetProjectPath), requestedProject)
+      );
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+    if (projects && !project) {
+      return new Error(`Unknown configured project path "${requestedProject.canonicalPath}".`);
+    }
+    if (!project) return undefined;
+    const conversation = latestConversation(
+      client.transcript,
+      project.targetProjectPath,
+      project.sessionId,
+      true,
+    );
+    const sessionView = latestSessionView(
+      client.transcript,
+      project.targetProjectPath,
+      project.sessionId,
+      true,
+    );
+    return conversation && sessionView && conversation.sessionId === sessionView.sessionId
+      ? { conversation, sessionView, configuredProjectPath: project.targetProjectPath }
+      : undefined;
+  };
+  const existing = inspect();
+  if (existing instanceof Error) return Promise.reject(existing);
+  if (existing) return Promise.resolve(existing);
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       unsubscribe();
-      reject(new Error("The Lead Agent did not identify its Target Project in time."));
+      reject(new Error("The Lead Agent did not identify the configured gateway project in time."));
     }, timeoutMs);
-    const unsubscribe = client.onTranscriptEntry((entry) => {
-      const conversation = conversationFrame(entry) ?? latestConversation(client.transcript);
-      if (!conversation || !hasSessionView(client.transcript)) return;
+    const unsubscribe = client.onTranscriptEntry(() => {
+      const ready = inspect();
+      if (!ready) return;
       clearTimeout(timeout);
       unsubscribe();
-      resolve(conversation);
+      ready instanceof Error ? reject(ready) : resolve(ready);
     });
   });
 }
 
-function hasSessionView(transcript: readonly LeadHostTranscriptEntry[]): boolean {
-  return transcript.some((entry) =>
-    gatewayEvents(entry).some((event) => event.type === "session-view")
-  );
+function latestLegacySessionView(
+  transcript: readonly LeadHostTranscriptEntry[],
+): SessionViewSnapshot | undefined {
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const event = gatewayEvents(transcript[index]!).find((candidate) =>
+      candidate.type === "session-view"
+    );
+    if (event?.type === "session-view") return event.sessionView;
+  }
+  return undefined;
+}
+
+function latestConfiguredProjects(
+  transcript: readonly LeadHostTranscriptEntry[],
+): HostedOwnerProject[] | undefined {
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const entry = transcript[index]!;
+    if (entry.source !== "lead" || entry.stream !== "stdout") continue;
+    const projects = decodeHostedOwnerProjects(entry.line);
+    if (projects) return projects;
+  }
+  return undefined;
 }
 
 function latestConversation(
   transcript: readonly LeadHostTranscriptEntry[],
+  projectPath?: string,
+  sessionId?: string,
+  matchSession = false,
 ): HostedOwnerConversation | undefined {
   for (let index = transcript.length - 1; index >= 0; index -= 1) {
     const conversation = conversationFrame(transcript[index]!);
-    if (conversation) return conversation;
+    if (!conversation) continue;
+    if (projectPath && !sameProjectPath(conversation.targetProjectPath, projectPath)) continue;
+    if (matchSession && conversation.sessionId !== sessionId) continue;
+    return conversation;
+  }
+  return undefined;
+}
+
+function latestSessionView(
+  transcript: readonly LeadHostTranscriptEntry[],
+  projectPath: string,
+  sessionId?: string,
+  matchSession = false,
+): HostedOwnerSessionView<SessionViewSnapshot> | undefined {
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const view = sessionViewFrame(transcript[index]!);
+    if (
+      view &&
+      sameProjectPath(view.targetProjectPath, projectPath) &&
+      (!matchSession || view.sessionId === sessionId)
+    ) return view;
   }
   return undefined;
 }
@@ -232,4 +388,30 @@ function conversationFrame(entry: LeadHostTranscriptEntry): HostedOwnerConversat
   return entry.source === "lead" && entry.stream === "stdout"
     ? decodeHostedOwnerConversation(entry.line)
     : undefined;
+}
+
+function sessionViewFrame(
+  entry: LeadHostTranscriptEntry,
+): HostedOwnerSessionView<SessionViewSnapshot> | undefined {
+  return entry.source === "lead" && entry.stream === "stdout"
+    ? decodeHostedOwnerSessionView<SessionViewSnapshot>(entry.line)
+    : undefined;
+}
+
+function projectIdentity(path: string): ProjectIdentity {
+  const absolutePath = resolve(path);
+  const canonicalPath = realpathSync.native(absolutePath);
+  const normalized = canonicalPath.replaceAll("\\", "/").replace(/\/$/, "");
+  return {
+    canonicalPath,
+    comparisonKey: process.platform === "win32" ? normalized.toLowerCase() : normalized,
+  };
+}
+
+function sameProjectIdentity(left: ProjectIdentity, right: ProjectIdentity): boolean {
+  return left.comparisonKey === right.comparisonKey;
+}
+
+function sameProjectPath(left: string, right: string): boolean {
+  return sameProjectIdentity(projectIdentity(left), projectIdentity(right));
 }

@@ -361,7 +361,7 @@ test("session creation is a Lead control and emits a fresh Gateway conversation"
     .split(/\r?\n/)
     .map(decodeHostedOwnerConversation)
     .filter((conversation) => conversation !== undefined);
-  assert.equal(conversations.length, 2);
+  assert(conversations.some((conversation) => conversation.targetProjectPath === "C:\\target-project"));
   assert.equal(conversations.at(-1)?.targetProjectPath, "C:\\repos\\survivors");
   assert.deepEqual(conversations.at(-1)?.entries, []);
 });

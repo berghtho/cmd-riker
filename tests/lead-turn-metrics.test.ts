@@ -15,6 +15,7 @@ import type { LeadTurnMetrics } from "../src/model-selection.ts";
 function ownerConfiguration() {
   return {
     targetProject: { path: "C:\\target-project" },
+    projects: [{ name: "second", path: "C:\\second-project" }],
     modelSelection: {
       provider: "local-openai" as const,
       model: "owner-model",
@@ -84,6 +85,46 @@ test("the Session View snapshot carries the Lead's metrics for the Owner UI", ()
 
   const snapshot = projectSessionView(state);
   assert.deepEqual(snapshot.lead, metrics({ thinkingLevel: "high" }));
+});
+
+test("scoped Session Views use metrics from their active Owner Session", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-scoped-lead-metrics-test-"));
+  const state = openAuthoritativeState(stateDirectory);
+  t.after(() => {
+    state.close();
+    return rm(stateDirectory, { recursive: true, force: true });
+  });
+  state.initialize(ownerConfiguration());
+  const primaryTurn = state.appendOwnerMessage("Default project status.");
+  state.appendLeadAgentMessage(primaryTurn, "Default result.", {
+    modelSelection: ownerConfiguration().modelSelection,
+    modelPolicyRevision: "lead-policy-1",
+    turnMetrics: metrics({ contextTokens: 10_000 }),
+  });
+  state.appendOwnerSessionSnapshots([{
+    id: "second-session",
+    name: "Second project status",
+    createdAt: "2026-08-26T00:00:00.000Z",
+    projectPath: "C:\\second-project",
+    state: "active",
+  }]);
+  const secondTurn = state.appendOwnerMessage("Second project status.", "second-session");
+  state.appendLeadAgentMessage(secondTurn, "Second result.", {
+    modelSelection: ownerConfiguration().modelSelection,
+    modelPolicyRevision: "lead-policy-1",
+    turnMetrics: metrics({ contextTokens: 20_000 }),
+  });
+
+  assert.equal(state.readLatestLeadTurnMetrics("primary")?.contextTokens, 10_000);
+  assert.equal(state.readLatestLeadTurnMetrics("second-session")?.contextTokens, 20_000);
+  assert.equal(projectSessionView(state, {
+    activeSessionId: "primary",
+    targetProjectPath: "C:\\target-project",
+  }).lead?.contextTokens, 10_000);
+  assert.equal(projectSessionView(state, {
+    activeSessionId: "second-session",
+    targetProjectPath: "C:\\second-project",
+  }).lead?.contextTokens, 20_000);
 });
 
 test("Lead metrics render as model, effort, and context in k tokens with percent", () => {

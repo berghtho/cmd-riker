@@ -26,7 +26,7 @@ test("riker gateway starts the protected host and reserves stdout for protocol r
   );
   await writeFile(
     gateway,
-    `process.stdout.write(JSON.stringify({ type: "ready", protocolVersion: 1 }) + "\\n");\n`,
+    `process.stdout.write(JSON.stringify({ type: "ready", protocolVersion: 2, args: process.argv.slice(2) }) + "\\n");\n`,
   );
   await writeFile(join(launcherDirectory, "installation.json"), JSON.stringify({
     leadAgent: {
@@ -42,11 +42,27 @@ test("riker gateway starts the protected host and reserves stdout for protocol r
     "--install-root",
     root,
     "gateway",
+    "--project",
+    "C:\\repos\\bound-project",
   ]);
 
   assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout.trim()), { type: "ready", protocolVersion: 1 });
+  assert.deepEqual(JSON.parse(result.stdout.trim()), {
+    type: "ready",
+    protocolVersion: 2,
+    args: ["--install-root", root, "--project", "C:\\repos\\bound-project"],
+  });
   assert.equal(await readFile(lifecycleMarker, "utf8"), "started");
+
+  const missingProject = await run(process.execPath, [
+    ownerLauncher,
+    "--install-root",
+    root,
+    "gateway",
+  ]);
+  assert.equal(missingProject.code, 2);
+  assert.equal(missingProject.stdout, "");
+  assert.match(missingProject.stderr, /--project is required for gateway mode/);
 });
 
 function run(

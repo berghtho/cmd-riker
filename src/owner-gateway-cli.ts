@@ -1,15 +1,17 @@
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import { localLeadHostAddress } from "./local-host/index.ts";
 import { connectOwnerGateway } from "./owner-gateway/index.ts";
 import { runOwnerGatewayProtocol } from "./owner-gateway/protocol.ts";
 
-const installRoot = resolve(requiredArgument("--install-root"));
-
 try {
+  const installRoot = resolve(requiredArgument("--install-root"));
+  const projectArgument = requiredArgument("--project");
+  if (!isAbsolute(projectArgument)) throw new Error("--project must be an absolute configured project path.");
+  const projectPath = resolve(projectArgument);
   const gateway = await connectOwnerGateway(
     localLeadHostAddress(installRoot),
-    { connectTimeoutMs: 10_000 },
+    { projectPath, connectTimeoutMs: 10_000 },
   );
   await runOwnerGatewayProtocol(gateway, process.stdin, process.stdout);
 } catch (error) {

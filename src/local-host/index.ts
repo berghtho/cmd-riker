@@ -4,6 +4,8 @@ import { createServer, createConnection, type Server, type Socket } from "node:n
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { encodeHostedOwnerInput } from "../owner-host-framing.ts";
+
 const defaultTranscriptByteLimit = 256 * 1024;
 const defaultStopGraceMs = 2_000;
 const defaultDurableOwnerAckTimeoutMs = 15_000;
@@ -53,6 +55,8 @@ export type StartLocalLeadHostOptions = {
   stopGraceMs?: number;
   durableOwnerAckPrefix?: string;
   ownerHandledMarker?: string;
+  /** Frames multiline Owner content into one physical child-stdin line. */
+  encodeOwnerInput?: boolean;
   durableOwnerAckTimeoutMs?: number;
   onStopIntent: () => Promise<void>;
   /** Observes live transcript entries (not the seed); must not disturb the host. */
@@ -225,7 +229,7 @@ export async function startLocalLeadHost(
         : undefined;
       if (acknowledgement) durableOwnerAcks.push(acknowledgement);
       try {
-        await writeLine(child, line);
+        await writeLine(child, options.encodeOwnerInput ? encodeHostedOwnerInput(line) : line);
         if (acknowledgement) {
           await Promise.race([
             acknowledgement.promise,
@@ -330,7 +334,7 @@ export async function startLocalLeadHost(
         return;
       }
       if (request.type === "owner") {
-        if (!isSingleLine(request.line)) {
+        if (typeof request.line !== "string" || (!options.encodeOwnerInput && !isSingleLine(request.line))) {
           send(socket, {
             type: "request-error",
             requestId: request.requestId,
@@ -463,9 +467,6 @@ export async function connectLocalLeadHost(address: string): Promise<LocalLeadHo
     },
     exit: exitResolution.promise,
     sendOwnerLine(line) {
-      if (!isSingleLine(line)) {
-        return Promise.reject(new Error("Owner input must be exactly one line."));
-      }
       return request("owner", (requestId) => ({ type: "owner", requestId, line }));
     },
     async stop() {

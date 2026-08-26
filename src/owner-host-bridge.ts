@@ -4,6 +4,7 @@ import type {
   LocalLeadHostClient,
 } from "./local-host/index.ts";
 import type { PiOwnerResponse } from "./pi-owner-interface.ts";
+import { decodeHostedOwnerResponse } from "./owner-host-framing.ts";
 
 type OwnerHostClient = Pick<
   LocalLeadHostClient,
@@ -22,10 +23,16 @@ export async function completeHostedOwnerInput(
   void responsePromise.catch(() => {});
   const responseLines: string[] = [];
   let source: PiOwnerResponse["source"] = "Lead Agent";
+  let framedResponse: PiOwnerResponse | undefined;
   const unsubscribeTranscript = client.onTranscriptEntry((entry: LeadHostTranscriptEntry) => {
     if (entry.source !== "lead" || entry.stream !== "stdout") return;
     if (/^Lead available\s+\|/.test(entry.line)) {
-      completion.resolve({ source, content: responseLines.join("\n").trim() });
+      completion.resolve(framedResponse ?? { source, content: responseLines.join("\n").trim() });
+      return;
+    }
+    const response = decodeHostedOwnerResponse(entry.line);
+    if (response) {
+      framedResponse = response;
       return;
     }
     if (entry.line.startsWith("Lead Agent: ")) {

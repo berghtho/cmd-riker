@@ -16,6 +16,10 @@ import {
   type PostBackupEffectReconciliation,
 } from "./authoritative-state/index.ts";
 import {
+  decodeHostedOwnerInput,
+  encodeHostedOwnerResponse,
+} from "./owner-host-framing.ts";
+import {
   PiAgentTurnAdapter,
   type PiTurnAdapter,
 } from "./conversation-runtime/index.ts";
@@ -294,9 +298,10 @@ async function runScriptableConversation(
   process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
   emitSessionData(state, workerSupervisors, sessionContext);
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  for await (const ownerInput of lines) {
-    if (!ownerInput.trim()) continue;
+  for await (const ownerInputLine of lines) {
     const hosted = process.argv.includes("--hosted");
+    const ownerInput = hosted ? hostedOwnerInput(ownerInputLine) : ownerInputLine;
+    if (!ownerInput.trim()) continue;
     let ownerTurnRecorded = false;
     const output = await completeOwnerInteraction(
       state,
@@ -314,10 +319,17 @@ async function runScriptableConversation(
     if (hosted && !ownerTurnRecorded) {
       process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
     }
-    process.stdout.write(`${output.source}: ${output.content}\n`);
+    process.stdout.write(hosted
+      ? `${encodeHostedOwnerResponse(output)}\n`
+      : `${output.source}: ${output.content}\n`);
     process.stdout.write(`${currentSessionView(state, workerSupervisors, sessionContext)}\n`);
     emitSessionData(state, workerSupervisors, sessionContext);
   }
+}
+
+function hostedOwnerInput(line: string): string {
+  // Invalid framing remains ordinary Owner input rather than becoming a host command.
+  return decodeHostedOwnerInput(line) ?? line;
 }
 
 function emitSessionData(

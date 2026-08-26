@@ -11,6 +11,7 @@
     "src/lifecycle-cli.ts",
     "src/live-smoke.ts",
     "src/owner-client.ts",
+    "src/owner-gateway-cli.ts",
     "src/owner-launcher.ts"
   ],
   "exclude": ["tests"]

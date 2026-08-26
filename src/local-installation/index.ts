@@ -519,7 +519,12 @@ async function writeLauncherManifest(
   leadAgent: VerifiedLocalRelease,
 ): Promise<void> {
   await mkdir(paths.launcher, { recursive: true });
-  for (const required of ["dist/owner-launcher.js", "dist/owner-client.js", "dist/lifecycle-cli.js"]) {
+  for (const required of [
+    "dist/owner-launcher.js",
+    "dist/owner-client.js",
+    "dist/owner-gateway-cli.js",
+    "dist/lifecycle-cli.js",
+  ]) {
     if (!leadAgent.manifest.files.some((file) => file.path === required)) {
       throw new Error(`The Lead Agent release does not contain ${required}.`);
     }
@@ -536,6 +541,7 @@ async function writeLauncherManifest(
         runtimePath: leadAgent.runtime.path,
         lifecyclePath: join(leadAgent.path, "dist", "lifecycle-cli.js"),
         ownerClientPath: join(leadAgent.path, "dist", "owner-client.js"),
+        ownerGatewayPath: join(leadAgent.path, "dist", "owner-gateway-cli.js"),
       },
       stateDirectory: paths.state,
       recoveryDirectory: paths.recovery,

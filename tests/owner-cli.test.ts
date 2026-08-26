@@ -6,6 +6,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { openAuthoritativeState } from "../src/authoritative-state/index.ts";
+import {
+  encodeHostedOwnerInput,
+  encodeHostedOwnerResponse,
+} from "../src/owner-host-framing.ts";
 import { advanceWriteGeneration } from "../src/write-generation.ts";
 import { startLocalModel } from "./support/local-model.ts";
 
@@ -280,6 +284,44 @@ test("hosted Session View inspection acknowledges handling without inventing a d
   const reopened = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
   assert.deepEqual(reopened.readOwnerConversation()?.messages, []);
   reopened.close();
+});
+
+test("hosted framing preserves multiline Owner input and Lead responses", async (t) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "cmd-riker-cli-hosted-framing-test-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const localModel = await startLocalModel(() => "First result line.\nSecond result line.");
+  t.after(() => localModel.close());
+  await writeFile(
+    join(stateDirectory, "config.json"),
+    JSON.stringify({
+      targetProject: { path: "C:\\target-project" },
+      modelSelection: {
+        provider: "local-openai",
+        model: "owner-model",
+        api: "openai-completions",
+        baseUrl: localModel.baseUrl,
+      },
+      modelPolicyRevision: "owner-policy-1",
+    }),
+  );
+  const ownerInput = "First request line.\nSecond request line.";
+
+  const result = await runCli(
+    stateDirectory,
+    `${encodeHostedOwnerInput(ownerInput)}\n`,
+    ["--hosted"],
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert(result.stdout.includes(
+    encodeHostedOwnerResponse({
+      source: "Lead Agent",
+      content: "First result line.\nSecond result line.",
+    }),
+  ));
+  const state = openAuthoritativeState(stateDirectory);
+  assert.equal(state.readOwnerConversation()?.messages[0]?.content, ownerInput);
+  state.close();
 });
 
 test("Owner CLI reports malformed configuration as a deterministic host diagnostic", async (t) => {

@@ -365,7 +365,7 @@ function emitConversationData(
   })}\n`);
 }
 
-function runInteractiveConversation(
+async function runInteractiveConversation(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
   targetProjectPath: string,
@@ -373,36 +373,38 @@ function runInteractiveConversation(
   ownerNotices: OwnerNoticeSink,
   sessionContext: OwnerSessionContext,
 ): Promise<void> {
-  const conversation = state.readOwnerConversation(sessionContext.activeSessionId);
-  const transcript = (conversation?.messages ?? []).map((message) => ({
-    source: message.role,
-    content: message.content,
-  }));
-  transcript.push(...state.readCommitments().map((commitment) => ({
-    source: "lead-agent" as const,
-    content: commitmentNotice(commitment),
-  })));
-
-  return runPiOwnerInterface({
-    targetProjectPath,
-    transcript,
-    completeOwnerInput: (ownerInput) =>
-      completeOwnerInteraction(state, adapter, ownerInput, workerSupervisors, undefined, sessionContext),
-    readSessionView: () => currentSessionView(state, workerSupervisors, sessionContext),
-    readSessionData: () => sessionViewSnapshot(state, workerSupervisors, "available", sessionContext),
-    subscribeNotices: (listener) => {
-      const previous = ownerNotices.deliver;
-      ownerNotices.deliver = listener;
-      return () => {
-        ownerNotices.deliver = previous;
-      };
-    },
-  }).then(() => {});
+  let attachment = currentOwnerAttachment(state, sessionContext, targetProjectPath);
+  while (true) {
+    const outcome = await runPiOwnerInterface({
+      ...attachment,
+      completeOwnerInput: (ownerInput) =>
+        completeOwnerInteraction(
+          state,
+          adapter,
+          ownerInput,
+          workerSupervisors,
+          undefined,
+          sessionContext,
+        ),
+      readSessionView: () => currentSessionView(state, workerSupervisors, sessionContext),
+      readSessionData: () => sessionViewSnapshot(state, workerSupervisors, "available", sessionContext),
+      subscribeNotices: (listener) => {
+        const previous = ownerNotices.deliver;
+        ownerNotices.deliver = listener;
+        return () => {
+          ownerNotices.deliver = previous;
+        };
+      },
+    });
+    if (outcome !== "conversation-replaced") return;
+    attachment = currentOwnerAttachment(state, sessionContext, targetProjectPath);
+  }
 }
 
 type OwnerInteractionOutput = {
   source: "Lead Agent" | "Session View";
   content: string;
+  reattach?: true;
 };
 
 /** Which Owner Session the Lead is currently serving; switching mutates it in place. */
@@ -470,15 +472,17 @@ async function completeOwnerInteraction(
     ]);
     sessionContext.activeSessionId = sessionId;
     return {
-      source: "Session View",
+      source: "Lead Agent",
       content: "New session started. Its first prompt names it.",
+      reattach: true,
     };
   }
   if (sessionAction?.kind === "use-session" && sessionContext) {
     sessionContext.activeSessionId = sessionAction.sessionId;
     return {
-      source: "Session View",
+      source: "Lead Agent",
       content: `Switched to session "${sessionAction.name || "(unnamed)"}". New turns continue there.`,
+      reattach: true,
     };
   }
   if (/^\/session\s+items\s*$/i.test(ownerInput)) {
@@ -507,16 +511,16 @@ async function completeOwnerInteraction(
     };
   }
   if (orderAction?.kind === "revoke-order") {
-    const ownerTurnId = state.appendOwnerMessage(ownerInput);
+    const ownerTurnId = state.appendOwnerMessage(ownerInput, sessionContext?.activeSessionId);
     onOwnerTurnRecorded?.(ownerTurnId);
     createOrchestrationCore(state).revokeStandingOrder(
       orderAction.standingOrderId,
       ownerTurnId,
       orderAction.reason,
     );
-    state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
+    state.recordOwnerInteractionDisposition(ownerTurnId, "owner-control");
     return {
-      source: "Session View",
+      source: "Lead Agent",
       content: "Standing Order revoked. Effects already dispatched under it are not rolled back.",
     };
   }
@@ -527,19 +531,49 @@ async function completeOwnerInteraction(
       content: "That control is not available right now.",
     };
   }
-  const ownerTurnId = state.appendOwnerMessage(ownerInput);
+  const ownerTurnId = state.appendOwnerMessage(ownerInput, sessionContext?.activeSessionId);
   onOwnerTurnRecorded?.(ownerTurnId);
   const supervisor = supervisorOfWorker(state, workerSupervisors, action.workerSessionId);
   if (!supervisor) throw new Error("Session View exposed cancellation without a live Worker supervisor.");
   await supervisor.cancel(
     action.workerSessionId,
     ownerTurnId,
-    "Owner requested cancellation from the Session View.",
+    "Owner requested cancellation through the Owner conversation.",
   );
-  state.recordOwnerInteractionDisposition(ownerTurnId, "session-view-control");
+  state.recordOwnerInteractionDisposition(ownerTurnId, "owner-control");
   return {
-    source: "Session View",
+    source: "Lead Agent",
     content: "Cancellation requested. Changes already made are not rolled back.",
+  };
+}
+
+function currentOwnerAttachment(
+  state: AuthoritativeState,
+  sessionContext: OwnerSessionContext,
+  fallbackTargetProjectPath: string,
+) {
+  const session = state.readOwnerSessions().find(
+    (candidate) => candidate.id === sessionContext.activeSessionId,
+  );
+  const configuredProjects = state.readConfiguredProjects();
+  const targetProjectPath = session?.projectPath
+    ? configuredProjects.find(
+        (project) => project.path.toLowerCase() === session.projectPath!.toLowerCase(),
+      )?.path ?? configuredProjects[0]?.path ?? fallbackTargetProjectPath
+    : configuredProjects[0]?.path ?? fallbackTargetProjectPath;
+  const conversation = state.readOwnerConversation(sessionContext.activeSessionId);
+  return {
+    targetProjectPath,
+    transcript: [
+      ...(conversation?.messages ?? []).map((message) => ({
+        source: message.role,
+        content: message.content,
+      })),
+      ...state.readCommitments().map((commitment) => ({
+        source: "lead-agent" as const,
+        content: commitmentNotice(commitment),
+      })),
+    ],
   };
 }
 

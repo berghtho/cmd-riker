@@ -48,7 +48,7 @@ export type OwnerGatewayProtocolSnapshot = {
 };
 
 export type OwnerGatewayProtocolEvent =
-  | { type: "conversation"; conversation: OwnerGatewayConversationEntry[] }
+  | Extract<OwnerGatewayEvent, { type: "conversation" }>
   | { type: "session-view"; sessionView: OwnerGatewayProtocolSessionView }
   | { type: "lead-state"; state: "responding" | "available" }
   | { type: "notice"; content: string }

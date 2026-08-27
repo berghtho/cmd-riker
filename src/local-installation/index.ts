@@ -551,7 +551,7 @@ async function writeLauncherManifest(
   );
   await writeFile(
     join(paths.launcher, "riker.cmd"),
-    `@echo off\r\n"${leadAgent.runtime.path}" "${join(leadAgent.path, "dist", "owner-launcher.js")}" --install-root "${paths.root}" %*\r\n`,
+    `@"${leadAgent.runtime.path}" "${join(leadAgent.path, "dist", "owner-launcher.js")}" --install-root "${paths.root}" %* & exit /b\r\n`,
     "utf8",
   );
 }

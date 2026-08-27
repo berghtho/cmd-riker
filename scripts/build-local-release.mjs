@@ -262,6 +262,12 @@ async function writeBundle(input) {
       payloadPaths.push(payloadPath);
     }
   }
+  await writeFile(
+    join(input.root, "package.json"),
+    `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`,
+    { encoding: "utf8", flag: "wx" },
+  );
+  payloadPaths.push("package.json");
   await copyFile(input.nodePath, join(runtimeDestination, "node.exe"));
   if (input.source !== undefined) {
     await writeFile(

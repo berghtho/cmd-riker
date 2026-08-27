@@ -151,7 +151,17 @@ function runBuild(buildScript: string, revision: string): Promise<void> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(
       "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", buildScript, "-Revision", revision],
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        buildScript,
+        "-Revision",
+        revision,
+        "-NodePath",
+        process.execPath,
+      ],
       { stdio: ["ignore", "inherit", "inherit"], windowsHide: true },
     );
     child.once("error", reject);

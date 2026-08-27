@@ -47,6 +47,7 @@ test("builds one complete Lead Agent release bundle with its lifecycle tools", {
       "dist/owner-launcher.js",
       "node_modules/runtime-dependency/index.js",
       "node_modules/runtime-dependency/package.json",
+      "package.json",
       "runtime/node.exe",
     ],
   );
@@ -59,6 +60,12 @@ test("builds one complete Lead Agent release bundle with its lifecycle tools", {
     await readFile(join(fixture.output, "lead-agent", "runtime", "node.exe")),
     await readFile(fixture.node),
   );
+  assert.deepEqual(
+    JSON.parse(await readFile(join(fixture.output, "lead-agent", "package.json"), "utf8")),
+    { private: true, type: "module" },
+  );
+  const execution = await run(fixture.node, [join(fixture.output, "lead-agent", "dist", "cli.js")]);
+  assert.equal(execution.stderr, "");
 });
 
 test("bundles an optional tools tree into the hashed manifest", { skip }, async (t) => {

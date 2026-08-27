@@ -149,6 +149,8 @@ test("install stages the bundle, snapshots initial state, and writes the v2 laun
   assert.ok(manifest.leadAgent.ownerGatewayPath.endsWith("owner-gateway-cli.js"));
   const riker = await readFile(join(paths.launcher, "riker.cmd"), "utf8");
   assert.match(riker, /owner-launcher\.js/);
+  assert.equal(riker.trim().split(/\r?\n/).length, 1, "the self-updating shim is parsed once");
+  assert.match(riker, / %\* & exit \/b\r\n$/);
 
   await assert.rejects(
     installation.initialInstall({

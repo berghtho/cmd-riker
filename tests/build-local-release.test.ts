@@ -108,12 +108,10 @@ test("refuses unsafe revisions and never replaces an existing output", { skip },
   );
 });
 
-test("records the source repository commit for the update notice", { skip }, async (t) => {
+test("records path-free source provenance for the update notice", { skip }, async (t) => {
   const fixture = await releaseFixture(t, "source");
   const commit = "a".repeat(40);
   await buildRelease(fixture, "source-1", [
-    "--source-path",
-    fixture.root,
     "--source-commit",
     commit,
   ]);
@@ -123,16 +121,14 @@ test("records the source repository commit for the update notice", { skip }, asy
     "lead-agent",
   );
   assert.ok(lead.manifest.files.some((file) => file.path === "source.json"));
-  const record = JSON.parse(
-    await readFile(join(fixture.output, "lead-agent", "source.json"), "utf8"),
-  ) as { repositoryPath: string; commit: string };
-  assert.equal(record.commit, commit);
-  assert.equal(record.repositoryPath, fixture.root);
+  const sourceRecord = await readFile(join(fixture.output, "lead-agent", "source.json"), "utf8");
+  assert.deepEqual(JSON.parse(sourceRecord), { formatVersion: 1, commit });
+  assert.doesNotMatch(sourceRecord, /repositoryPath/);
 
   const noCommit = await releaseFixture(t, "source-missing");
   await assert.rejects(
-    buildRelease(noCommit, "source-2", ["--source-path", noCommit.root]),
-    /supplied together/,
+    buildRelease(noCommit, "source-2", ["--source-commit", "not-a-commit"]),
+    /Git commit hash/,
   );
 });
 

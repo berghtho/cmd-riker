@@ -147,6 +147,16 @@ Inside the `riker` terminal, `/items` lists every work item with a plain status 
 Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"
 — and the Lead persists the preference durably; nobody edits configuration files by hand.
 
+From any directory inside the CMD Riker source checkout, build and activate the next revision:
+
+```powershell
+riker upgrade
+```
+
+The installed bundle records only its producing Git commit. The checkout is discovered from the
+invocation directory at runtime; its machine-specific path is never written into the bundle or
+installation state. Launching `riker` from that checkout also enables the repository update notice.
+
 Upgrade from another trusted local Lead Agent bundle:
 
 ```powershell

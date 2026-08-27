@@ -102,11 +102,11 @@ async function main() {
       ],
       nodePath,
       runtime,
-      // The bundle remembers which repository commit produced it so the Owner
-      // interface can announce when the repository has moved on.
+      // The bundle remembers which commit produced it without persisting the
+      // checkout's machine-specific path.
       source: options.sourceCommit === undefined
         ? undefined
-        : { repositoryPath: resolve(options.sourcePath), commit: options.sourceCommit },
+        : { commit: options.sourceCommit },
     });
     await assertMissing(output, "Release output");
     try {
@@ -130,7 +130,6 @@ function parseArguments(argumentsList) {
     ["--lead-node-modules", "leadNodeModules"],
     ["--output", "output"],
     ["--tools", "tools"],
-    ["--source-path", "sourcePath"],
     ["--source-commit", "sourceCommit"],
   ]);
   const required = ["revision", "node", "leadDist", "leadNodeModules", "output"];
@@ -148,9 +147,6 @@ function parseArguments(argumentsList) {
   if (required.some((key) => values[key] === undefined)) {
     throw usageError();
   }
-  if ((values.sourcePath === undefined) !== (values.sourceCommit === undefined)) {
-    throw new Error("--source-path and --source-commit must be supplied together.");
-  }
   if (values.sourceCommit !== undefined && !/^[0-9a-f]{7,40}$/i.test(values.sourceCommit)) {
     throw new Error("--source-commit must be a Git commit hash.");
   }
@@ -161,7 +157,7 @@ function usageError() {
   return new Error(
     "Usage: build-local-release.mjs --revision <revision> --node <node.exe> " +
       "--lead-dist <directory> --lead-node-modules <directory> --output <directory> " +
-      "[--tools <directory>]",
+      "[--tools <directory>] [--source-commit <commit>]",
   );
 }
 

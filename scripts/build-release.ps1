@@ -14,7 +14,6 @@ npm run build:local-release -- `
   --lead-dist dist/lead-agent `
   --lead-node-modules node_modules `
   --tools vendor `
-  --source-path "$repository" `
   --source-commit $commit `
   --output "release/$Revision"
 exit $LASTEXITCODE

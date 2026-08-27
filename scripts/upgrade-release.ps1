@@ -1,6 +1,8 @@
 param([Parameter(Mandatory = $true)][string]$Revision)
 $ErrorActionPreference = "Stop"
+$repository = Resolve-Path (Join-Path $PSScriptRoot "..")
+$leadBundle = Join-Path $repository "release\$Revision\lead-agent"
 & "$env:LOCALAPPDATA\CMD Riker\launcher\riker.cmd" upgrade `
-  --lead-bundle "C:\repos\cmd-riker\release\$Revision\lead-agent" `
+  --lead-bundle $leadBundle `
   --state-revision "before-$Revision"
 exit $LASTEXITCODE

@@ -9,6 +9,9 @@ import test from "node:test";
 
 const run = promisify(execFile);
 const sourceScript = fileURLToPath(new URL("../scripts/build-release.ps1", import.meta.url));
+const sourceUpgradeScript = fileURLToPath(
+  new URL("../scripts/upgrade-release.ps1", import.meta.url),
+);
 
 test("release wrapper forwards the selected Node runtime", {
   skip: process.platform === "win32" ? false : "PowerShell release wrapper is Windows-only",
@@ -49,5 +52,12 @@ test("release wrapper forwards the selected Node runtime", {
   assert.equal(invocations.length, 2);
   assert.match(invocations[1]!, /run build:local-release/);
   assert.ok(invocations[1]!.includes(process.execPath), invocations[1]);
-  assert.doesNotMatch(invocations[1]!, /C:\\Tools\\nodejs\\node\.exe/i);
+  assert.doesNotMatch(invocations[1]!, /--source-path/);
+  assert.doesNotMatch(await readFile(sourceScript, "utf8"), /C:\\Tools\\nodejs\\node\.exe/i);
+});
+
+test("upgrade wrapper derives the candidate path from its checkout", async () => {
+  const script = await readFile(sourceUpgradeScript, "utf8");
+  assert.match(script, /\$PSScriptRoot/);
+  assert.doesNotMatch(script, /[A-Za-z]:\\repos\\/i);
 });

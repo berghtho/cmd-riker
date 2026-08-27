@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -15,6 +15,7 @@ import {
   readLifecycle,
   type LocalInstallation,
 } from "./local-installation/index.ts";
+import { inspectLocalSourceCheckout } from "./local-source-checkout/index.ts";
 import {
   localLeadHostAddress,
   startLocalLeadHost,
@@ -54,7 +55,6 @@ try {
       stateRevision,
       stateProvenance: "Owner-supplied local upgrade",
     });
-    await recordSourceRepository(installRoot, result.active.code.path);
     await (await installation.start()).detach();
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } else if (command === "rollback") {
@@ -79,41 +79,28 @@ function errorChain(error: unknown): string {
   return messages.join(" Caused by: ");
 }
 
-// A bare `riker upgrade` builds the next revision from the source repository
-// the installed bundle recorded, so the update notice's instruction is one
-// literal command. Bundles built without a source record fall back to the
-// installation-level record written on the last successful install/upgrade.
+// A bare `riker upgrade` builds from the Git checkout containing the invocation
+// directory. Checkout paths are deliberately never persisted into bundles or
+// installation state.
 async function buildFromSourceRepository(
   installation: LocalInstallation,
 ): Promise<{ bundleDirectory: string; revision: string }> {
   const inspection = await installation.inspect();
   const active = inspection.active;
   if (!active) throw new Error("No installed version to upgrade from; supply --lead-bundle.");
-  const recorded = [
-    await readSourceRepositoryPath(join(active.code.path, "source.json")),
-    await readSourceRepositoryPath(sourceRepositoryRecordPath(inspection.paths.root)),
-  ].filter((path): path is string => path !== undefined);
-  if (recorded.length === 0) {
-    throw new Error(
-      "Neither the installed bundle nor the installation records a source repository; " +
-        "supply --lead-bundle explicitly.",
-    );
-  }
-  const repositoryPath = recorded.find((path) => existsSync(path));
-  if (!repositoryPath) {
-    throw new Error(
-      "The recorded source repository is unavailable; supply --lead-bundle explicitly.",
-    );
-  }
+  const installedCommit = await readSourceCommit(join(active.code.path, "source.json"));
+  const repositoryPath = await invocationRepositoryPath(installedCommit);
   const buildScript = join(repositoryPath, "scripts", "build-release.ps1");
   if (!existsSync(buildScript)) {
-    throw new Error(`The source repository is missing ${buildScript}; supply --lead-bundle.`);
+    throw new Error(
+      "Run riker upgrade from the CMD Riker source checkout, or supply --lead-bundle explicitly.",
+    );
   }
   let revision = nextRevision(active.code.revision);
   while (existsSync(join(repositoryPath, "release", revision))) {
     revision = nextRevision(revision);
   }
-  process.stdout.write(`Building ${revision} from ${repositoryPath} …\n`);
+  process.stdout.write(`Building ${revision} from the invocation checkout …\n`);
   await runBuild(buildScript, revision);
   const bundleDirectory = join(repositoryPath, "release", revision, "lead-agent");
   if (!existsSync(join(bundleDirectory, "manifest.json"))) {
@@ -122,29 +109,21 @@ async function buildFromSourceRepository(
   return { bundleDirectory, revision };
 }
 
-function sourceRepositoryRecordPath(installRoot: string): string {
-  return join(localInstallationPaths(installRoot).state, "source-repository.json");
+async function invocationRepositoryPath(expectedCommit: string | undefined): Promise<string> {
+  const checkout = await inspectLocalSourceCheckout(process.cwd(), expectedCommit);
+  if (checkout) return checkout.path;
+  throw new Error(
+    "Run riker upgrade from the CMD Riker source checkout, or supply --lead-bundle explicitly.",
+  );
 }
 
-async function readSourceRepositoryPath(file: string): Promise<string | undefined> {
+async function readSourceCommit(file: string): Promise<string | undefined> {
   try {
-    const record = JSON.parse(await readFile(file, "utf8")) as { repositoryPath?: string };
-    return typeof record.repositoryPath === "string" ? record.repositoryPath : undefined;
+    const record = JSON.parse(await readFile(file, "utf8")) as { commit?: string };
+    return typeof record.commit === "string" ? record.commit : undefined;
   } catch {
     return undefined;
   }
-}
-
-// Mirrors the activated bundle's source record at installation level so a later
-// bare `riker upgrade` survives a bundle that was built without one.
-async function recordSourceRepository(installRoot: string, bundlePath: string): Promise<void> {
-  const repositoryPath = await readSourceRepositoryPath(join(bundlePath, "source.json"));
-  if (repositoryPath === undefined) return;
-  await writeFile(
-    sourceRepositoryRecordPath(installRoot),
-    `${JSON.stringify({ formatVersion: 1, repositoryPath }, null, 2)}\n`,
-    "utf8",
-  );
 }
 
 function runBuild(buildScript: string, revision: string): Promise<void> {
@@ -183,7 +162,6 @@ async function install(installation: LocalInstallation, installRoot: string): Pr
     stateRevision: argumentValue("--state-revision") ?? "initial-state",
     stateProvenance: "Owner-supplied initial local installation",
   });
-  if (result.active) await recordSourceRepository(installRoot, result.active.code.path);
   await (await installation.start()).detach();
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }

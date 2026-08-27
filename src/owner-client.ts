@@ -1,9 +1,8 @@
-import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
 
 import { localLeadHostAddress } from "./local-host/index.ts";
+import { inspectLocalSourceCheckout } from "./local-source-checkout/index.ts";
 import {
   runPiOwnerInterface,
   type PiOwnerUpdateStatus,
@@ -55,15 +54,15 @@ async function runOwnerClient(installationRoot: string): Promise<void> {
   }
 }
 
-// The installed bundle records its source repository and commit; the client
-// polls that repository's HEAD in the background so the interface can announce
-// a newer version. Git failures or a missing source record simply disable the
-// notice.
+// The installed bundle records its source commit. When the Owner launches from
+// the matching checkout, the client polls that checkout's HEAD in the
+// background. Checkout paths are never persisted; Git failures, another
+// checkout, or a missing source record simply disable the notice.
 function createUpdateStatusReader(
   installationRoot: string,
 ): () => PiOwnerUpdateStatus | undefined {
   let status: PiOwnerUpdateStatus | undefined;
-  let source: { repositoryPath: string; commit: string; revision: string } | undefined;
+  let source: { commit: string; revision: string } | undefined;
   try {
     const launcher = JSON.parse(
       readFileSync(join(installationRoot, "launcher", "installation.json"), "utf8"),
@@ -71,12 +70,10 @@ function createUpdateStatusReader(
     const bundlePath = launcher.leadAgent?.path;
     if (bundlePath) {
       const record = JSON.parse(readFileSync(join(bundlePath, "source.json"), "utf8")) as {
-        repositoryPath?: string;
         commit?: string;
       };
-      if (record.repositoryPath && record.commit) {
+      if (record.commit) {
         source = {
-          repositoryPath: record.repositoryPath,
           commit: record.commit,
           revision: launcher.leadAgent?.identity?.revision ?? "installed",
         };
@@ -87,24 +84,18 @@ function createUpdateStatusReader(
   }
   if (source) {
     const record = source;
-    const execute = promisify(execFile);
     let checking = false;
     const check = async () => {
       if (checking) return;
       checking = true;
       try {
-        const result = await execute(
-          "git",
-          ["-C", record.repositoryPath, "rev-parse", "HEAD"],
-          { encoding: "utf8", timeout: 10_000, windowsHide: true },
-        );
-        const repositoryCommit = result.stdout.trim();
-        status = /^[0-9a-f]{40}$/i.test(repositoryCommit)
+        const checkout = await inspectLocalSourceCheckout(process.cwd(), record.commit);
+        status = checkout
           ? {
               installedRevision: record.revision,
               installedCommit: record.commit,
-              repositoryCommit,
-              updateAvailable: repositoryCommit.toLowerCase() !== record.commit.toLowerCase(),
+              repositoryCommit: checkout.headCommit,
+              updateAvailable: checkout.headCommit.toLowerCase() !== record.commit.toLowerCase(),
             }
           : undefined;
       } catch {

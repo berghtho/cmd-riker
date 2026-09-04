@@ -7,6 +7,36 @@ export const ownerConversationPrefix = "CMD_RIKER_OWNER_CONVERSATION:";
 export const ownerSessionViewPrefix = "CMD_RIKER_OWNER_SESSION_VIEW:";
 export const ownerProjectsPrefix = "CMD_RIKER_OWNER_PROJECTS:";
 export const ownerTurnCompleteMarker = "CMD_RIKER_OWNER_TURN_COMPLETE";
+export const ownerInterruptPrefix = "CMD_RIKER_OWNER_INTERRUPT:";
+export const leadStatePrefix = "CMD_RIKER_LEAD_STATE:";
+
+export type OwnerInputScope = { targetProjectPath?: string; sessionId?: string; ownerTurnId?: string };
+
+export function encodeHostedOwnerInterrupt(scope: OwnerInputScope = {}): string {
+  return `${ownerInterruptPrefix}${JSON.stringify(scope)}`;
+}
+
+export function decodeHostedOwnerInterrupt(line: string): OwnerInputScope | undefined {
+  if (!line.startsWith(ownerInterruptPrefix)) return undefined;
+  try {
+    const value: unknown = JSON.parse(line.slice(ownerInterruptPrefix.length));
+    if (typeof value !== "object" || value === null) return undefined;
+    const scope = value as Record<string, unknown>;
+    if (
+      (scope.targetProjectPath !== undefined && typeof scope.targetProjectPath !== "string") ||
+      (scope.sessionId !== undefined && typeof scope.sessionId !== "string") ||
+      (scope.ownerTurnId !== undefined && typeof scope.ownerTurnId !== "string") ||
+      (scope.sessionId !== undefined && !scope.targetProjectPath)
+    ) return undefined;
+    return {
+      ...(typeof scope.targetProjectPath === "string" ? { targetProjectPath: scope.targetProjectPath } : {}),
+      ...(typeof scope.sessionId === "string" ? { sessionId: scope.sessionId } : {}),
+      ...(typeof scope.ownerTurnId === "string" ? { ownerTurnId: scope.ownerTurnId } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 export type HostedOwnerInput = {
   content: string;

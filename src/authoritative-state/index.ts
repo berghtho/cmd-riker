@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { backup as backupDatabase, DatabaseSync } from "node:sqlite";
+import { pendingLeadContinuations, type LeadContinuation, type LeadContinuationCandidate } from "../lead-continuation/index.ts";
 
 import {
   assertSupportedModelSelection,
@@ -269,6 +270,17 @@ export interface AuthoritativeState {
   appendLeadTurnAttemptSnapshots(snapshots: LeadTurnAttempt[]): void;
   readLeadTurnAttempt(attemptId: string): LeadTurnAttempt | undefined;
   readLeadTurnAttempts(): LeadTurnAttempt[];
+  readLeadContinuation(id: string): LeadContinuation | undefined;
+  readLeadContinuations(): LeadContinuation[];
+  hasOwnerResponseAfterLeadContinuation(id: string): boolean;
+  claimLeadContinuation(candidate: LeadContinuationCandidate): LeadContinuation | undefined;
+  settleLeadContinuation(id: string, status: "completed" | "failed", failureKind?: LeadContinuation["failureKind"]): void;
+  appendLeadContinuationMessageWithAccounts(
+    id: string,
+    content: string,
+    accounts: { selfRepairs: SelfRepairRecord[]; commitments: Commitment[] },
+    attribution?: { modelSelection: ModelSelection; modelPolicyRevision: string; selectionReason?: "fallback-after-ineligible-candidate"; turnMetrics?: LeadTurnMetrics },
+  ): void;
   appendWorkerSessionSnapshots(snapshots: WorkerSession[]): void;
   readWorkerSession(workerSessionId: string): WorkerSession | undefined;
   readWorkerSessions(): WorkerSession[];
@@ -381,6 +393,7 @@ type FactDraft =
   | { kind: "commitment.snapshot"; value: Commitment }
   | { kind: "owner-session.snapshot"; value: OwnerSession }
   | { kind: "lead-turn-attempt.snapshot"; value: LeadTurnAttempt }
+  | { kind: "lead-continuation.snapshot"; value: LeadContinuation }
   | { kind: "worker-session.snapshot"; value: WorkerSession }
   | { kind: "worker-execution-attempt.snapshot"; value: WorkerExecutionAttempt }
   | { kind: "worker-question.snapshot"; value: WorkerQuestion }
@@ -409,6 +422,7 @@ type TransitionKind =
   | `owner-session.${OwnerSession["state"]}`
   | `commitment.${Commitment["state"]}`
   | `lead-turn-attempt.${LeadTurnAttempt["status"]}`
+  | `lead-continuation.${LeadContinuation["status"]}`
   | `worker-session.${WorkerSession["state"]}`
   | `worker-execution-attempt.${WorkerExecutionAttempt["status"]}`
   | `worker-question.${WorkerQuestion["status"]}`
@@ -678,6 +692,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "owner-session.snapshot"
+      | "lead-continuation.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
@@ -707,6 +722,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "owner-session.snapshot"
+      | "lead-continuation.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
@@ -732,6 +748,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "owner-session.snapshot"
+      | "lead-continuation.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot"
@@ -743,6 +760,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "owner-session"
+      | "lead-continuation"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
@@ -754,6 +772,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "owner-session"
+      | "lead-continuation"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice"
@@ -818,6 +837,7 @@ export function openAuthoritativeState(
       | "worker-question.snapshot"
       | "standing-order.snapshot"
       | "owner-session.snapshot"
+      | "lead-continuation.snapshot"
       | "self-repair.snapshot"
       | "forge-operation-attempt.snapshot"
       | "forge-owner-action-notice.snapshot",
@@ -827,6 +847,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "owner-session"
+      | "lead-continuation"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
@@ -836,6 +857,7 @@ export function openAuthoritativeState(
       | "worker-question"
       | "standing-order"
       | "owner-session"
+      | "lead-continuation"
       | "self-repair"
       | "forge-operation-attempt"
       | "forge-owner-action-notice",
@@ -1447,7 +1469,19 @@ export function openAuthoritativeState(
       );
     },
 
+    appendLeadContinuationMessageWithAccounts(id, content, accounts, attribution) {
+      const continuation = this.readLeadContinuation(id);
+      if (!continuation || continuation.status !== "started") {
+        throw new Error("Continuation response requires its active durable receipt.");
+      }
+      this.appendLeadAgentMessageWithAccounts(id, content, accounts, attribution);
+    },
+
     appendLeadAgentMessageWithAccounts(turnId, content, accounts, attribution) {
+      const continuation = this.readLeadContinuation(turnId);
+      if (continuation && continuation.status !== "started") {
+        throw new Error("Continuation response requires its active durable receipt.");
+      }
       const ownerTurn = database
         .prepare(`
           SELECT value_json
@@ -1456,7 +1490,7 @@ export function openAuthoritativeState(
              AND json_extract(value_json, '$.turnId') = ?
            LIMIT 1
         `)
-        .get(turnId) as { value_json: string } | undefined;
+        .get(continuation?.ownerTurnId ?? turnId) as { value_json: string } | undefined;
       if (!ownerTurn) throw new Error(`Unknown Lead turn ${turnId}.`);
       const originalAttribution = JSON.parse(ownerTurn.value_json) as {
         modelSelection: ModelSelection;
@@ -1578,6 +1612,70 @@ export function openAuthoritativeState(
         database.exec("ROLLBACK");
         throw error;
       }
+    },
+
+    readLeadContinuation(id) {
+      return readCurrentSnapshot<LeadContinuation>("lead-continuation.snapshot", `lead-continuation:${id}`)?.value;
+    },
+
+    readLeadContinuations() {
+      return readCurrentSnapshots<LeadContinuation>("lead-continuation.snapshot");
+    },
+
+    hasOwnerResponseAfterLeadContinuation(id) {
+      const receipt = readCurrentSnapshot<LeadContinuation>("lead-continuation.snapshot", `lead-continuation:${id}`);
+      if (!receipt) return false;
+      return Boolean(database.prepare(`
+        SELECT 1 FROM facts response
+        JOIN facts owner ON owner.kind = 'owner-conversation.owner-message'
+          AND json_extract(owner.value_json, '$.turnId') = json_extract(response.value_json, '$.turnId')
+        WHERE response.kind = 'owner-conversation.lead-agent-message'
+          AND response.sequence > (SELECT sequence FROM facts WHERE id = ?)
+          AND COALESCE(json_extract(response.value_json, '$.sessionId'), 'primary') = ?
+        LIMIT 1
+      `).get(receipt.id, receipt.value.sessionId));
+    },
+
+    claimLeadContinuation(candidate) {
+      beginWrite();
+      try {
+        // Validate against the current facts while holding the writer lock.
+        const eligible = pendingLeadContinuations(this).find((entry) => entry.eventKey === candidate.eventKey);
+        if (!eligible) {
+          database.exec("COMMIT");
+          return undefined;
+        }
+        if ((Object.keys(eligible) as Array<keyof LeadContinuationCandidate>).some((key) => eligible[key] !== candidate[key])) {
+          throw new Error("Continuation origin must match the durable Worker observation.");
+        }
+        const receipt: LeadContinuation = { ...eligible, id: randomUUID(), status: "started", createdAt: new Date().toISOString() };
+        const factId = randomUUID();
+        database.prepare(`
+          INSERT INTO facts (id, subject_id, kind, value_json, supersedes_fact_id, recorded_at)
+          VALUES (?, ?, 'lead-continuation.snapshot', ?, NULL, ?)
+        `).run(factId, `lead-continuation:${receipt.id}`, JSON.stringify(receipt), receipt.createdAt);
+        database.prepare(`
+          INSERT INTO transitions (id, kind, fact_id, recorded_at)
+          VALUES (?, 'lead-continuation.started', ?, ?)
+        `).run(randomUUID(), factId, receipt.createdAt);
+        database.exec("COMMIT");
+        return receipt;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+
+    settleLeadContinuation(id, status, failureKind) {
+      const receipt = this.readLeadContinuation(id);
+      if (!receipt || receipt.status !== "started") throw new Error("Continuation is not active.");
+      if (status === "completed" && this.leadAgentResponse(id) === undefined) {
+        throw new Error("Completed continuation requires a durable response.");
+      }
+      if (status === "failed" && !failureKind) throw new Error("Failed continuation requires a cause.");
+      appendSnapshots("lead-continuation.snapshot", "lead-continuation", "lead-continuation", [{
+        ...receipt, status, ...(status === "failed" ? { failureKind } : {}),
+      }]);
     },
 
     ownerTurnSequence(turnId) {
@@ -3010,6 +3108,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
         'owner-session.snapshot',
         'commitment.snapshot',
         'lead-turn-attempt.snapshot',
+          'lead-continuation.snapshot',
         'worker-session.snapshot',
         'worker-execution-attempt.snapshot',
         'worker-question.snapshot',
@@ -3052,6 +3151,9 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
         'lead-turn-attempt.started',
         'lead-turn-attempt.completed',
         'lead-turn-attempt.failed',
+          'lead-continuation.started',
+          'lead-continuation.completed',
+          'lead-continuation.failed',
         'worker-session.starting',
         'worker-session.running',
         'worker-session.waiting-question',
@@ -3178,6 +3280,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
     .get() as { sql: string };
   if (
     row.sql.includes("'owner-session.snapshot'") &&
+    row.sql.includes("'lead-continuation.snapshot'") &&
     row.sql.includes("'commitment.snapshot'") &&
     row.sql.includes("'lead-turn-attempt.snapshot'") &&
     row.sql.includes("'worker-session.snapshot'") &&
@@ -3193,6 +3296,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
     row.sql.includes("'target-project-operation-attempt.snapshot'") &&
     row.sql.includes("'effect-intent.snapshot'") &&
     transitionsRow.sql.includes("'owner-session.active'") &&
+    transitionsRow.sql.includes("'lead-continuation.started'") &&
     transitionsRow.sql.includes("'worker-execution-attempt.timed-out'") &&
     transitionsRow.sql.includes("'self-repair.activation-pending'") &&
     transitionsRow.sql.includes("'owner.forge-authorities-reconfigured'") &&
@@ -3219,6 +3323,7 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
           'owner-session.snapshot',
           'commitment.snapshot',
           'lead-turn-attempt.snapshot',
+          'lead-continuation.snapshot',
           'worker-session.snapshot',
           'worker-execution-attempt.snapshot',
           'worker-question.snapshot',
@@ -3259,6 +3364,9 @@ function ensureSchema(database: DatabaseSync, writeGeneration: number): void {
           'lead-turn-attempt.started',
           'lead-turn-attempt.completed',
           'lead-turn-attempt.failed',
+          'lead-continuation.started',
+          'lead-continuation.completed',
+          'lead-continuation.failed',
           'worker-session.starting',
           'worker-session.running',
           'worker-session.waiting-question',
@@ -3480,6 +3588,8 @@ function factSubject(input: FactDraft): string {
       return `commitment:${input.value.id}`;
     case "lead-turn-attempt.snapshot":
       return `lead-turn-attempt:${input.value.id}`;
+    case "lead-continuation.snapshot":
+      return `lead-continuation:${input.value.id}`;
     case "worker-session.snapshot":
       return `worker-session:${input.value.id}`;
     case "worker-execution-attempt.snapshot":

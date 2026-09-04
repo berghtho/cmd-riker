@@ -211,6 +211,7 @@ async function host(installRoot: string): Promise<void> {
           durableOwnerAckPrefix: "CMD_RIKER_OWNER_RECORDED:",
           ownerHandledMarker: "CMD_RIKER_OWNER_HANDLED",
           encodeOwnerInput: true,
+          interruptibleOwnerTurns: true,
           ownerTurnCompletePrefix: ownerTurnCompleteMarker,
           onTranscriptEntry(entry) {
             if (!toasts || entry.source !== "lead" || entry.stream !== "stdout") return;

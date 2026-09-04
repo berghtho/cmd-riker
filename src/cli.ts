@@ -17,14 +17,18 @@ import {
 } from "./authoritative-state/index.ts";
 import {
   decodeHostedOwnerInput,
+  decodeHostedOwnerInterrupt,
   encodeHostedOwnerConversation,
   encodeHostedOwnerError,
   encodeHostedOwnerProjects,
   encodeHostedOwnerResponse,
   encodeHostedOwnerSessionView,
   ownerTurnCompleteMarker,
+  leadStatePrefix,
   type HostedOwnerInput,
 } from "./owner-host-framing.ts";
+import { createLeadTurnScheduler, type LeadTurnScope } from "./lead-turn-scheduler/index.ts";
+import { pendingLeadContinuations, reconcileLeadContinuations } from "./lead-continuation/index.ts";
 import {
   PiAgentTurnAdapter,
   type PiTurnAdapter,
@@ -249,6 +253,7 @@ async function main(): Promise<void> {
     }
     if (!conversation) throw new Error("Authoritative state could not be initialized.");
     createOrchestrationCore(state).reconcileInterruptedCommitments();
+    reconcileLeadContinuations(state);
     if (!policyValidated) {
       await validatePolicy(adapter, conversation);
     }
@@ -256,7 +261,8 @@ async function main(): Promise<void> {
       deliver: (content) =>
         process.stdout.write(`CMD_RIKER_WORKER_NOTICE: ${singleLine(content)}\n`),
     };
-    const workerSupervisors = await availableWorkerSupervisors(state, conversation, ownerNotices);
+    let wakeLead = () => {};
+    const workerSupervisors = await availableWorkerSupervisors(state, conversation, ownerNotices, () => wakeLead());
     for (const supervisor of Object.values(workerSupervisors)) await supervisor.recover();
     // A restarted interface resumes the session the Owner spoke to last.
     const sessionContext: OwnerSessionContext = {
@@ -273,23 +279,57 @@ async function main(): Promise<void> {
       }
     };
 
-    if (process.stdin.isTTY && process.stdout.isTTY) {
-      await runInteractiveConversation(
-        state,
-        adapter,
-        conversation.targetProject.path,
-        workerSupervisors,
-        ownerNotices,
-        sessionContext,
-      );
-    } else {
-      await runScriptableConversation(
-        state,
-        adapter,
-        conversation.targetProject.path,
-        workerSupervisors,
-        sessionContext,
-      );
+    const runtime = createLeadAgentRuntime({ state, adapter, workerSupervisors });
+    const scheduler = createLeadTurnScheduler({
+      nextContinuation() {
+        const candidate = pendingLeadContinuations(state)[0];
+        if (!candidate) return undefined;
+        return {
+          scope: { targetProjectPath: candidate.targetProjectPath, sessionId: candidate.sessionId },
+          async run(signal) {
+            try {
+              const content = await runtime.completeContinuation(candidate, signal);
+              if (content && !process.argv.includes("--hosted")) {
+                ownerNotices.deliver(content);
+              }
+            } finally {
+              emitSessionData(state, workerSupervisors, sessionContext);
+              if (process.argv.includes("--hosted")) {
+                emitHostedProjectData(state, workerSupervisors);
+                emitHostedProjectProjection(state, workerSupervisors, candidate.targetProjectPath, {
+                  targetProjectPath: candidate.targetProjectPath,
+                  activeSessionId: candidate.sessionId,
+                });
+              }
+            }
+          },
+        };
+      },
+      onState: (availability) => {
+        if (process.argv.includes("--hosted")) process.stdout.write(`${leadStatePrefix}${availability}\n`);
+      },
+      onError: (error) => {
+        if (error instanceof LeadAgentRuntimeDiagnostic && error.code === "CMD_RIKER_LEAD_INTERRUPTED") return;
+        process.stderr.write("CMD_RIKER_CONTINUATION_FAILED: Automatic follow-up stopped; inspect the project status.\n");
+      },
+    });
+    wakeLead = scheduler.wake;
+    scheduler.wake();
+    try {
+      if (process.stdin.isTTY && process.stdout.isTTY) {
+        await runInteractiveConversation(
+          state, adapter, conversation.targetProject.path, workerSupervisors,
+          ownerNotices, sessionContext, scheduler,
+        );
+      } else {
+        await runScriptableConversation(
+          state, adapter, conversation.targetProject.path, workerSupervisors,
+          sessionContext, scheduler,
+        );
+      }
+    } finally {
+      wakeLead = () => {};
+      await scheduler.close();
     }
   } finally {
     state.close();
@@ -302,6 +342,7 @@ async function runScriptableConversation(
   targetProjectPath: string,
   workerSupervisors: WorkerSupervisors,
   sessionContext: OwnerSessionContext,
+  scheduler: ReturnType<typeof createLeadTurnScheduler>,
 ): Promise<void> {
   const hosted = process.argv.includes("--hosted");
   process.stdout.write(`CMD Riker | Target Project: ${targetProjectPath}\n`);
@@ -311,7 +352,24 @@ async function runScriptableConversation(
     emitHostedProjectData(state, workerSupervisors);
   }
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const pending = new Set<Promise<void>>();
+  let scriptFailure: Error | undefined;
   for await (const ownerInputLine of lines) {
+    const interrupt = hosted ? decodeHostedOwnerInterrupt(ownerInputLine) : undefined;
+    if (interrupt) {
+      try {
+        const context = interrupt.targetProjectPath
+          ? scopedSessionContext(state, { content: "", ...interrupt, targetProjectPath: interrupt.targetProjectPath })
+          : sessionContext;
+        scheduler.interrupt({
+          ...leadTurnScope(state, context),
+          ...(interrupt.ownerTurnId ? { ownerTurnId: interrupt.ownerTurnId } : {}),
+        });
+      } catch {
+        // A stale or foreign cursor cannot interrupt another Owner Session.
+      }
+      continue;
+    }
     const framedInput = hosted ? hostedOwnerInput(ownerInputLine) : { content: ownerInputLine };
     const ownerInput = framedInput.content;
     if (!ownerInput.trim()) continue;
@@ -331,36 +389,55 @@ async function runScriptableConversation(
         continue;
       }
     }
-    let ownerTurnRecorded = false;
-    const output = await completeOwnerInteraction(
-      state,
-      adapter,
-      ownerInput,
-      workerSupervisors,
-      hosted
-        ? (turnId) => {
+    const scope = leadTurnScope(state, turnContext);
+    if (ownerInput.trim().toLowerCase() === "/interrupt") {
+      scheduler.interrupt(scope);
+      process.stdout.write("Session View: Lead interruption requested. Worker Sessions continue.\n");
+      continue;
+    }
+    const operation = scheduler.submitOwner(scope, async (signal) => {
+      let ownerTurnRecorded = false;
+      try {
+        const output = await completeOwnerInteraction(
+          state, adapter, ownerInput, workerSupervisors,
+          (turnId) => {
             ownerTurnRecorded = true;
-            process.stdout.write(`CMD_RIKER_OWNER_RECORDED:${turnId}\n`);
-          }
-        : undefined,
-      turnContext,
-    );
-    if (hosted && !ownerTurnRecorded) {
-      process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
-    }
-    process.stdout.write(hosted
-      ? `${encodeHostedOwnerResponse(output)}\n`
-      : `${output.source}: ${output.content}\n`);
-    process.stdout.write(`${currentSessionView(state, workerSupervisors, turnContext)}\n`);
-    emitSessionData(state, workerSupervisors, turnContext);
-    if (hosted) {
-      emitHostedProjectData(state, workerSupervisors);
-      if (turnContext.targetProjectPath) {
-        emitHostedProjectProjection(state, workerSupervisors, turnContext.targetProjectPath, turnContext);
+            scope.ownerTurnId = turnId;
+            if (turnContext.activeSessionId) scope.sessionId = turnContext.activeSessionId;
+            if (hosted) {
+              process.stdout.write(`CMD_RIKER_OWNER_RECORDED:${turnId}\n`);
+              emitConversationData(state, turnContext);
+            }
+          },
+          turnContext, signal,
+        );
+        if (hosted && !ownerTurnRecorded) process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
+        process.stdout.write(hosted
+          ? `${encodeHostedOwnerResponse(output)}\n`
+          : `${output.source}: ${output.content}\n`);
+      } catch (error) {
+        if (hosted) {
+          if (!ownerTurnRecorded) process.stdout.write("CMD_RIKER_OWNER_HANDLED\n");
+          process.stdout.write(`${encodeHostedOwnerError(error instanceof Error ? error.message : "Lead turn failed.")}\n`);
+        } else {
+          scriptFailure ??= error instanceof Error ? error : new Error("Lead turn failed.");
+        }
       }
-      process.stdout.write(`${ownerTurnCompleteMarker}\n`);
-    }
+      process.stdout.write(`${currentSessionView(state, workerSupervisors, turnContext)}\n`);
+      emitSessionData(state, workerSupervisors, turnContext);
+      if (hosted) {
+        emitHostedProjectData(state, workerSupervisors);
+        if (turnContext.targetProjectPath) {
+          emitHostedProjectProjection(state, workerSupervisors, turnContext.targetProjectPath, turnContext);
+        }
+        process.stdout.write(`${ownerTurnCompleteMarker}\n`);
+      }
+    });
+    pending.add(operation);
+    void operation.finally(() => pending.delete(operation)).catch(() => {});
   }
+  await Promise.all(pending);
+  if (scriptFailure) throw scriptFailure;
 }
 
 function hostedOwnerInput(line: string): HostedOwnerInput {
@@ -449,20 +526,28 @@ async function runInteractiveConversation(
   workerSupervisors: WorkerSupervisors,
   ownerNotices: OwnerNoticeSink,
   sessionContext: OwnerSessionContext,
+  scheduler: ReturnType<typeof createLeadTurnScheduler>,
 ): Promise<void> {
   let attachment = currentOwnerAttachment(state, sessionContext, targetProjectPath);
   while (true) {
     const outcome = await runPiOwnerInterface({
       ...attachment,
-      completeOwnerInput: (ownerInput) =>
-        completeOwnerInteraction(
+      completeOwnerInput: (ownerInput) => {
+        const scope = leadTurnScope(state, sessionContext);
+        if (ownerInput.trim().toLowerCase() === "/interrupt") {
+          scheduler.interrupt(scope);
+          return Promise.resolve({ source: "Session View" as const, content: "Lead interruption requested. Worker Sessions continue." });
+        }
+        return scheduler.submitOwner(scope, (signal) => completeOwnerInteraction(
           state,
           adapter,
           ownerInput,
           workerSupervisors,
-          undefined,
+          (turnId) => { scope.ownerTurnId = turnId; },
           sessionContext,
-        ),
+          signal,
+        ));
+      },
       readSessionView: () => currentSessionView(state, workerSupervisors, sessionContext),
       readSessionData: () => sessionViewSnapshot(state, workerSupervisors, "available", sessionContext),
       subscribeNotices: (listener) => {
@@ -487,6 +572,14 @@ type OwnerInteractionOutput = {
 /** Which Owner Session one presentation client is serving; switching mutates only this cursor. */
 type OwnerSessionContext = { activeSessionId?: string; targetProjectPath?: string };
 
+function leadTurnScope(state: AuthoritativeState, context: OwnerSessionContext): LeadTurnScope {
+  const session = state.readOwnerSessions().find((entry) => entry.id === context.activeSessionId);
+  return {
+    targetProjectPath: context.targetProjectPath ?? session?.projectPath ?? state.readConfiguredProjects()[0]!.path,
+    ...(context.activeSessionId ? { sessionId: context.activeSessionId } : {}),
+  };
+}
+
 async function completeOwnerInteraction(
   state: AuthoritativeState,
   adapter: PiTurnAdapter,
@@ -494,7 +587,9 @@ async function completeOwnerInteraction(
   workerSupervisors: WorkerSupervisors = {},
   onOwnerTurnRecorded?: (turnId: string) => void,
   sessionContext?: OwnerSessionContext,
+  signal?: AbortSignal,
 ): Promise<OwnerInteractionOutput> {
+  signal?.throwIfAborted();
   if (!/^\/session\s+/i.test(ownerInput)) {
     if (sessionContext?.targetProjectPath && !sessionContext.activeSessionId) {
       sessionContext.activeSessionId = randomUUID();
@@ -513,7 +608,7 @@ async function completeOwnerInteraction(
         adapter,
         workerSupervisors,
       })
-        .completeOwnerTurn(ownerInput, onOwnerTurnRecorded, sessionContext?.activeSessionId),
+        .completeOwnerTurn(ownerInput, onOwnerTurnRecorded, sessionContext?.activeSessionId, signal),
     };
   }
   const snapshot = sessionViewSnapshot(state, workerSupervisors, "available", sessionContext);
@@ -763,6 +858,7 @@ async function availableWorkerSupervisors(
   state: AuthoritativeState,
   configuration: OwnerConfiguration,
   ownerNotices: OwnerNoticeSink,
+  onChange?: () => void,
 ): Promise<WorkerSupervisors> {
   const settings = configuration.workerHarnessSettings ?? {};
   const configured = configuration.workerModelPolicy?.selection.nativeHarness;
@@ -802,6 +898,7 @@ async function availableWorkerSupervisors(
         operations,
         undefined,
         (notice) => ownerNotices.deliver(notice),
+        onChange,
       );
     } catch (error) {
       failures.push({

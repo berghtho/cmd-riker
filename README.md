@@ -142,6 +142,12 @@ Work Items, Worker Sessions, effects, and Verification. Concurrent gateways are 
 gateways on the same project also keep private Owner Session cursors when one switches or creates a
 session.
 
+The gateway accepts another turn while the Lead responds. A follow-up in the same Owner Session
+interrupts the current Lead turn, waits for its active tools to settle, and then runs the new turn.
+Each response retains its request ID. `/interrupt` requests the same scoped interruption without
+starting another Model turn. Worker Sessions continue; interruption does not roll back completed
+effects. T3 keeps the composer available and preserves unsent text when interrupting.
+
 Inside the `riker` terminal, `/items` lists every work item with a plain status ("in progress",
 "needs you", "done", …); `/workers` and `/riker` show Worker Sessions and the Session View. The
 Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"
@@ -274,6 +280,20 @@ Owner never fills a form and never sees an identifier. Verification evidence and
 survive restart; delivery is complete on verified evidence with one report, without an Owner
 acceptance gate. Interrupted work becomes recoverable with a plain next step; later Owner turns can
 resume or cancel it through the same conversation.
+
+Worker questions, terminal results, and uncertain effects also wake the Lead while the Owner is
+away. Each automatic turn uses the originating Owner Session and mission; it never records a
+Worker observation as a new Owner instruction. Completed effectful Workers wake the Lead only
+after their checkout reconciliation and Verification have settled. Project context, action IDs,
+Standing Orders, and outcome reports remain scoped to the configured Target Project.
+
+CMD Riker durably claims each observation before inference. Repeated observations do not repeat
+the turn, and restart does not replay a claimed turn whose effects may be unknown. Such a failed
+follow-up appears in project status until the Owner returns to that conversation. Unclaimed
+observations remain recoverable. Owner-reserved questions, paused or cancelled work, and explicit
+Owner verdicts do not trigger automatic continuation. Owner input takes priority over an automatic
+turn; each automatic turn has a five-minute execution deadline. Standing Order changes, harness
+configuration, and Owner verdicts require a real Owner turn.
 
 For a typed Target Project test operation, install the Task CLI and declare the public Taskfile
 mapping in `cmd-riker.operations.json` at the checkout root:

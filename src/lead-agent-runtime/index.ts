@@ -20,13 +20,17 @@ import {
   type TargetProjectOperations,
 } from "../target-project-operations/index.ts";
 import type { WorkerSupervisor } from "../worker-supervisor/index.ts";
+import { createLeadProjectScope } from "./project-scope.ts";
+import { pendingLeadContinuations, type LeadContinuation, type LeadContinuationCandidate } from "../lead-continuation/index.ts";
 
 export type LeadAgentRuntime = {
   completeOwnerTurn(
     ownerInput: string,
     onOwnerTurnRecorded?: (turnId: string) => void,
     sessionId?: string,
+    signal?: AbortSignal,
   ): Promise<string>;
+  completeContinuation(candidate: LeadContinuationCandidate, signal?: AbortSignal): Promise<string | undefined>;
 };
 
 export class LeadAgentRuntimeDiagnostic extends Error {
@@ -54,7 +58,7 @@ export function createLeadAgentRuntime(input: {
     createTargetProjectOperations(input.state);
   const forgeOperations = input.forgeOperations ?? createForgeOperations(input.state);
   return {
-    completeOwnerTurn: (ownerInput, onOwnerTurnRecorded, sessionId) =>
+    completeOwnerTurn: (ownerInput, onOwnerTurnRecorded, sessionId, signal) =>
       completeOwnerTurn({
         ...input,
         targetProjectOperations,
@@ -62,7 +66,35 @@ export function createLeadAgentRuntime(input: {
         ownerInput,
         ...(onOwnerTurnRecorded ? { onOwnerTurnRecorded } : {}),
         ...(sessionId ? { sessionId } : {}),
+        ...(signal ? { signal } : {}),
       }),
+    async completeContinuation(candidate, signal) {
+      if (signal?.aborted) return undefined;
+      const current = pendingLeadContinuations(input.state).find((entry) => entry.eventKey === candidate.eventKey);
+      if (!current) return undefined;
+      const continuation = input.state.claimLeadContinuation(current);
+      if (!continuation) return undefined;
+      const boundedSignal = AbortSignal.any([
+        AbortSignal.timeout(5 * 60_000),
+        ...(signal ? [signal] : []),
+      ]);
+      try {
+        const content = await completeOwnerTurn({
+          ...input, targetProjectOperations, forgeOperations,
+          ownerInput: input.state.ownerMessage(continuation.ownerTurnId)!,
+          sessionId: continuation.sessionId,
+          signal: boundedSignal,
+          continuation,
+        });
+        input.state.settleLeadContinuation(continuation.id, "completed");
+        return content;
+      } catch (error) {
+        input.state.settleLeadContinuation(continuation.id, "failed",
+          signal?.aborted ? "aborted" : boundedSignal.aborted ? "turn-failed" :
+            error instanceof LeadAgentRuntimeDiagnostic ? "model-unavailable" : "turn-failed");
+        throw error;
+      }
+    },
   };
 }
 
@@ -97,7 +129,10 @@ async function completeOwnerTurn(input: {
   forgeOperations: ForgeOperations;
   onOwnerTurnRecorded?: (turnId: string) => void;
   sessionId?: string;
+  signal?: AbortSignal;
+  continuation?: LeadContinuation;
 }): Promise<string> {
+  input.signal?.throwIfAborted();
   const conversation = input.state.readOwnerConversation(input.sessionId);
   if (!conversation) throw new Error("Authoritative state is not configured.");
   // A session bound to a configured project works in that checkout; unbound
@@ -106,13 +141,14 @@ async function completeOwnerTurn(input: {
     ? input.state.readOwnerSessions().find((session) => session.id === input.sessionId)?.projectPath
     : undefined;
   const targetProjectPath = sessionProjectPath ?? conversation.targetProject.path;
+  const project = createLeadProjectScope(input.state, targetProjectPath);
   const orchestration = createOrchestrationCore(input.state);
-  const turnId = input.state.appendOwnerMessage(input.ownerInput, input.sessionId);
-  input.onOwnerTurnRecorded?.(turnId);
-  await reconcileUncertainForgeEffects(input.state, orchestration, input.forgeOperations);
+  const turnId = input.continuation?.ownerTurnId ?? input.state.appendOwnerMessage(input.ownerInput, input.sessionId);
+  if (!input.continuation) input.onOwnerTurnRecorded?.(turnId);
+  await reconcileUncertainForgeEffects(input.state, orchestration, input.forgeOperations, project);
   const commitmentsBefore = new Map(
-    input.state
-      .readCommitments()
+    project
+      .commitments()
       .map((commitment) => [commitment.id, commitmentFingerprint(commitment)]),
   );
   // Work Items are durable internal tracking; the model never fills forms for
@@ -131,9 +167,9 @@ async function completeOwnerTurn(input: {
             | "azure-subscription-inspection";
           description: string;
         },
-  ): string =>
-    workItemId ??
-    orchestration.recordCommitment(turnId, {
+  ): string => {
+    if (workItemId) return project.requireCommitment(workItemId).id;
+    return orchestration.recordCommitment(turnId, {
       outcome,
       criteria: [
         criterion ?? {
@@ -143,15 +179,19 @@ async function completeOwnerTurn(input: {
         },
       ],
     }).id;
+  };
   const candidates = [conversation.modelSelection, ...(conversation.modelFallbacks ?? [])];
   for (const [index, modelSelection] of candidates.entries()) {
+    input.signal?.throwIfAborted();
     const validation = await input.adapter.validateSelection(
       modelSelection,
       conversation.modelRequirements ?? defaultLeadModelRequirements,
     );
     if (orchestration.modelCandidateDecision(validation) === "skip") continue;
+    input.signal?.throwIfAborted();
     const attempt = orchestration.startLeadTurnAttempt({
       ownerTurnId: turnId,
+      ...(input.continuation ? { continuationId: input.continuation.id } : {}),
       modelSelection,
       modelPolicyRevision: conversation.modelPolicyRevision,
       ...(index > 0 ? { selectionReason: "fallback-after-ineligible-candidate" as const } : {}),
@@ -177,7 +217,7 @@ async function completeOwnerTurn(input: {
         ([harness]) => harnessSettings[harness]?.enabled !== false && modelFor(harness),
       );
       const supervisorOfWorker = (workerSessionId: string): WorkerSupervisor => {
-        const worker = orchestration.workerSessionView(workerSessionId);
+        const worker = project.requireWorker(workerSessionId);
         const attempt = worker
           ? orchestration.workerExecutionAttemptView(worker.currentExecutionAttemptId)
           : undefined;
@@ -196,21 +236,33 @@ async function completeOwnerTurn(input: {
       const response = await input.adapter.completeTurn({
         conversation: conversation.messages,
         ownerInput: input.ownerInput,
+        ...(input.signal ? { signal: input.signal } : {}),
+        ...(input.continuation ? { continuation: {
+          kind: input.continuation.kind,
+          workerSessionId: input.continuation.workerSessionId,
+          ...(input.continuation.questionId ? { questionId: input.continuation.questionId } : {}),
+          mission: input.ownerInput,
+        } } : {}),
         modelSelection,
-        commitments: input.state.readCommitments(),
+        commitments: project.commitments(),
         nativeTools: { cwd: targetProjectPath },
-        standingOrders: orchestration.standingOrdersView(),
-        authorityActions: {
-          recordStandingOrder: (draft) => orchestration.recordStandingOrder(turnId, draft),
-          revokeStandingOrder: (standingOrderId, reason) =>
-            orchestration.revokeStandingOrder(standingOrderId, turnId, reason),
-        },
-        workers: orchestration.workerSessionsView(),
-        workerQuestions: orchestration.workerQuestionsView(),
-        harnessActions: {
+        standingOrders: orchestration.standingOrdersView().filter(project.containsStandingOrder),
+        ...(!input.continuation ? { authorityActions: {
+          recordStandingOrder: (draft) => {
+            draft.commitmentIds.forEach(project.requireCommitment);
+            return orchestration.recordStandingOrder(turnId, draft);
+          },
+          revokeStandingOrder: (standingOrderId, reason) => {
+            project.requireStandingOrder(standingOrderId);
+            orchestration.revokeStandingOrder(standingOrderId, turnId, reason);
+          },
+        } } : {}),
+        workers: orchestration.workerSessionsView().filter(project.containsWorker),
+        workerQuestions: orchestration.workerQuestionsView().filter(project.containsQuestion),
+        ...(!input.continuation ? { harnessActions: {
           configure: (configuration) =>
             orchestration.configureWorkerHarness(turnId, configuration),
-        },
+        } } : {}),
         ...(!workerAvailable && (unavailableHarness || conversation.workerModelPolicy)
           ? {
               workerUnavailability: {
@@ -243,8 +295,11 @@ async function completeOwnerTurn(input: {
                       recoveryReason?: string;
                     }) => {
                       const { model, ...bounded } = assignment;
+                      if (assignment.commitmentId) project.requireCommitment(assignment.commitmentId);
+                      if (assignment.recoveryOfWorkerSessionId) project.requireWorker(assignment.recoveryOfWorkerSessionId);
                       return supervisor.delegate({
                         ...bounded,
+                        ownerTurnId: turnId,
                         targetProjectPath: targetProjectPath,
                         model: model ?? modelFor(harness)!,
                         modelPolicyRevision: workerModelPolicyRevision,
@@ -263,12 +318,14 @@ async function completeOwnerTurn(input: {
                             recoveryReason?: string;
                           }) => {
                             const { model, timeoutMinutes, ...bounded } = assignment;
+                            if (assignment.recoveryOfWorkerSessionId) project.requireWorker(assignment.recoveryOfWorkerSessionId);
                             const commitmentId = workItemFor(
                               assignment.commitmentId,
                               assignment.objective,
                             );
                             return supervisor.delegateEffectful({
                               ...bounded,
+                              ownerTurnId: turnId,
                               commitmentId,
                               targetProjectPath: targetProjectPath,
                               model: model ?? modelFor(harness)!,
@@ -291,6 +348,7 @@ async function completeOwnerTurn(input: {
                   harness?: "codex" | "claude" | "copilot";
                 }) => {
                   const { harness, ...bounded } = assignment;
+                  project.requireWorker(assignment.implementationWorkerSessionId);
                   const chosen = (harness && supervisors.get(harness)) ??
                     availableHarnesses[0]?.[1];
                   if (!chosen) throw new Error("No Worker harness is available for Review.");
@@ -301,14 +359,18 @@ async function completeOwnerTurn(input: {
                     modelPolicyRevision: workerModelPolicyRevision,
                   });
                 },
-                adjudicateReview: (adjudication) =>
-                  orchestration.adjudicateReview(adjudication.commitmentId, adjudication.decisions),
+                adjudicateReview: (adjudication) => {
+                  project.requireCommitment(adjudication.commitmentId);
+                  orchestration.adjudicateReview(adjudication.commitmentId, adjudication.decisions);
+                },
                 reserveOwnerDecision: (questionId: string, reason: string) => {
+                  project.requireQuestion(questionId);
                   orchestration.reserveWorkerQuestionForOwner(questionId, reason);
                 },
                 steer: async (workerSessionId: string, message: string) =>
                   supervisorOfWorker(workerSessionId).steer(workerSessionId, message),
                 workerOutput: (workerSessionId: string) => {
+                  project.requireWorker(workerSessionId);
                   try {
                     return supervisorOfWorker(workerSessionId).workerOutput(workerSessionId);
                   } catch {
@@ -316,10 +378,10 @@ async function completeOwnerTurn(input: {
                   }
                 },
                 answer: (questionId: string, answers: Record<string, string[]>) => {
-                  const question = orchestration
-                    .workerQuestionsView()
-                    .find((candidate) => candidate.id === questionId);
-                  if (!question) throw new Error("Unknown Worker question.");
+                  const question = project.requireQuestion(questionId);
+                  if (input.continuation && question.ownerAttention) {
+                    throw new Error("This Worker question is reserved for the Owner.");
+                  }
                   return supervisorOfWorker(question.workerSessionId)
                     .answer(questionId, turnId, answers);
                 },
@@ -329,10 +391,16 @@ async function completeOwnerTurn(input: {
             }
           : {}),
         commitmentActions: {
-          resume: (workItemId) => orchestration.resumeCommitment(workItemId, turnId),
-          cancel: (workItemId, reason) =>
-            orchestration.cancelCommitment(workItemId, turnId, reason),
-          recordOwnerVerdict: async (workItemId, ownerVerdictQuote) => {
+          resume: (workItemId) => {
+            project.requireCommitment(workItemId);
+            orchestration.resumeCommitment(workItemId, turnId);
+          },
+          ...(!input.continuation ? { cancel: (workItemId: string, reason: string) => {
+            project.requireCommitment(workItemId);
+            orchestration.cancelCommitment(workItemId, turnId, reason);
+          },
+          recordOwnerVerdict: async (workItemId: string, ownerVerdictQuote: string) => {
+            project.requireCommitment(workItemId);
             const targetProjectHeadCommit = await readTargetProjectHead(
               targetProjectPath,
             );
@@ -340,7 +408,7 @@ async function completeOwnerTurn(input: {
               ownerVerdictQuote,
               ...(targetProjectHeadCommit ? { targetProjectHeadCommit } : {}),
             });
-          },
+          } } : {}),
           executeOperation: async (workItemId, operation) => {
             const commitmentId = workItemFor(
               workItemId,
@@ -467,14 +535,15 @@ async function completeOwnerTurn(input: {
             : {}),
         },
       });
-      const pendingSelfRepairAccounts = input.state.readSelfRepairs().flatMap((repair) =>
+      const pendingSelfRepairAccounts = input.state.readSelfRepairs()
+        .filter((repair) => project.containsCommitmentId(repair.commitmentId)).flatMap((repair) =>
         repair.attempts.flatMap((repairAttempt) =>
           repairAttempt.activation && !repairAttempt.activation.deliveredAt
             ? [{ repair, attempt: repairAttempt, account: repairAttempt.activation.account }]
             : []
         )
       );
-      const pendingCommitmentAccounts = input.state.readCommitments().filter(
+      const pendingCommitmentAccounts = project.commitments().filter(
         (commitment) => commitment.outcomeAccount && !commitment.outcomeAccount.deliveredAt,
       );
       const accountContents = [
@@ -506,8 +575,11 @@ async function completeOwnerTurn(input: {
         ...commitment,
         outcomeAccount: { ...commitment.outcomeAccount!, deliveredAt },
       }));
-      input.state.appendLeadAgentMessageWithAccounts(
-        turnId,
+      const appendResponse = input.continuation
+        ? input.state.appendLeadContinuationMessageWithAccounts.bind(input.state)
+        : input.state.appendLeadAgentMessageWithAccounts.bind(input.state);
+      appendResponse(
+        input.continuation?.id ?? turnId,
         durableResponse,
         { selfRepairs: deliveredRepairs, commitments: deliveredCommitments },
         {
@@ -520,8 +592,8 @@ async function completeOwnerTurn(input: {
         },
       );
       orchestration.observeLeadResponse(turnId, durableResponse);
-      const notices = input.state
-        .readCommitments()
+      const notices = project
+        .commitments()
         .filter(
           (commitment) =>
             commitmentsBefore.get(commitment.id) !== commitmentFingerprint(commitment),
@@ -533,8 +605,12 @@ async function completeOwnerTurn(input: {
       orchestration.settleLeadTurnAttempt(attempt.id, "completed");
       return content;
     } catch (error) {
+      const failureKind = input.signal?.aborted ? "aborted" : error instanceof PiTurnFailure ? error.kind : "turn-failed";
+      orchestration.settleLeadTurnAttempt(attempt.id, "failed", failureKind);
+      if (failureKind === "aborted") {
+        throw new LeadAgentRuntimeDiagnostic("CMD_RIKER_LEAD_INTERRUPTED", "Lead turn interrupted. Completed effects remain in place; Worker Sessions continue.");
+      }
       if (!(error instanceof PiTurnFailure)) throw error;
-      orchestration.settleLeadTurnAttempt(attempt.id, "failed", error.kind);
       const decision = orchestration.modelFailureDecision(error);
       if (decision === "fallback") continue;
       if (decision === "revalidate") {
@@ -544,7 +620,7 @@ async function completeOwnerTurn(input: {
         );
         if (orchestration.modelCandidateDecision(updatedValidation) === "skip") continue;
       }
-      orchestration.observeLeadTurnFailure(turnId, `Lead Model turn failed: ${error.kind}.`);
+      if (!input.continuation) orchestration.observeLeadTurnFailure(turnId, `Lead Model turn failed: ${error.kind}.`);
       break;
     }
   }
@@ -564,11 +640,13 @@ async function reconcileUncertainForgeEffects(
   state: AuthoritativeState,
   orchestration: OrchestrationCore,
   forgeOperations: ForgeOperations,
+  project: ReturnType<typeof createLeadProjectScope>,
 ): Promise<void> {
   for (const effect of state.readEffectIntents()) {
     if (effect.kind !== "forge-operation" || effect.status !== "unknown") continue;
+    if (!project.containsCommitmentId(effect.commitmentId)) continue;
     const attempt = state.readForgeOperationAttempt(effect.forgeOperationAttemptId);
-    if (!attempt) continue;
+    if (!attempt || !project.containsCommitmentId(attempt.commitmentId)) continue;
     try {
       const readBack = await forgeOperations.readBackEffect({
         target: attempt.target,

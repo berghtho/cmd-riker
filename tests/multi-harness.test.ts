@@ -95,7 +95,7 @@ test("the Lead delegates per task across two effectful harnesses in one turn", a
       });
       await assert.rejects(
         request.workerActions!.steer!("unknown-worker", "hello"),
-        /not available in this session/i,
+        /unknown or outside the active Target Project/i,
       );
       return { content: "Both Workers are underway." };
     }

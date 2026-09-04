@@ -223,6 +223,7 @@ export type CommitmentDraft = {
 export type LeadTurnAttempt = {
   id: string;
   ownerTurnId: string;
+  continuationId?: string;
   modelSelection: ModelSelection;
   modelPolicyRevision: string;
   nativeHarness: null;
@@ -316,6 +317,7 @@ export type WorkerSession = {
 };
 
 type WorkerAssignmentBase = {
+    ownerTurnId?: string;
     objective: string;
     prompt: string;
     targetProjectPath: string;
@@ -571,6 +573,7 @@ export interface OrchestrationState {
   appendLeadTurnAttemptSnapshots(snapshots: LeadTurnAttempt[]): void;
   readLeadTurnAttempt(attemptId: string): LeadTurnAttempt | undefined;
   readLeadTurnAttempts(): LeadTurnAttempt[];
+  readLeadContinuation?(id: string): { ownerTurnId: string; status: "started" | "completed" | "failed" } | undefined;
   appendWorkerSessionSnapshots(snapshots: WorkerSession[]): void;
   readWorkerSession(workerSessionId: string): WorkerSession | undefined;
   readWorkerSessions(): WorkerSession[];
@@ -700,6 +703,7 @@ export interface OrchestrationCore {
   }): "fallback" | "revalidate" | "stop";
   startLeadTurnAttempt(input: {
     ownerTurnId: string;
+    continuationId?: string;
     modelSelection: ModelSelection;
     modelPolicyRevision: string;
     selectionReason?: "fallback-after-ineligible-candidate";
@@ -710,6 +714,7 @@ export interface OrchestrationCore {
     failureKind?: LeadTurnAttempt["failureKind"],
   ): void;
   delegateReadOnlyWorker(input: {
+    ownerTurnId?: string;
     objective: string;
     prompt: string;
     targetProjectPath: string;
@@ -720,6 +725,7 @@ export interface OrchestrationCore {
     recoveryReason?: string;
   }): { workerSession: WorkerSession; executionAttempt: WorkerExecutionAttempt };
   delegateEffectfulWorker(input: {
+    ownerTurnId?: string;
     objective: string;
     prompt: string;
     targetProjectPath: string;
@@ -1103,7 +1109,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
     reconcileInterruptedCommitments() {
       for (const attempt of state.readLeadTurnAttempts()) {
         if (attempt.status !== "started") continue;
-        const response = state.leadAgentResponse(attempt.ownerTurnId);
+        const response = state.leadAgentResponse(attempt.continuationId ?? attempt.ownerTurnId);
         if (response !== undefined) {
           observeLeadResponse(state, attempt.ownerTurnId, response);
           state.appendLeadTurnAttemptSnapshots([{ ...attempt, status: "completed" }]);
@@ -1518,6 +1524,12 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
       if (state.ownerTurnSequence(input.ownerTurnId) === undefined) {
         throw new Error(`Unknown Owner turn ${input.ownerTurnId}.`);
       }
+      if (input.continuationId) {
+        const continuation = state.readLeadContinuation?.(input.continuationId);
+        if (!continuation || continuation.status !== "started" || continuation.ownerTurnId !== input.ownerTurnId) {
+          throw new Error("Autonomous inference requires its active continuation and original Owner instruction.");
+        }
+      }
       const attempt: LeadTurnAttempt = {
         id: randomUUID(),
         ...input,
@@ -1594,6 +1606,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           objective: input.objective,
           prompt: input.prompt,
           targetProjectPath: input.targetProjectPath,
+          ...workerOwnerOrigin(state, input.ownerTurnId, input.commitmentId, input.recoveryOfWorkerSessionId),
           readOnly: true,
           modelPolicyRevision: input.modelPolicyRevision,
           ...(input.commitmentId ? { commitmentId: input.commitmentId } : {}),
@@ -1736,6 +1749,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           readOnly: false,
           modelPolicyRevision: input.modelPolicyRevision,
           commitmentId: input.commitmentId,
+          ...workerOwnerOrigin(state, input.ownerTurnId, input.commitmentId, input.recoveryOfWorkerSessionId),
           targets: input.targets,
           effectClasses: ["filesystem-write", "bounded-process-execution"],
           authorizedWriteRoots: [input.checkoutIsolation.root],
@@ -1840,6 +1854,7 @@ export function createOrchestrationCore(state: OrchestrationState): Orchestratio
           objective: `Independently review Worker Session ${implementationWorker.id}.`,
           prompt: `${input.prompt}\n\n${reviewContract}`,
           targetProjectPath: implementationWorker.assignment.targetProjectPath,
+          ...workerOwnerOrigin(state, implementationWorker.assignment.ownerTurnId, implementationWorker.assignment.commitmentId),
           readOnly: true,
           modelPolicyRevision: input.modelPolicyRevision,
           commitmentId: implementationWorker.assignment.commitmentId,
@@ -3310,6 +3325,21 @@ function requireOwnerTurn(state: OrchestrationState, ownerTurnId: string): void 
   if (state.ownerTurnSequence(ownerTurnId) === undefined) {
     throw new Error(`Unknown Owner turn ${ownerTurnId}.`);
   }
+}
+
+function workerOwnerOrigin(
+  state: OrchestrationState,
+  explicitOwnerTurnId?: string,
+  commitmentId?: string,
+  recoveryOfWorkerSessionId?: string,
+): { ownerTurnId?: string } {
+  const ownerTurnId = explicitOwnerTurnId ??
+    (recoveryOfWorkerSessionId ? state.readWorkerSession(recoveryOfWorkerSessionId)?.assignment.ownerTurnId : undefined) ??
+    (commitmentId ? state.readCommitment(commitmentId)?.createdByOwnerTurnId : undefined) ??
+    state.latestOwnerTurnId();
+  if (!ownerTurnId) return {};
+  requireOwnerTurn(state, ownerTurnId);
+  return { ownerTurnId };
 }
 
 function requireCurrentOwnerTurn(state: OrchestrationState, ownerTurnId: string): void {

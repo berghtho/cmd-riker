@@ -91,6 +91,7 @@ export async function runOwnerGatewayProtocol(
   });
 
   const lines = createInterface({ input, crlfDelay: Infinity });
+  const pending = new Set<Promise<void>>();
   try {
     for await (const line of lines) {
       let command: OwnerGatewayProtocolCommand;
@@ -103,17 +104,20 @@ export async function runOwnerGatewayProtocol(
         });
         continue;
       }
-      try {
-        const response = await gateway.completeTurn(command.content);
-        send({ type: "turn-result", id: command.id, response });
-      } catch (error) {
-        send({
+      // Continue reading so a later Owner turn can interrupt the active Lead.
+      // The host still serializes execution and owns response correlation.
+      const operation = gateway.completeTurn(command.content).then(
+        (response) => send({ type: "turn-result", id: command.id, response }),
+        (error: unknown) => send({
           type: "turn-error",
           id: command.id,
           message: error instanceof Error ? error.message : "The Owner turn failed.",
-        });
-      }
+        }),
+      );
+      pending.add(operation);
+      void operation.finally(() => pending.delete(operation)).catch(() => {});
     }
+    await Promise.all(pending);
   } finally {
     unsubscribe();
     await gateway.detach();

@@ -128,6 +128,7 @@ export interface WorkerSupervisor {
     cancellation: boolean;
   };
   delegate(input: {
+    ownerTurnId?: string;
     objective: string;
     prompt: string;
     targetProjectPath: string;
@@ -138,6 +139,7 @@ export interface WorkerSupervisor {
     recoveryReason?: string;
   }): Promise<{ workerSessionId: string; executionAttemptId: string }>;
   delegateEffectful(input: {
+    ownerTurnId?: string;
     objective: string;
     prompt: string;
     targetProjectPath: string;
@@ -175,10 +177,15 @@ export function createWorkerSupervisor(
   verificationOperations?: TargetProjectOperations,
   checkoutInspector: EffectfulCheckoutInspector = new NativeEffectfulCheckoutInspector(),
   onOwnerNotice?: (notice: string) => void,
+  onChange?: () => void,
 ): WorkerSupervisor {
   const orchestration = createOrchestrationCore(state);
   const executions = new Map<string, NativeWorkerExecution>();
+  const changed = (): void => {
+    try { onChange?.(); } catch { /* The durable observations remain discoverable. */ }
+  };
   const notifyOwner = (notice: string): void => {
+    changed();
     try {
       onOwnerNotice?.(notice);
     } catch {
@@ -336,6 +343,7 @@ export function createWorkerSupervisor(
           executionAttempt.id,
           existingAttempt.result,
         );
+        changed();
       }
       return;
     }
@@ -468,6 +476,7 @@ export function createWorkerSupervisor(
               executionAttemptId: executionAttempt.id,
               ...request,
             });
+            changed();
           },
           output(text) {
             const existing = outputByAttempt.get(executionAttempt.id) ?? "";
@@ -535,6 +544,7 @@ export function createWorkerSupervisor(
             if (willVerify) {
               await verifySettledWorker(workerSession, executionAttempt);
             }
+            changed();
           },
           async failed(error) {
             clearDeadlines(executionAttempt.id);

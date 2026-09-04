@@ -11,6 +11,8 @@ import {
   decodeHostedOwnerResponse,
   decodeHostedOwnerSessionView,
   encodeHostedOwnerInput,
+  encodeHostedOwnerInterrupt,
+  leadStatePrefix,
   ownerConversationPrefix,
   ownerTurnCompleteMarker,
 } from "../owner-host-framing.ts";
@@ -77,6 +79,8 @@ export type StartLocalLeadHostOptions = {
   ownerHandledMarker?: string;
   /** Frames multiline Owner content into one physical child-stdin line. */
   encodeOwnerInput?: boolean;
+  /** Production Lead accepts scoped cancellation while a semantic turn is running. */
+  interruptibleOwnerTurns?: boolean;
   /** Marks semantic Owner turn completion for host-wide response correlation. */
   ownerTurnCompletePrefix?: string;
   durableOwnerAckTimeoutMs?: number;
@@ -174,6 +178,7 @@ export async function startLocalLeadHost(
         error?: string;
         targetProjectPath?: string;
         sessionId?: string;
+        ownerTurnId?: string;
         completion: ReturnType<typeof Promise.withResolvers<{
           response: PiOwnerResponse;
           sessionId?: string;
@@ -301,7 +306,14 @@ export async function startLocalLeadHost(
       (options.durableOwnerAckPrefix && line.startsWith(options.durableOwnerAckPrefix)) ||
       (options.ownerHandledMarker && line === options.ownerHandledMarker)
     ) {
+      if (options.durableOwnerAckPrefix && line.startsWith(options.durableOwnerAckPrefix) && activeSemanticTurn) {
+        activeSemanticTurn.ownerTurnId = line.slice(options.durableOwnerAckPrefix.length);
+      }
       durableOwnerAcks.shift()?.resolve();
+      return;
+    }
+    if (line === `${leadStatePrefix}responding` || line === `${leadStatePrefix}available`) {
+      setLeadState(line === `${leadStatePrefix}responding` ? "responding" : "available");
       return;
     }
     const response = decodeHostedOwnerResponse(line);
@@ -399,6 +411,35 @@ export async function startLocalLeadHost(
     if (!options.ownerTurnCompletePrefix) {
       return Promise.reject(new Error("Semantic Owner turns are unavailable on this host."));
     }
+    if (options.interruptibleOwnerTurns) {
+      const active = activeSemanticTurn;
+      const sameProject = scope?.targetProjectPath
+        ? Boolean(active?.targetProjectPath && samePath(scope.targetProjectPath, active.targetProjectPath))
+        : active?.targetProjectPath === undefined;
+      const requestedSession = scope?.sessionId ?? (scope?.targetProjectPath
+        ? latestSessionByProject.get(pathKey(scope.targetProjectPath))
+        : undefined);
+      const sameSession = !requestedSession || !active?.sessionId || requestedSession === active.sessionId;
+      const explicitInterrupt = input.trim().toLowerCase() === "/interrupt";
+      if (explicitInterrupt || (active && sameProject && sameSession)) {
+        const interruption = writeLine(child, encodeHostedOwnerInterrupt({
+          ...scope,
+          ...(active && sameProject && sameSession && active.ownerTurnId
+            ? { ownerTurnId: active.ownerTurnId }
+            : {}),
+        }));
+        if (explicitInterrupt) {
+          return interruption.then(() => ({
+            response: {
+              source: "Session View" as const,
+              content: "Lead interruption requested. Worker Sessions continue; completed effects remain in place.",
+            },
+            ...(scope?.sessionId ? { sessionId: scope.sessionId } : {}),
+          }));
+        }
+        void interruption.catch(() => {});
+      }
+    }
     const operation = semanticTurnQueue.then(async () => {
       const completion = Promise.withResolvers<{
         response: PiOwnerResponse;
@@ -411,7 +452,9 @@ export async function startLocalLeadHost(
         ...(scope
           ? {
               targetProjectPath: scope.targetProjectPath,
-              ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
+                ...(scope.sessionId ?? latestSessionByProject.get(pathKey(scope.targetProjectPath))
+                  ? { sessionId: scope.sessionId ?? latestSessionByProject.get(pathKey(scope.targetProjectPath))! }
+                  : {}),
             }
           : {}),
       };

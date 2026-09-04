@@ -154,6 +154,7 @@ export async function connectOwnerGateway(
         targetProjectPath: configuredProjectPath!,
         ...(activeSessionId ? { sessionId: activeSessionId } : {}),
       });
+      if (ownerInput.trim().toLowerCase() === "/interrupt") return result.response;
       activeSessionId = result.sessionId;
       if (activeSessionId !== previousSessionId) ownerSessionRevision += 1;
       const latest = latestConversation(client.transcript, configuredProjectPath, activeSessionId);

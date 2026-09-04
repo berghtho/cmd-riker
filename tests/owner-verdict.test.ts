@@ -124,7 +124,7 @@ test("Lead runtime pins the recorded Owner verdict to the Target Project head co
   });
   class VerdictAdapter extends DeterministicTurnAdapter {
     override async completeTurn(request: PiTurnRequest): Promise<{ content: string }> {
-      await request.commitmentActions!.recordOwnerVerdict(
+      await request.commitmentActions!.recordOwnerVerdict!(
         commitment.id,
         "Verified — the change works end to end.",
       );

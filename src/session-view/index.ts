@@ -10,6 +10,7 @@ import type { EffectIntent } from "../target-project-operations/index.ts";
 import type { ForgeOwnerActionNotice } from "../forge-operations/index.ts";
 import type { LeadTurnMetrics } from "../model-selection.ts";
 import type { OwnerSessionView } from "../authoritative-state/index.ts";
+import type { LeadContinuation } from "../lead-continuation/index.ts";
 
 export type SessionViewWorker = {
   number: number;
@@ -100,6 +101,8 @@ export interface SessionViewState {
   readOwnerSessions?(): OwnerSessionView[];
   readConfiguredProjects?(): Array<{ name: string; path: string }>;
   ownerSessionIdForTurn?(ownerTurnId: string): string | undefined;
+  readLeadContinuations?(): LeadContinuation[];
+  hasOwnerResponseAfterLeadContinuation?(id: string): boolean;
 }
 
 export function projectSessionView(
@@ -195,6 +198,14 @@ export function projectSessionView(
     if (notice.state !== "active") continue;
     notices.push(`${notice.provider}: ${notice.detail} Next: ${notice.nextAction}`);
   }
+  const continuationNotices = new Set<string>();
+  for (const continuation of state.readLeadContinuations?.() ?? []) {
+    if (continuation.status !== "failed" || continuation.failureKind === "aborted" ||
+        !inProject(continuation.targetProjectPath) ||
+        state.hasOwnerResponseAfterLeadContinuation?.(continuation.id)) continue;
+    continuationNotices.add(leadContinuationNotice(continuation.failureKind));
+  }
+  notices.push(...continuationNotices);
 
   const lead = state.readLatestLeadTurnMetrics?.(options.activeSessionId);
   const projectNameByPath = new Map(
@@ -254,6 +265,19 @@ export function projectSessionView(
     ...(sessions ? { sessions } : {}),
     ...(projects ? { projects } : {}),
   };
+}
+
+function leadContinuationNotice(failureKind: LeadContinuation["failureKind"]): string {
+  if (failureKind === "model-unavailable") {
+    return "The Lead Agent could not follow up on a Worker update because its Model is unavailable. " +
+      "Restore the configured Model, then ask it to continue.";
+  }
+  if (failureKind === "continuity-lost") {
+    return "The Lead Agent's automatic follow-up was interrupted. Effects may already have run. " +
+      "Ask it to review the current state before continuing.";
+  }
+  return "The Lead Agent could not complete its automatic follow-up after a Worker update. " +
+    "Ask it to review the current state and continue.";
 }
 
 function samePath(left: string, right: string): boolean {

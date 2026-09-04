@@ -4,6 +4,7 @@ import {
   getAgentDir,
   getMarkdownTheme,
   loadSkills,
+  main as runPi,
   stripFrontmatter,
   type ExtensionAPI,
   type ExtensionContext,
@@ -26,10 +27,6 @@ import {
   type OwnerSurfaceUpdateStatus,
 } from "./owner-surface/index.ts";
 import type { SessionViewSnapshot } from "./session-view/index.ts";
-
-// Pi intentionally does not export its CLI composition root. CMD Riker pins the
-// package version and uses that root so Pi owns terminal lifecycle and input.
-import { main as runPi } from "../node_modules/@earendil-works/pi-coding-agent/dist/main.js";
 
 export type PiOwnerTranscriptEntry = {
   source: "owner" | "lead-agent";

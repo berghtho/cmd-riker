@@ -273,15 +273,16 @@ test("hosted Session View inspection acknowledges handling without inventing a d
   });
   state.close();
 
-  const result = await runCli(stateDirectory, "/session workers\n", [
-    "--write-generation",
-    "1",
-    "--hosted",
-  ]);
-
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /CMD_RIKER_OWNER_HANDLED/);
-  assert.doesNotMatch(result.stdout, /CMD_RIKER_OWNER_RECORDED:/);
+  for (const command of ["/session workers", "/session items", "/session history"]) {
+    const result = await runCli(stateDirectory, `${command}\n`, [
+      "--write-generation",
+      "1",
+      "--hosted",
+    ]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /CMD_RIKER_OWNER_HANDLED/);
+    assert.doesNotMatch(result.stdout, /CMD_RIKER_OWNER_RECORDED:/);
+  }
   const reopened = openAuthoritativeState(stateDirectory, { writeGeneration: 1 });
   assert.deepEqual(reopened.readOwnerConversation()?.messages, []);
   reopened.close();

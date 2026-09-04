@@ -673,10 +673,10 @@ async function completeOwnerInteraction(
       reattach: true,
     };
   }
-  if (/^\/session\s+items\s*$/i.test(ownerInput)) {
+  if (/^\/session\s+(items|history)\s*$/i.test(ownerInput)) {
     return {
       source: "Session View",
-      content: renderSessionItems(snapshot),
+      content: renderSessionItems(snapshot, /^\/session\s+history\s*$/i.test(ownerInput)),
     };
   }
   if (/^\/session\s+workers\s*$/i.test(ownerInput)) {

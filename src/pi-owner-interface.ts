@@ -211,6 +211,20 @@ function installRikerOwnerExtension(
       updateUi(ctx);
     },
   });
+  pi.registerCommand("details", {
+    description: "Toggle Worker, Model and Standing Order details",
+    handler: async (_args, ctx) => {
+      surface.toggleDetails();
+      updateUi(ctx);
+    },
+  });
+  pi.registerCommand("history", {
+    description: "Toggle completed work and previous sessions",
+    handler: async (_args, ctx) => {
+      surface.toggleHistory();
+      updateUi(ctx);
+    },
+  });
   pi.registerShortcut(activityShortcut, {
     description: "Toggle CMD Riker Activity",
     handler: async (ctx) => {
@@ -234,7 +248,7 @@ function installRikerOwnerExtension(
   });
   for (const [command, request, description] of [
     ["workers", "/session workers", "Inspect CMD Riker Worker Sessions"],
-    ["items", "/session items", "Show every work item and its plain status"],
+    ["items", "/session items", "Show current work items; /history for completed work"],
     ["orders", "/session orders", "Show Standing Orders"],
     ["sessions", "/session list", "List Owner Sessions"],
   ] as const) {

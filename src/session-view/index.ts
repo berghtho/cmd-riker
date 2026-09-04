@@ -11,6 +11,7 @@ import type { ForgeOwnerActionNotice } from "../forge-operations/index.ts";
 import type { LeadTurnMetrics } from "../model-selection.ts";
 import type { OwnerSessionView } from "../authoritative-state/index.ts";
 import type { LeadContinuation } from "../lead-continuation/index.ts";
+import { groupOperatorItems } from "./operator-items.ts";
 
 export type SessionViewWorker = {
   number: number;
@@ -499,9 +500,11 @@ function itemsSummary(items: SessionViewItem[]): string {
     : `${items.length} ${label}`;
 }
 
-export function renderSessionItems(snapshot: SessionViewSnapshot): string {
-  if (snapshot.items.length === 0) return "No work items.";
-  return snapshot.items
+export function renderSessionItems(snapshot: SessionViewSnapshot, history = false): string {
+  const groups = groupOperatorItems(snapshot.items);
+  const items = history ? groups.history : [...groups.attention, ...groups.active];
+  if (items.length === 0) return history ? "No completed work items." : "No current work items. History: /session history";
+  return items
     .map(
       (item) =>
         `${item.number}. ${item.status} | ${item.outcome}` +
@@ -511,10 +514,11 @@ export function renderSessionItems(snapshot: SessionViewSnapshot): string {
 }
 
 export function renderSessionView(snapshot: SessionViewSnapshot): string {
+  const { attention, active } = groupOperatorItems(snapshot.items);
   const workerLabel = snapshot.activeWorkerCount === 1 ? "Worker" : "Workers";
   const lines = [
     `Lead ${snapshot.leadAvailability} | ${snapshot.activeWorkerCount} ${workerLabel} | ` +
-      itemsSummary(snapshot.items) +
+      itemsSummary([...attention, ...active]) +
       (snapshot.notices.length > 0 ? ` | ${snapshot.notices.length} notice(s)` : " | all quiet") +
       (snapshot.items.length > 0 ? " | /session items" : "") +
       (snapshot.activeWorkerCount > 0 ? " | /session workers" : ""),

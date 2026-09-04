@@ -148,8 +148,12 @@ Each response retains its request ID. `/interrupt` requests the same scoped inte
 starting another Model turn. Worker Sessions continue; interruption does not roll back completed
 effects. T3 keeps the composer available and preserves unsent text when interrupting.
 
-Inside the `riker` terminal, `/items` lists every work item with a plain status ("in progress",
-"needs you", "done", …); `/workers` and `/riker` show Worker Sessions and the Session View. The
+Inside the `riker` terminal, decisions and problems stay visible above the composer. `Alt+A` or
+`/view` toggles a compact view of current work, with attention first and no repeated Worker rows.
+`/items` lists all current work. `/details` toggles Model, Worker and current Standing Order details;
+`/history` toggles completed work and previous sessions. Both start hidden. `Shift+Right` closes
+the open panel. `/session history` lists all completed work, `/workers` shows Worker details,
+`/orders` shows Standing Orders, and `/riker` shows notices. These views never delete history. The
 Owner also configures Worker harnesses conversationally — "disable codex", "use claude with model X"
 — and the Lead persists the preference durably; nobody edits configuration files by hand.
 

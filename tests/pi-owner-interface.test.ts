@@ -13,12 +13,14 @@ import type { KeyId } from "@earendil-works/pi-tui";
 
 import {
   formatAge,
+  OwnerSurface,
   renderDecisionDock,
   renderOperationsPanel,
   renderSessionNavigation,
 } from "../src/owner-surface/index.ts";
 import { rikerOwnerExtension } from "../src/pi-owner-interface.ts";
 import type { SessionViewSnapshot } from "../src/session-view/index.ts";
+import { renderSessionItems, renderSessionView } from "../src/session-view/index.ts";
 
 const plainTheme = {
   fg: (_color: string, text: string) => text,
@@ -246,6 +248,69 @@ test("ages read plainly at every magnitude", () => {
   assert.equal(formatAge("2026-08-21T09:30:00.000Z", now), "2 h 30 min");
   assert.equal(formatAge("2026-08-19T10:00:00.000Z", now), "2 d 2 h");
   assert.equal(formatAge("invalid", now), "");
+});
+
+test("completed work stays in optional history and does not inflate current work", () => {
+  const snapshot = sessionSnapshot();
+  snapshot.items.unshift(...Array.from({ length: 1000 }, (_, index) => ({
+    number: index + 10, workItemId: `old-${index}`, outcome: `Old delivery ${index}`,
+    status: "done", needsOwner: false,
+  })));
+  const surface = new OwnerSurface({ targetProjectPath: "C:\\project", readSessionData: () => snapshot });
+  assert.deepEqual(surface.content(plainTheme, 100), []);
+  surface.toggleActivity();
+  assert.doesNotMatch(surface.content(plainTheme, 100).join("\n"), /Old delivery/);
+  assert.match(renderSessionView(snapshot), /1 item\b/);
+  assert.doesNotMatch(renderSessionItems(snapshot), /Old delivery/);
+  assert.match(renderSessionItems(snapshot, true), /Old delivery 0/);
+  assert.match(renderSessionItems(snapshot, true), /Old delivery 999/);
+  surface.toggleHistory();
+  assert.match(surface.content(plainTheme, 100).join("\n"), /Old delivery 999/);
+  assert.ok(surface.content(plainTheme, 100).length <= 8);
+  surface.toggleHistory();
+  assert.deepEqual(surface.content(plainTheme, 100), []);
+  assert.equal(snapshot.items.length, 1001);
+});
+
+test("details toggle without duplicate worker rows in current work", () => {
+  const snapshot = sessionSnapshot();
+  snapshot.workers[0]!.label = "Implementation worker detail";
+  const surface = new OwnerSurface({ targetProjectPath: "C:\\project", readSessionData: () => snapshot });
+  surface.toggleActivity();
+  const activity = surface.content(plainTheme, 100).join("\n");
+  assert.match(activity, /Aktuelle Arbeit/);
+  assert.doesNotMatch(activity, /Implementation worker detail/);
+  surface.toggleDetails();
+  assert.match(surface.content(plainTheme, 100).join("\n"), /Implementation worker detail/);
+  surface.toggleDetails();
+  assert.deepEqual(surface.content(plainTheme, 100), []);
+});
+
+test("new problems remain visible and get priority over ordinary work", () => {
+  const snapshot = sessionSnapshot();
+  const surface = new OwnerSurface({ targetProjectPath: "C:\\project", readSessionData: () => snapshot });
+  snapshot.items.push({ number: 8, workItemId: "blocked", outcome: "Restore source", status: "blocked", needsOwner: false });
+  assert.match(surface.content(plainTheme, 100).join("\n"), /Restore source/);
+  snapshot.items.push({ number: 9, workItemId: "reopened", outcome: "Choose source", status: "done", needsOwner: true });
+  assert.match(surface.content(plainTheme, 100).join("\n"), /Choose source/);
+  surface.toggleActivity();
+  const activity = surface.content(plainTheme, 100).join("\n");
+  assert.ok(activity.indexOf("Choose source") < activity.indexOf("Aktuelle Arbeit"));
+  assert.match(renderSessionItems(snapshot), /9. done \| Choose source/);
+  assert.doesNotMatch(renderSessionItems(snapshot, true), /Choose source/);
+  surface.close();
+  snapshot.items = [];
+  snapshot.notices.push("An effect is still unconfirmed.");
+  assert.match(surface.content(plainTheme, 100).join("\n"), /effect is still unconfirmed/);
+});
+
+test("archived sessions are absent from navigation and available in history", () => {
+  const snapshot = sessionSnapshot();
+  snapshot.sessions!.unshift({ number: 22, sessionId: "old", name: "Old archived chat", current: false, lastActiveAt: "2020-01-01", state: "archived" });
+  assert.doesNotMatch(renderSessionNavigation(plainTheme, snapshot).join("\n"), /Old archived chat/);
+  const surface = new OwnerSurface({ targetProjectPath: "C:\\project", readSessionData: () => snapshot });
+  surface.toggleHistory();
+  assert.match(surface.content(plainTheme, 100).join("\n"), /Old archived chat/);
 });
 
 function shellApi(
